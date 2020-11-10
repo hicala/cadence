@@ -21,8 +21,6 @@
 package execution
 
 import (
-	"time"
-
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/persistence"
@@ -208,22 +206,6 @@ func convertSignalRequestedIDs(
 		outputs = append(outputs, item)
 	}
 	return outputs
-}
-
-func setTaskInfo(
-	version int64,
-	timestamp time.Time,
-	transferTasks []persistence.Task,
-	timerTasks []persistence.Task,
-) {
-	// set both the task version, as well as the timestamp on the transfer tasks
-	for _, task := range transferTasks {
-		task.SetVersion(version)
-		task.SetVisibilityTimestamp(timestamp)
-	}
-	for _, task := range timerTasks {
-		task.SetVersion(version)
-	}
 }
 
 // FailDecision fails the current decision task
@@ -544,26 +526,4 @@ func CopyChildInfo(sourceInfo *persistence.ChildExecutionInfo) *persistence.Chil
 		}
 	}
 	return result
-}
-
-// CopyReplicationState copies workflow ReplicationState
-func CopyReplicationState(source *persistence.ReplicationState) *persistence.ReplicationState {
-	var lastReplicationInfo map[string]*persistence.ReplicationInfo
-	if source.LastReplicationInfo != nil {
-		lastReplicationInfo = map[string]*persistence.ReplicationInfo{}
-		for k, v := range source.LastReplicationInfo {
-			lastReplicationInfo[k] = &persistence.ReplicationInfo{
-				Version:     v.Version,
-				LastEventID: v.LastEventID,
-			}
-		}
-	}
-
-	return &persistence.ReplicationState{
-		CurrentVersion:      source.CurrentVersion,
-		StartVersion:        source.StartVersion,
-		LastWriteVersion:    source.LastWriteVersion,
-		LastWriteEventID:    source.LastWriteEventID,
-		LastReplicationInfo: lastReplicationInfo,
-	}
 }

@@ -906,6 +906,7 @@ type describeWorkflowExecutionResponse struct {
 	WorkflowExecutionInfo  workflowExecutionInfo
 	PendingActivities      []*pendingActivityInfo
 	PendingChildren        []*shared.PendingChildExecutionInfo
+	PendingDecision        *pendingDecisionInfo
 }
 
 // workflowExecutionInfo has same fields as shared.WorkflowExecutionInfo, but has datetime instead of raw time
@@ -938,6 +939,14 @@ type pendingActivityInfo struct {
 	LastFailureReason      *string `json:",omitempty"`
 	LastWorkerIdentity     *string `json:",omitempty"`
 	LastFailureDetails     *string `json:",omitempty"` // change from []byte
+}
+
+type pendingDecisionInfo struct {
+	State                      *shared.PendingDecisionState
+	OriginalScheduledTimestamp *string `json:",omitempty"` // change from *int64
+	ScheduledTimestamp         *string `json:",omitempty"` // change from *int64
+	StartedTimestamp           *string `json:",omitempty"` // change from *int64
+	Attempt                    *int64  `json:",omitempty"`
 }
 
 func convertDescribeWorkflowExecutionResponse(resp *shared.DescribeWorkflowExecutionResponse,
@@ -983,11 +992,32 @@ func convertDescribeWorkflowExecutionResponse(resp *shared.DescribeWorkflowExecu
 		pendingActs = append(pendingActs, tmpAct)
 	}
 
+	var pendingDecision *pendingDecisionInfo
+	if resp.PendingDecision != nil {
+		pendingDecision = &pendingDecisionInfo{
+			State:              resp.PendingDecision.State,
+			ScheduledTimestamp: timestampPtrToStringPtr(resp.PendingDecision.ScheduledTimestamp, false),
+			StartedTimestamp:   timestampPtrToStringPtr(resp.PendingDecision.StartedTimestamp, false),
+			Attempt:            resp.PendingDecision.Attempt,
+		}
+		// TODO: Idea here is only display decision task original scheduled timestamp if user are
+		// using decision heartbeat. And we should be able to tell whether a decision task has heartbeat
+		// or not by comparing the original scheduled timestamp and scheduled timestamp.
+		// However, currently server may assign different value to original scheduled timestamp and
+		// scheduled time even if there's no decision heartbeat.
+		// if resp.PendingDecision.OriginalScheduledTimestamp != nil &&
+		// 	resp.PendingDecision.ScheduledTimestamp != nil &&
+		// 	*resp.PendingDecision.OriginalScheduledTimestamp != *resp.PendingDecision.ScheduledTimestamp {
+		// 	pendingDecision.OriginalScheduledTimestamp = timestampPtrToStringPtr(resp.PendingDecision.OriginalScheduledTimestamp, false)
+		// }
+	}
+
 	return &describeWorkflowExecutionResponse{
 		ExecutionConfiguration: resp.ExecutionConfiguration,
 		WorkflowExecutionInfo:  executionInfo,
 		PendingActivities:      pendingActs,
 		PendingChildren:        resp.PendingChildren,
+		PendingDecision:        pendingDecision,
 	}
 }
 
@@ -1408,7 +1438,6 @@ func ObserveHistory(c *cli.Context) {
 func ResetWorkflow(c *cli.Context) {
 	domain := getRequiredGlobalOption(c, FlagDomain)
 	wid := getRequiredOption(c, FlagWorkflowID)
-	rid := getRequiredOption(c, FlagRunID)
 	reason := getRequiredOption(c, FlagReason)
 	if len(reason) == 0 {
 		ErrorAndExit("wrong reason", fmt.Errorf("reason cannot be empty"))
@@ -1427,10 +1456,17 @@ func ResetWorkflow(c *cli.Context) {
 	defer cancel()
 
 	frontendClient := cFactory.ServerFrontendClient(c)
+	rid := c.String(FlagRunID)
+	var err error
+	if rid == "" {
+		rid, err = getCurrentRunID(ctx, domain, wid, frontendClient)
+		if err != nil {
+			ErrorAndExit("Cannot get latest RunID as default", err)
+		}
+	}
 
 	resetBaseRunID := rid
 	decisionFinishID := eventID
-	var err error
 	if resetType != "" {
 		resetBaseRunID, decisionFinishID, err = getResetEventIDByType(ctx, c, resetType, domain, wid, rid, frontendClient)
 		if err != nil {
@@ -1446,6 +1482,7 @@ func ResetWorkflow(c *cli.Context) {
 		Reason:                common.StringPtr(fmt.Sprintf("%v:%v", getCurrentUserFromEnv(), reason)),
 		DecisionFinishEventId: common.Int64Ptr(decisionFinishID),
 		RequestId:             common.StringPtr(uuid.New()),
+		SkipSignalReapply:     common.BoolPtr(c.Bool(FlagSkipSignalReapply)),
 	})
 	if err != nil {
 		ErrorAndExit("reset failed", err)
@@ -1490,6 +1527,7 @@ type batchResetParamsType struct {
 	skipBaseNotCurrent   bool
 	dryRun               bool
 	resetType            string
+	skipSignalReapply    bool
 }
 
 // ResetInBatch resets workflow in batch
@@ -1517,6 +1555,7 @@ func ResetInBatch(c *cli.Context) {
 		skipBaseNotCurrent:   c.Bool(FlagSkipBaseIsNotCurrent),
 		dryRun:               c.Bool(FlagDryRun),
 		resetType:            resetType,
+		skipSignalReapply:    c.Bool(FlagSkipSignalReapply),
 	}
 
 	if inFileName == "" && query == "" {
@@ -1711,6 +1750,7 @@ func doReset(c *cli.Context, domain, wid, rid string, params batchResetParamsTyp
 			DecisionFinishEventId: common.Int64Ptr(decisionFinishID),
 			RequestId:             common.StringPtr(uuid.New()),
 			Reason:                common.StringPtr(fmt.Sprintf("%v:%v", getCurrentUserFromEnv(), params.reason)),
+			SkipSignalReapply:     common.BoolPtr(params.skipSignalReapply),
 		})
 
 		if err != nil {
@@ -1768,27 +1808,42 @@ func isLastEventDecisionTaskFailedWithNonDeterminism(ctx context.Context, domain
 	return false, nil
 }
 
-func getResetEventIDByType(ctx context.Context, c *cli.Context, resetType, domain, wid, rid string, frontendClient workflowserviceclient.Interface) (resetBaseRunID string, decisionFinishID int64, err error) {
+func getResetEventIDByType(
+	ctx context.Context,
+	c *cli.Context,
+	resetType, domain, wid, rid string,
+	frontendClient workflowserviceclient.Interface,
+) (resetBaseRunID string, decisionFinishID int64, err error) {
+	// default to the same runID
+	resetBaseRunID = rid
+
 	fmt.Println("resetType:", resetType)
 	switch resetType {
-	case "LastDecisionCompleted":
-		resetBaseRunID, decisionFinishID, err = getLastDecisionCompletedID(ctx, domain, wid, rid, frontendClient)
+	case resetTypeLastDecisionCompleted:
+		decisionFinishID, err = getLastDecisionCompletedID(ctx, domain, wid, rid, frontendClient)
 		if err != nil {
 			return
 		}
-	case "LastContinuedAsNew":
+	case resetTypeLastContinuedAsNew:
+		// this reset type may change the base runID
 		resetBaseRunID, decisionFinishID, err = getLastContinueAsNewID(ctx, domain, wid, rid, frontendClient)
 		if err != nil {
 			return
 		}
-	case "FirstDecisionCompleted":
-		resetBaseRunID, decisionFinishID, err = getFirstDecisionCompletedID(ctx, domain, wid, rid, frontendClient)
+	case resetTypeFirstDecisionCompleted:
+		decisionFinishID, err = getFirstDecisionCompletedID(ctx, domain, wid, rid, frontendClient)
 		if err != nil {
 			return
 		}
-	case "BadBinary":
+	case resetTypeBadBinary:
 		binCheckSum := c.String(FlagResetBadBinaryChecksum)
-		resetBaseRunID, decisionFinishID, err = getBadDecisionCompletedID(ctx, domain, wid, rid, binCheckSum, frontendClient)
+		decisionFinishID, err = getBadDecisionCompletedID(ctx, domain, wid, rid, binCheckSum, frontendClient)
+		if err != nil {
+			return
+		}
+	case resetTypeDecisionCompletedTime:
+		earliestTime := parseTime(c.String(FlagEarliestTime), 0)
+		decisionFinishID, err = getEarliestDecisionID(ctx, domain, wid, rid, earliestTime, frontendClient)
 		if err != nil {
 			return
 		}
@@ -1798,8 +1853,49 @@ func getResetEventIDByType(ctx context.Context, c *cli.Context, resetType, domai
 	return
 }
 
-func getLastDecisionCompletedID(ctx context.Context, domain, wid, rid string, frontendClient workflowserviceclient.Interface) (resetBaseRunID string, decisionFinishID int64, err error) {
-	resetBaseRunID = rid
+func getEarliestDecisionID(
+	ctx context.Context,
+	domain string, wid string,
+	rid string, earliestTime int64,
+	frontendClient workflowserviceclient.Interface,
+) (decisionFinishID int64, err error) {
+	req := &shared.GetWorkflowExecutionHistoryRequest{
+		Domain: common.StringPtr(domain),
+		Execution: &shared.WorkflowExecution{
+			WorkflowId: common.StringPtr(wid),
+			RunId:      common.StringPtr(rid),
+		},
+		MaximumPageSize: common.Int32Ptr(1000),
+		NextPageToken:   nil,
+	}
+
+OuterLoop:
+	for {
+		resp, err := frontendClient.GetWorkflowExecutionHistory(ctx, req)
+		if err != nil {
+			return 0, printErrorAndReturn("GetWorkflowExecutionHistory failed", err)
+		}
+		for _, e := range resp.GetHistory().GetEvents() {
+			if e.GetEventType() == shared.EventTypeDecisionTaskCompleted {
+				if e.GetTimestamp() >= earliestTime {
+					decisionFinishID = e.GetEventId()
+					break OuterLoop
+				}
+			}
+		}
+		if len(resp.NextPageToken) != 0 {
+			req.NextPageToken = resp.NextPageToken
+		} else {
+			break
+		}
+	}
+	if decisionFinishID == 0 {
+		return 0, printErrorAndReturn("Get DecisionFinishID failed", fmt.Errorf("no DecisionFinishID"))
+	}
+	return
+}
+
+func getLastDecisionCompletedID(ctx context.Context, domain, wid, rid string, frontendClient workflowserviceclient.Interface) (decisionFinishID int64, err error) {
 	req := &shared.GetWorkflowExecutionHistoryRequest{
 		Domain: common.StringPtr(domain),
 		Execution: &shared.WorkflowExecution{
@@ -1813,7 +1909,7 @@ func getLastDecisionCompletedID(ctx context.Context, domain, wid, rid string, fr
 	for {
 		resp, err := frontendClient.GetWorkflowExecutionHistory(ctx, req)
 		if err != nil {
-			return "", 0, printErrorAndReturn("GetWorkflowExecutionHistory failed", err)
+			return 0, printErrorAndReturn("GetWorkflowExecutionHistory failed", err)
 		}
 		for _, e := range resp.GetHistory().GetEvents() {
 			if e.GetEventType() == shared.EventTypeDecisionTaskCompleted {
@@ -1827,13 +1923,25 @@ func getLastDecisionCompletedID(ctx context.Context, domain, wid, rid string, fr
 		}
 	}
 	if decisionFinishID == 0 {
-		return "", 0, printErrorAndReturn("Get DecisionFinishID failed", fmt.Errorf("no DecisionFinishID"))
+		return 0, printErrorAndReturn("Get DecisionFinishID failed", fmt.Errorf("no DecisionFinishID"))
 	}
 	return
 }
 
-func getBadDecisionCompletedID(ctx context.Context, domain, wid, rid, binChecksum string, frontendClient workflowserviceclient.Interface) (resetBaseRunID string, decisionFinishID int64, err error) {
-	resetBaseRunID = rid
+func getCurrentRunID(ctx context.Context, domain, wid string, frontendClient workflowserviceclient.Interface) (string, error) {
+	resp, err := frontendClient.DescribeWorkflowExecution(ctx, &shared.DescribeWorkflowExecutionRequest{
+		Domain: common.StringPtr(domain),
+		Execution: &shared.WorkflowExecution{
+			WorkflowId: common.StringPtr(wid),
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	return resp.WorkflowExecutionInfo.Execution.GetRunId(), nil
+}
+
+func getBadDecisionCompletedID(ctx context.Context, domain, wid, rid, binChecksum string, frontendClient workflowserviceclient.Interface) (decisionFinishID int64, err error) {
 	resp, err := frontendClient.DescribeWorkflowExecution(ctx, &shared.DescribeWorkflowExecutionRequest{
 		Domain: common.StringPtr(domain),
 		Execution: &shared.WorkflowExecution{
@@ -1842,7 +1950,7 @@ func getBadDecisionCompletedID(ctx context.Context, domain, wid, rid, binChecksu
 		},
 	})
 	if err != nil {
-		return "", 0, printErrorAndReturn("DescribeWorkflowExecution failed", err)
+		return 0, printErrorAndReturn("DescribeWorkflowExecution failed", err)
 	}
 
 	_, p := execution.FindAutoResetPoint(clock.NewRealTimeSource(), &shared.BadBinaries{
@@ -1855,13 +1963,12 @@ func getBadDecisionCompletedID(ctx context.Context, domain, wid, rid, binChecksu
 	}
 
 	if decisionFinishID == 0 {
-		return "", 0, printErrorAndReturn("Get DecisionFinishID failed", &shared.BadRequestError{"no DecisionFinishID"})
+		return 0, printErrorAndReturn("Get DecisionFinishID failed", &shared.BadRequestError{"no DecisionFinishID"})
 	}
 	return
 }
 
-func getFirstDecisionCompletedID(ctx context.Context, domain, wid, rid string, frontendClient workflowserviceclient.Interface) (resetBaseRunID string, decisionFinishID int64, err error) {
-	resetBaseRunID = rid
+func getFirstDecisionCompletedID(ctx context.Context, domain, wid, rid string, frontendClient workflowserviceclient.Interface) (decisionFinishID int64, err error) {
 	req := &shared.GetWorkflowExecutionHistoryRequest{
 		Domain: common.StringPtr(domain),
 		Execution: &shared.WorkflowExecution{
@@ -1875,12 +1982,12 @@ func getFirstDecisionCompletedID(ctx context.Context, domain, wid, rid string, f
 	for {
 		resp, err := frontendClient.GetWorkflowExecutionHistory(ctx, req)
 		if err != nil {
-			return "", 0, printErrorAndReturn("GetWorkflowExecutionHistory failed", err)
+			return 0, printErrorAndReturn("GetWorkflowExecutionHistory failed", err)
 		}
 		for _, e := range resp.GetHistory().GetEvents() {
 			if e.GetEventType() == shared.EventTypeDecisionTaskCompleted {
 				decisionFinishID = e.GetEventId()
-				return resetBaseRunID, decisionFinishID, nil
+				return decisionFinishID, nil
 			}
 		}
 		if len(resp.NextPageToken) != 0 {
@@ -1890,7 +1997,7 @@ func getFirstDecisionCompletedID(ctx context.Context, domain, wid, rid string, f
 		}
 	}
 	if decisionFinishID == 0 {
-		return "", 0, printErrorAndReturn("Get DecisionFinishID failed", fmt.Errorf("no DecisionFinishID"))
+		return 0, printErrorAndReturn("Get DecisionFinishID failed", fmt.Errorf("no DecisionFinishID"))
 	}
 	return
 }

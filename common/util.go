@@ -35,12 +35,12 @@ import (
 	"go.uber.org/yarpc/yarpcerrors"
 
 	h "github.com/uber/cadence/.gen/go/history"
-	m "github.com/uber/cadence/.gen/go/matching"
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common/backoff"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/metrics"
+	"github.com/uber/cadence/common/types"
 )
 
 const (
@@ -76,7 +76,7 @@ const (
 
 	replicationServiceBusyInitialInterval    = 2 * time.Second
 	replicationServiceBusyMaxInterval        = 10 * time.Second
-	replicationServiceBusyExpirationInterval = 30 * time.Second
+	replicationServiceBusyExpirationInterval = 5 * time.Minute
 
 	contextExpireThreshold = 10 * time.Millisecond
 
@@ -310,15 +310,15 @@ func GenerateRandomString(n int) string {
 }
 
 // CreateMatchingPollForDecisionTaskResponse create response for matching's PollForDecisionTask
-func CreateMatchingPollForDecisionTaskResponse(historyResponse *h.RecordDecisionTaskStartedResponse, workflowExecution *workflow.WorkflowExecution, token []byte) *m.PollForDecisionTaskResponse {
-	matchingResp := &m.PollForDecisionTaskResponse{
+func CreateMatchingPollForDecisionTaskResponse(historyResponse *types.RecordDecisionTaskStartedResponse, workflowExecution *types.WorkflowExecution, token []byte) *types.MatchingPollForDecisionTaskResponse {
+	matchingResp := &types.MatchingPollForDecisionTaskResponse{
 		WorkflowExecution:         workflowExecution,
 		TaskToken:                 token,
 		Attempt:                   Int64Ptr(historyResponse.GetAttempt()),
 		WorkflowType:              historyResponse.WorkflowType,
-		StartedEventId:            historyResponse.StartedEventId,
+		StartedEventID:            historyResponse.StartedEventID,
 		StickyExecutionEnabled:    historyResponse.StickyExecutionEnabled,
-		NextEventId:               historyResponse.NextEventId,
+		NextEventID:               historyResponse.NextEventID,
 		DecisionInfo:              historyResponse.DecisionInfo,
 		WorkflowExecutionTaskList: historyResponse.WorkflowExecutionTaskList,
 		BranchToken:               historyResponse.BranchToken,
@@ -326,8 +326,8 @@ func CreateMatchingPollForDecisionTaskResponse(historyResponse *h.RecordDecision
 		StartedTimestamp:          historyResponse.StartedTimestamp,
 		Queries:                   historyResponse.Queries,
 	}
-	if historyResponse.GetPreviousStartedEventId() != EmptyEventID {
-		matchingResp.PreviousStartedEventId = historyResponse.PreviousStartedEventId
+	if historyResponse.GetPreviousStartedEventID() != EmptyEventID {
+		matchingResp.PreviousStartedEventID = historyResponse.PreviousStartedEventID
 	}
 	return matchingResp
 }
@@ -791,4 +791,74 @@ func IsStickyTaskConditionError(err error) bool {
 		return e.GetMessage() == StickyTaskConditionFailedErrorMsg
 	}
 	return false
+}
+
+// DurationToDays converts time.Duration to number of 24 hour days
+func DurationToDays(d time.Duration) int32 {
+	return int32(d / (24 * time.Hour))
+}
+
+// DurationToHours converts time.Duration to number of hours
+func DurationToHours(d time.Duration) int64 {
+	return int64(d / time.Hour)
+}
+
+// DurationToMinutes converts time.Duration to number of minutes
+func DurationToMinutes(d time.Duration) int64 {
+	return int64(d / time.Minute)
+}
+
+// DurationToSeconds converts time.Duration to number of seconds
+func DurationToSeconds(d time.Duration) int64 {
+	return int64(d / time.Second)
+}
+
+// DurationToMilliseconds converts time.Duration to number of milliseconds
+func DurationToMilliseconds(d time.Duration) int64 {
+	return int64(d / time.Millisecond)
+}
+
+// DurationToMicroseconds converts time.Duration to number of microseconds
+func DurationToMicroseconds(d time.Duration) int64 {
+	return int64(d / time.Microsecond)
+}
+
+// DurationToNanoseconds converts time.Duration to number of nanoseconds
+func DurationToNanoseconds(d time.Duration) int64 {
+	return int64(d / time.Nanosecond)
+}
+
+// DaysToDuration converts number of 24 hour days to time.Duration
+func DaysToDuration(d int32) time.Duration {
+	return time.Duration(d) * (24 * time.Hour)
+}
+
+// HoursToDuration converts number of hours to time.Duration
+func HoursToDuration(d int64) time.Duration {
+	return time.Duration(d) * time.Hour
+}
+
+// MinutesToDuration converts number of minutes to time.Duration
+func MinutesToDuration(d int64) time.Duration {
+	return time.Duration(d) * time.Minute
+}
+
+// SecondsToDuration converts number of seconds to time.Duration
+func SecondsToDuration(d int64) time.Duration {
+	return time.Duration(d) * time.Second
+}
+
+// MillisecondsToDuration converts number of milliseconds to time.Duration
+func MillisecondsToDuration(d int64) time.Duration {
+	return time.Duration(d) * time.Millisecond
+}
+
+// MicrosecondsToDuration converts number of microseconds to time.Duration
+func MicrosecondsToDuration(d int64) time.Duration {
+	return time.Duration(d) * time.Microsecond
+}
+
+// NanosecondsToDuration converts number of nanoseconds to time.Duration
+func NanosecondsToDuration(d int64) time.Duration {
+	return time.Duration(d) * time.Nanosecond
 }

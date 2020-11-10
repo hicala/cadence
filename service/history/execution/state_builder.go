@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-//go:generate mockgen -copyright_file ../../../LICENSE -package $GOPACKAGE -source $GOFILE -destination state_builder_mock.go -self_package github.com/uber/cadence/service/history/execution
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination state_builder_mock.go -self_package github.com/uber/cadence/service/history/execution
 
 package execution
 
@@ -114,6 +114,9 @@ func (b *stateBuilderImpl) ApplyEvents(
 			return nil, err
 		}
 		versionHistories := b.mutableState.GetVersionHistories()
+		if versionHistories == nil {
+			return nil, ErrMissingVersionHistories
+		}
 		versionHistory, err := versionHistories.GetCurrentVersionHistory()
 		if err != nil {
 			return nil, err

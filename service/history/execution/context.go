@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-//go:generate mockgen -copyright_file ../../../LICENSE -package $GOPACKAGE -source $GOFILE -destination context_mock.go -self_package github.com/uber/cadence/service/history/execution
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination context_mock.go -self_package github.com/uber/cadence/service/history/execution
 
 package execution
 
@@ -36,6 +36,8 @@ import (
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/types"
+	"github.com/uber/cadence/common/types/mapper/thrift"
 	"github.com/uber/cadence/service/history/events"
 	"github.com/uber/cadence/service/history/shard"
 )
@@ -415,14 +417,14 @@ func (c *contextImpl) CreateWorkflowExecution(
 
 	_, err := c.createWorkflowExecutionWithRetry(ctx, createRequest)
 	if err != nil {
+		if c.isPersistenceTimeoutError(err) {
+			c.notifyTasksFromWorkflowSnapshot(newWorkflow)
+		}
 		return err
 	}
 
-	c.notifyTasks(
-		newWorkflow.TransferTasks,
-		newWorkflow.ReplicationTasks,
-		newWorkflow.TimerTasks,
-	)
+	c.notifyTasksFromWorkflowSnapshot(newWorkflow)
+
 	return nil
 }
 
@@ -542,6 +544,11 @@ func (c *contextImpl) ConflictResolveWorkflowExecution(
 		CurrentWorkflowMutation: currentWorkflow,
 		// Encoding, this is set by shard context
 	}); err != nil {
+		if c.isPersistenceTimeoutError(err) {
+			c.notifyTasksFromWorkflowSnapshot(resetWorkflow)
+			c.notifyTasksFromWorkflowSnapshot(newWorkflow)
+			c.notifyTasksFromWorkflowMutation(currentWorkflow)
+		}
 		return err
 	}
 
@@ -563,25 +570,10 @@ func (c *contextImpl) ConflictResolveWorkflowExecution(
 		workflowCloseState,
 	))
 
-	c.notifyTasks(
-		resetWorkflow.TransferTasks,
-		resetWorkflow.ReplicationTasks,
-		resetWorkflow.TimerTasks,
-	)
-	if newWorkflow != nil {
-		c.notifyTasks(
-			newWorkflow.TransferTasks,
-			newWorkflow.ReplicationTasks,
-			newWorkflow.TimerTasks,
-		)
-	}
-	if currentWorkflow != nil {
-		c.notifyTasks(
-			currentWorkflow.TransferTasks,
-			currentWorkflow.ReplicationTasks,
-			currentWorkflow.TimerTasks,
-		)
-	}
+	c.notifyTasksFromWorkflowSnapshot(resetWorkflow)
+	c.notifyTasksFromWorkflowSnapshot(newWorkflow)
+	c.notifyTasksFromWorkflowMutation(currentWorkflow)
+
 	return nil
 }
 
@@ -744,6 +736,10 @@ func (c *contextImpl) UpdateWorkflowExecutionWithNew(
 		// Encoding, this is set by shard context
 	})
 	if err != nil {
+		if c.isPersistenceTimeoutError(err) {
+			c.notifyTasksFromWorkflowMutation(currentWorkflow)
+			c.notifyTasksFromWorkflowSnapshot(newWorkflow)
+		}
 		return err
 	}
 
@@ -768,20 +764,10 @@ func (c *contextImpl) UpdateWorkflowExecutionWithNew(
 	))
 
 	// notify current workflow tasks
-	c.notifyTasks(
-		currentWorkflow.TransferTasks,
-		currentWorkflow.ReplicationTasks,
-		currentWorkflow.TimerTasks,
-	)
+	c.notifyTasksFromWorkflowMutation(currentWorkflow)
 
 	// notify new workflow tasks
-	if newWorkflow != nil {
-		c.notifyTasks(
-			newWorkflow.TransferTasks,
-			newWorkflow.ReplicationTasks,
-			newWorkflow.TimerTasks,
-		)
-	}
+	c.notifyTasksFromWorkflowSnapshot(newWorkflow)
 
 	// finally emit session stats
 	domainName := c.GetDomainName()
@@ -799,17 +785,43 @@ func (c *contextImpl) UpdateWorkflowExecutionWithNew(
 	// emit workflow completion stats if any
 	if currentWorkflow.ExecutionInfo.State == persistence.WorkflowStateCompleted {
 		if event, err := c.mutableState.GetCompletionEvent(ctx); err == nil {
+			workflowType := currentWorkflow.ExecutionInfo.WorkflowTypeName
 			taskList := currentWorkflow.ExecutionInfo.TaskList
-			emitWorkflowCompletionStats(c.metricsClient, domainName, taskList, event)
+			emitWorkflowCompletionStats(c.metricsClient, domainName, workflowType, taskList, event)
 		}
 	}
 
 	return nil
 }
 
+func (c *contextImpl) notifyTasksFromWorkflowSnapshot(
+	workflowSnapShot *persistence.WorkflowSnapshot,
+) {
+	if workflowSnapShot == nil {
+		return
+	}
+
+	c.notifyTasks(
+		workflowSnapShot.TransferTasks,
+		workflowSnapShot.TimerTasks,
+	)
+}
+
+func (c *contextImpl) notifyTasksFromWorkflowMutation(
+	workflowMutation *persistence.WorkflowMutation,
+) {
+	if workflowMutation == nil {
+		return
+	}
+
+	c.notifyTasks(
+		workflowMutation.TransferTasks,
+		workflowMutation.TimerTasks,
+	)
+}
+
 func (c *contextImpl) notifyTasks(
 	transferTasks []persistence.Task,
-	replicationTasks []persistence.Task,
 	timerTasks []persistence.Task,
 ) {
 	c.shard.GetEngine().NotifyNewTransferTasks(transferTasks)
@@ -1141,9 +1153,9 @@ func (c *contextImpl) ReapplyEvents(
 
 	// Reapply events only reapply to the current run.
 	// The run id is only used for reapply event de-duplication
-	execution := &workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr(workflowID),
-		RunId:      common.StringPtr(runID),
+	execution := &types.WorkflowExecution{
+		WorkflowID: common.StringPtr(workflowID),
+		RunID:      common.StringPtr(runID),
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultRemoteCallTimeout)
 	defer cancel()
@@ -1177,12 +1189,37 @@ func (c *contextImpl) ReapplyEvents(
 			Message: fmt.Sprintf("cannot find cluster config %v to do reapply", activeCluster),
 		}
 	}
-	return sourceCluster.ReapplyEvents(
+	err = sourceCluster.ReapplyEvents(
 		ctx,
-		&workflow.ReapplyEventsRequest{
+		&types.ReapplyEventsRequest{
 			DomainName:        common.StringPtr(domainEntry.GetInfo().Name),
 			WorkflowExecution: execution,
-			Events:            reapplyEventsDataBlob.ToThrift(),
+			Events:            thrift.ToDataBlob(reapplyEventsDataBlob.ToThrift()),
 		},
 	)
+	return thrift.FromError(err)
+}
+
+func (c *contextImpl) isPersistenceTimeoutError(
+	err error,
+) bool {
+	// TODO: ideally we only need to check if err has type *persistence.Timeout,
+	// but currently only cassandra will return timeout error of that type.
+	// so currently this method will return false positives
+	switch err.(type) {
+	case nil:
+		return false
+	case *workflow.WorkflowExecutionAlreadyStartedError,
+		*persistence.WorkflowExecutionAlreadyStartedError,
+		*persistence.CurrentWorkflowConditionFailedError,
+		*persistence.ConditionFailedError,
+		*workflow.ServiceBusyError,
+		*workflow.LimitExceededError,
+		*persistence.ShardOwnershipLostError:
+		return false
+	case *persistence.TimeoutError:
+		return true
+	default:
+		return err != ErrConflict
+	}
 }

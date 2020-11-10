@@ -29,6 +29,8 @@ import (
 	"html/template"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -56,6 +58,14 @@ const licence = `// Copyright (c) 2017-2020 Uber Technologies Inc.
 `
 
 func internalName(name string) string {
+	return noUnderscores(capitalizeID(name))
+}
+
+func noUnderscores(name string) string {
+	return strings.ReplaceAll(name, "_", "")
+}
+
+func capitalizeID(name string) string {
 	if index := strings.Index(name, "Id"); index > 0 {
 		nextWordIndex := index + len("Id")
 		if nextWordIndex >= len(name) || unicode.IsUpper([]rune(name)[nextWordIndex]) {
@@ -208,6 +218,7 @@ func To{{internal .Name}}(t {{if .IsPointer}}*{{end}}{{.ThriftPackage}}.{{.Name}
 `))
 
 var historyMapperAdditions = template.Must(template.New("history mapper additions").Parse(`
+// FromProcessingQueueStateArrayMap converts internal ProcessingQueueState array map to thrift
 func FromProcessingQueueStateArrayMap(t map[string][]*types.ProcessingQueueState) map[string][]*history.ProcessingQueueState {
 	if t == nil {
 		return nil
@@ -219,6 +230,7 @@ func FromProcessingQueueStateArrayMap(t map[string][]*types.ProcessingQueueState
 	return v
 }
 
+// ToProcessingQueueStateArrayMap converts thrift ProcessingQueueState array map to internal
 func ToProcessingQueueStateArrayMap(t map[string][]*history.ProcessingQueueState) map[string][]*types.ProcessingQueueState {
 	if t == nil {
 		return nil
@@ -291,21 +303,38 @@ func newNamedType(n *types.Named) Type {
 	t.ThriftPackage = pkg.Name()
 	t.FullThriftPackage = pkg.Path()
 	if t.IsPrimitive {
+		type enumConst struct {
+			label string
+			value int
+		}
+		enumConsts := []enumConst{}
 		for _, name := range pkg.Scope().Names() {
 			enumValue := pkg.Scope().Lookup(name)
 			if isEnumValue(enumValue, n) {
-				t.EnumValues = append(t.EnumValues, enumValue.Name())
+				c := enumValue.(*types.Const)
+				val, _ := strconv.Atoi(c.Val().String())
+				enumConsts = append(enumConsts, enumConst{enumValue.Name(), val})
 			}
 		}
-		if len(t.EnumValues) > 0 {
+		if len(enumConsts) > 0 {
 			t.IsPrimitive = false
 			t.IsEnum = true
 			if _, ok := enumPointerExceptions[t.Name]; !ok {
 				t.IsPointer = true
 			}
+			sort.Slice(enumConsts, func(i, j int) bool {
+				return enumConsts[i].value < enumConsts[j].value
+			})
+			for _, c := range enumConsts {
+				t.EnumValues = append(t.EnumValues, c.label)
+			}
 		}
 	}
 	//TODO: fix this hack
+	if t.Name == "IndexedValueType" {
+		t.IsEnum = true
+		t.IsPrimitive = false
+	}
 	if t.Name == "ContinueAsNewInitiator" {
 		t.IsPrimitive = false
 	}
@@ -414,6 +443,18 @@ func main() {
 			DuplicatePrefix: "History",
 			MapperAdditions: historyMapperAdditions,
 		},
+		{
+			ThriftPackage:   "github.com/uber/cadence/.gen/go/admin",
+			TypesFile:       "common/types/admin.go",
+			MapperFile:      "common/types/mapper/thrift/admin.go",
+			DuplicatePrefix: "Admin",
+		},
+		{
+			ThriftPackage:   "github.com/uber/cadence/.gen/go/matching",
+			TypesFile:       "common/types/matching.go",
+			MapperFile:      "common/types/mapper/thrift/matching.go",
+			DuplicatePrefix: "Matching",
+		},
 	}
 
 	for _, p := range packages {
@@ -434,6 +475,9 @@ func main() {
 		for _, name := range pkg.Scope().Names() {
 			obj := pkg.Scope().Lookup(name)
 			t := newType(obj.Type())
+			if _, isConst := obj.(*types.Const); isConst {
+				continue
+			}
 			if count, ok := allNames[t.Name]; ok {
 				allNames[t.Name] = count + 1
 			} else {

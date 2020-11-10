@@ -291,6 +291,11 @@ func (t *timerQueueProcessorBase) processQueueCollections(levels map[int]struct{
 			continue
 		}
 
+		t.upsertPollTime(level, t.shard.GetCurrentTime(t.clusterName).Add(backoff.JitDuration(
+			t.options.MaxPollInterval(),
+			t.options.MaxPollIntervalJitterCoefficient(),
+		)))
+
 		var nextPageToken []byte
 		readLevel := activeQueue.State().ReadLevel()
 		maxReadLevel := minTaskKey(activeQueue.State().MaxLevel(), t.updateMaxReadLevel())
@@ -329,12 +334,6 @@ func (t *timerQueueProcessorBase) processQueueCollections(levels map[int]struct{
 			t.upsertPollTime(level, time.Time{}) // re-enqueue the event
 			continue
 		}
-
-		// TODO: consider remove max poll interval
-		t.upsertPollTime(level, t.shard.GetCurrentTime(t.clusterName).Add(backoff.JitDuration(
-			t.options.MaxPollInterval(),
-			t.options.MaxPollIntervalJitterCoefficient(),
-		)))
 
 		tasks := make(map[task.Key]task.Task)
 		taskChFull := false
@@ -438,7 +437,13 @@ func (t *timerQueueProcessorBase) readAndFilterTasks(
 		// only look ahead within the processing queue boundary
 		lookAheadTask, err = t.readLookAheadTask(maxReadLevel, maximumTimerTaskKey)
 		if err != nil {
-			return filteredTasks, nil, nil, nil
+			// we don't know if look ahead task exists or not, but we know if it exists,
+			// it's visibility timestamp is larger than or equal to maxReadLevel.
+			// so, create a fake look ahead task so another load can be triggered at that time.
+			lookAheadTask = &persistence.TimerTaskInfo{
+				VisibilityTimestamp: maxReadLevel.(timerTaskKey).visibilityTimestamp,
+			}
+			return filteredTasks, lookAheadTask, nil, nil
 		}
 	}
 

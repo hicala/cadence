@@ -26,6 +26,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/uber/cadence/.gen/go/history"
+	"github.com/uber/cadence/.gen/go/replicator"
+
 	"github.com/pborman/uuid"
 
 	workflow "github.com/uber/cadence/.gen/go/shared"
@@ -243,24 +246,24 @@ type (
 
 	// ShardInfo describes a shard
 	ShardInfo struct {
-		ShardID                       int                              `json:"shard_id"`
-		Owner                         string                           `json:"owner"`
-		RangeID                       int64                            `json:"range_id"`
-		StolenSinceRenew              int                              `json:"stolen_since_renew"`
-		UpdatedAt                     time.Time                        `json:"updated_at"`
-		ReplicationAckLevel           int64                            `json:"replication_ack_level"`
-		ReplicationDLQAckLevel        map[string]int64                 `json:"replication_dlq_ack_level"`
-		TransferAckLevel              int64                            `json:"transfer_ack_level"`
-		TimerAckLevel                 time.Time                        `json:"timer_ack_level"`
-		ClusterTransferAckLevel       map[string]int64                 `json:"cluster_transfer_ack_level"`
-		ClusterTimerAckLevel          map[string]time.Time             `json:"cluster_timer_ack_level"`
-		TransferProcessingQueueStates *DataBlob                        `json:"transfer_processing_queue_states"`
-		TimerProcessingQueueStates    *DataBlob                        `json:"timer_processing_queue_states"`
-		TransferFailoverLevels        map[string]TransferFailoverLevel // uuid -> TransferFailoverLevel
-		TimerFailoverLevels           map[string]TimerFailoverLevel    // uuid -> TimerFailoverLevel
-		ClusterReplicationLevel       map[string]int64                 `json:"cluster_replication_level"`
-		DomainNotificationVersion     int64                            `json:"domain_notification_version"`
-		PendingFailoverMarkers        *DataBlob                        `json:"pending_failover_markers"`
+		ShardID                       int                                    `json:"shard_id"`
+		Owner                         string                                 `json:"owner"`
+		RangeID                       int64                                  `json:"range_id"`
+		StolenSinceRenew              int                                    `json:"stolen_since_renew"`
+		UpdatedAt                     time.Time                              `json:"updated_at"`
+		ReplicationAckLevel           int64                                  `json:"replication_ack_level"`
+		ReplicationDLQAckLevel        map[string]int64                       `json:"replication_dlq_ack_level"`
+		TransferAckLevel              int64                                  `json:"transfer_ack_level"`
+		TimerAckLevel                 time.Time                              `json:"timer_ack_level"`
+		ClusterTransferAckLevel       map[string]int64                       `json:"cluster_transfer_ack_level"`
+		ClusterTimerAckLevel          map[string]time.Time                   `json:"cluster_timer_ack_level"`
+		TransferProcessingQueueStates *history.ProcessingQueueStates         `json:"transfer_processing_queue_states"`
+		TimerProcessingQueueStates    *history.ProcessingQueueStates         `json:"timer_processing_queue_states"`
+		TransferFailoverLevels        map[string]TransferFailoverLevel       // uuid -> TransferFailoverLevel
+		TimerFailoverLevels           map[string]TimerFailoverLevel          // uuid -> TimerFailoverLevel
+		ClusterReplicationLevel       map[string]int64                       `json:"cluster_replication_level"`
+		DomainNotificationVersion     int64                                  `json:"domain_notification_version"`
+		PendingFailoverMarkers        []*replicator.FailoverMarkerAttributes `json:"pending_failover_markers"`
 	}
 
 	// TransferFailoverLevel contains corresponding start / end level
@@ -348,6 +351,7 @@ type (
 
 	// ReplicationState represents mutable state information for global domains.
 	// This information is used by replication protocol when applying events from remote clusters
+	// TODO: remove this struct after all 2DC workflows complete
 	ReplicationState struct {
 		CurrentVersion      int64
 		StartVersion        int64
@@ -656,6 +660,7 @@ type (
 		ExecutionStats      *ExecutionStats
 		BufferedEvents      []*workflow.HistoryEvent
 		VersionHistories    *VersionHistories
+		ReplicationState    *ReplicationState // TODO: remove this after all 2DC workflows complete
 		Checksum            checksum.Checksum
 	}
 
@@ -1635,12 +1640,13 @@ type (
 		DeleteMessagesBefore(ctx context.Context, messageID int64) error
 		UpdateAckLevel(ctx context.Context, messageID int64, clusterName string) error
 		GetAckLevels(ctx context.Context) (map[string]int64, error)
-		EnqueueMessageToDLQ(ctx context.Context, messagePayload []byte) (int64, error)
+		EnqueueMessageToDLQ(ctx context.Context, messagePayload []byte) error
 		ReadMessagesFromDLQ(ctx context.Context, firstMessageID int64, lastMessageID int64, pageSize int, pageToken []byte) ([]*QueueMessage, []byte, error)
 		DeleteMessageFromDLQ(ctx context.Context, messageID int64) error
 		RangeDeleteMessagesFromDLQ(ctx context.Context, firstMessageID int64, lastMessageID int64) error
 		UpdateDLQAckLevel(ctx context.Context, messageID int64, clusterName string) error
 		GetDLQAckLevels(ctx context.Context) (map[string]int64, error)
+		GetDLQSize(ctx context.Context) (int64, error)
 	}
 
 	// QueueMessage is the message that stores in the queue

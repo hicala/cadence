@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-//go:generate mockgen -copyright_file ../../../LICENSE -package $GOPACKAGE -source $GOFILE -destination transaction_manager_mock.go
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination transaction_manager_mock.go
 
 package ndc
 
@@ -328,6 +328,9 @@ func (r *transactionManagerImpl) backfillWorkflowEventsReapply(
 		}
 
 		baseVersionHistories := baseMutableState.GetVersionHistories()
+		if baseVersionHistories == nil {
+			return 0, execution.TransactionPolicyActive, execution.ErrMissingVersionHistories
+		}
 		baseCurrentVersionHistory, err := baseVersionHistories.GetCurrentVersionHistory()
 		if err != nil {
 			return 0, execution.TransactionPolicyActive, err
@@ -353,6 +356,7 @@ func (r *transactionManagerImpl) backfillWorkflowEventsReapply(
 			targetWorkflow,
 			EventsReapplicationResetWorkflowReason,
 			targetWorkflowEvents.Events,
+			false,
 		); err != nil {
 			return 0, execution.TransactionPolicyActive, err
 		}

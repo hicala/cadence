@@ -52,6 +52,7 @@ import (
 	cndc "github.com/uber/cadence/common/ndc"
 	"github.com/uber/cadence/common/persistence"
 	"github.com/uber/cadence/common/reconciliation/invariant"
+	"github.com/uber/cadence/common/types/mapper/thrift"
 	"github.com/uber/cadence/service/history/config"
 	"github.com/uber/cadence/service/history/engine"
 	"github.com/uber/cadence/service/history/events"
@@ -135,6 +136,8 @@ var (
 	ErrWorkflowParent = &workflow.EntityNotExistsError{Message: "workflow parent does not match"}
 	// ErrDeserializingToken is the error to indicate task token is invalid
 	ErrDeserializingToken = &workflow.BadRequestError{Message: "error deserializing task token"}
+	// ErrSerializingToken is the error to indicate task token can not be serialized
+	ErrSerializingToken = &workflow.BadRequestError{Message: "error serializing task token"}
 	// ErrSignalOverSize is the error to indicate signal input size is > 256K
 	ErrSignalOverSize = &workflow.BadRequestError{Message: "signal input size is over 256K"}
 	// ErrCancellationAlreadyRequested is the error indicating cancellation for target workflow is already requested
@@ -298,7 +301,8 @@ func NewEngineWithShardContext(
 		common.IsServiceBusyError,
 	)
 	resendFunc := func(ctx context.Context, request *h.ReplicateEventsV2Request) error {
-		return historyRetryableClient.ReplicateEventsV2(ctx, request)
+		err := historyRetryableClient.ReplicateEventsV2(ctx, thrift.ToReplicateEventsV2Request(request))
+		return thrift.FromError(err)
 	}
 	for _, replicationTaskFetcher := range replicationTaskFetchers.GetFetchers() {
 		sourceCluster := replicationTaskFetcher.GetSourceCluster()
@@ -1245,7 +1249,9 @@ func (e *historyEngineImpl) queryDirectlyThroughMatching(
 		// a really short deadline, causing we clear the stickiness
 		stickyContext, cancel := context.WithTimeout(context.Background(), time.Duration(msResp.GetStickyTaskListScheduleToStartTimeout())*time.Second)
 		stickyStopWatch := scope.StartTimer(metrics.DirectQueryDispatchStickyLatency)
-		matchingResp, err := e.rawMatchingClient.QueryWorkflow(stickyContext, stickyMatchingRequest)
+		clientResp, err := e.rawMatchingClient.QueryWorkflow(stickyContext, thrift.ToMatchingQueryWorkflowRequest(stickyMatchingRequest))
+		matchingResp := thrift.FromQueryWorkflowResponse(clientResp)
+		err = thrift.FromError(err)
 		stickyStopWatch.Stop()
 		cancel()
 		if err == nil {
@@ -1307,7 +1313,9 @@ func (e *historyEngineImpl) queryDirectlyThroughMatching(
 	}
 
 	nonStickyStopWatch := scope.StartTimer(metrics.DirectQueryDispatchNonStickyLatency)
-	matchingResp, err := e.matchingClient.QueryWorkflow(ctx, nonStickyMatchingRequest)
+	clientResp, err := e.matchingClient.QueryWorkflow(ctx, thrift.ToMatchingQueryWorkflowRequest(nonStickyMatchingRequest))
+	matchingResp := thrift.FromQueryWorkflowResponse(clientResp)
+	err = thrift.FromError(err)
 	nonStickyStopWatch.Stop()
 	if err != nil {
 		e.logger.Error("query directly though matching on non-sticky failed",
@@ -1589,6 +1597,20 @@ func (e *historyEngineImpl) DescribeWorkflowExecution(
 			}
 			result.PendingChildren = append(result.PendingChildren, p)
 		}
+	}
+
+	if di, ok := mutableState.GetPendingDecision(); ok {
+		pendingDecision := &workflow.PendingDecisionInfo{
+			State:                      workflow.PendingDecisionStateScheduled.Ptr(),
+			ScheduledTimestamp:         common.Int64Ptr(di.ScheduledTimestamp),
+			Attempt:                    common.Int64Ptr(di.Attempt),
+			OriginalScheduledTimestamp: common.Int64Ptr(di.OriginalScheduledTimestamp),
+		}
+		if di.StartedID != common.EmptyEventID {
+			pendingDecision.State = workflow.PendingDecisionStateStarted.Ptr()
+			pendingDecision.StartedTimestamp = common.Int64Ptr(di.StartedTimestamp)
+		}
+		result.PendingDecision = pendingDecision
 	}
 
 	return result, nil
@@ -2513,16 +2535,24 @@ func (e *historyEngineImpl) ResetWorkflowExecution(
 	resetRunID := uuid.New()
 	baseRebuildLastEventID := request.GetDecisionFinishEventId() - 1
 	baseVersionHistories := baseMutableState.GetVersionHistories()
-	baseCurrentVersionHistory, err := baseVersionHistories.GetCurrentVersionHistory()
+	baseCurrentBranchToken, err := baseMutableState.GetCurrentBranchToken()
 	if err != nil {
 		return nil, err
 	}
-	baseRebuildLastEventVersion, err := baseCurrentVersionHistory.GetEventVersion(baseRebuildLastEventID)
-	if err != nil {
-		return nil, err
-	}
-	baseCurrentBranchToken := baseCurrentVersionHistory.GetBranchToken()
+	baseRebuildLastEventVersion := baseMutableState.GetCurrentVersion()
 	baseNextEventID := baseMutableState.GetNextEventID()
+
+	if baseVersionHistories != nil {
+		baseCurrentVersionHistory, err := baseVersionHistories.GetCurrentVersionHistory()
+		if err != nil {
+			return nil, err
+		}
+		baseRebuildLastEventVersion, err = baseCurrentVersionHistory.GetEventVersion(baseRebuildLastEventID)
+		if err != nil {
+			return nil, err
+		}
+		baseCurrentBranchToken = baseCurrentVersionHistory.GetBranchToken()
+	}
 
 	if err := e.workflowResetter.ResetWorkflow(
 		ctx,
@@ -2545,6 +2575,7 @@ func (e *historyEngineImpl) ResetWorkflowExecution(
 		),
 		request.GetReason(),
 		nil,
+		request.GetSkipSignalReapply(),
 	); err != nil {
 		return nil, err
 	}
@@ -3140,6 +3171,9 @@ func (e *historyEngineImpl) ReapplyEvents(
 				}
 
 				baseVersionHistories := mutableState.GetVersionHistories()
+				if baseVersionHistories == nil {
+					return nil, execution.ErrMissingVersionHistories
+				}
 				baseCurrentVersionHistory, err := baseVersionHistories.GetCurrentVersionHistory()
 				if err != nil {
 					return nil, err
@@ -3172,6 +3206,7 @@ func (e *historyEngineImpl) ReapplyEvents(
 					),
 					ndc.EventsReapplicationResetWorkflowReason,
 					toReapplyEvents,
+					false,
 				); err != nil {
 					return nil, err
 				}

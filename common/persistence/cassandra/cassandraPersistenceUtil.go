@@ -26,10 +26,13 @@ import (
 
 	"github.com/gocql/gocql"
 
+	"github.com/uber/cadence/.gen/go/shared"
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/checksum"
 	p "github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/persistence/nosql/nosqlplugin"
+	"github.com/uber/cadence/common/persistence/nosql/nosqlplugin/cassandra"
 )
 
 func applyWorkflowMutationBatch(
@@ -55,6 +58,7 @@ func applyWorkflowMutationBatch(
 		cqlNowTimestampMillis,
 		condition,
 		workflowMutation.Checksum,
+		workflowMutation.LastWriteVersion,
 	); err != nil {
 		return err
 	}
@@ -169,6 +173,7 @@ func applyWorkflowSnapshotBatchAsReset(
 		cqlNowTimestampMillis,
 		condition,
 		workflowSnapshot.Checksum,
+		workflowSnapshot.LastWriteVersion,
 	); err != nil {
 		return err
 	}
@@ -273,6 +278,7 @@ func applyWorkflowSnapshotBatchAsNew(
 		versionHistories,
 		workflowSnapshot.Checksum,
 		cqlNowTimestampMillis,
+		workflowSnapshot.LastWriteVersion,
 	); err != nil {
 		return err
 	}
@@ -361,6 +367,7 @@ func createExecution(
 	versionHistories *p.DataBlob,
 	checksum checksum.Checksum,
 	cqlNowTimestampMillis int64,
+	lastWriteVersion int64,
 ) error {
 
 	// validate workflow state & close status
@@ -388,157 +395,87 @@ func createExecution(
 	// TODO we should set the start time and last update time on business logic layer
 	executionInfo.StartTimestamp = time.Unix(0, p.DBTimestampToUnixNano(cqlNowTimestampMillis))
 	executionInfo.LastUpdatedTimestamp = time.Unix(0, p.DBTimestampToUnixNano(cqlNowTimestampMillis))
-
 	completionData, completionEncoding := p.FromDataBlob(executionInfo.CompletionEvent)
-	if versionHistories == nil {
-		// Cross DC feature is currently disabled so we will be creating workflow executions without version histories
-		batch.Query(templateCreateWorkflowExecutionQuery,
-			shardID,
-			domainID,
-			workflowID,
-			runID,
-			rowTypeExecution,
-			domainID,
-			workflowID,
-			runID,
-			parentDomainID,
-			parentWorkflowID,
-			parentRunID,
-			initiatedID,
-			executionInfo.CompletionEventBatchID,
-			completionData,
-			completionEncoding,
-			executionInfo.TaskList,
-			executionInfo.WorkflowTypeName,
-			executionInfo.WorkflowTimeout,
-			executionInfo.DecisionStartToCloseTimeout,
-			executionInfo.ExecutionContext,
-			executionInfo.State,
-			executionInfo.CloseStatus,
-			executionInfo.LastFirstEventID,
-			executionInfo.LastEventTaskID,
-			executionInfo.NextEventID,
-			executionInfo.LastProcessedEvent,
-			executionInfo.StartTimestamp,
-			executionInfo.LastUpdatedTimestamp,
-			executionInfo.CreateRequestID,
-			executionInfo.SignalCount,
-			executionInfo.HistorySize,
-			executionInfo.DecisionVersion,
-			executionInfo.DecisionScheduleID,
-			executionInfo.DecisionStartedID,
-			executionInfo.DecisionRequestID,
-			executionInfo.DecisionTimeout,
-			executionInfo.DecisionAttempt,
-			executionInfo.DecisionStartedTimestamp,
-			executionInfo.DecisionScheduledTimestamp,
-			executionInfo.DecisionOriginalScheduledTimestamp,
-			executionInfo.CancelRequested,
-			executionInfo.CancelRequestID,
-			executionInfo.StickyTaskList,
-			executionInfo.StickyScheduleToStartTimeout,
-			executionInfo.ClientLibraryVersion,
-			executionInfo.ClientFeatureVersion,
-			executionInfo.ClientImpl,
-			executionInfo.AutoResetPoints.Data,
-			executionInfo.AutoResetPoints.GetEncoding(),
-			executionInfo.Attempt,
-			executionInfo.HasRetryPolicy,
-			executionInfo.InitialInterval,
-			executionInfo.BackoffCoefficient,
-			executionInfo.MaximumInterval,
-			executionInfo.ExpirationTime,
-			executionInfo.MaximumAttempts,
-			executionInfo.NonRetriableErrors,
-			p.EventStoreVersion,
-			executionInfo.BranchToken,
-			executionInfo.CronSchedule,
-			executionInfo.ExpirationSeconds,
-			executionInfo.SearchAttributes,
-			executionInfo.Memo,
-			executionInfo.NextEventID,
-			defaultVisibilityTimestamp,
-			rowTypeExecutionTaskID,
-			checksum.Version,
-			checksum.Flavor,
-			checksum.Value)
-	} else {
-		// TODO also need to set the start / current / last write version
-		versionHistoriesData, versionHistoriesEncoding := p.FromDataBlob(versionHistories)
-		batch.Query(templateCreateWorkflowExecutionWithVersionHistoriesQuery,
-			shardID,
-			domainID,
-			workflowID,
-			runID,
-			rowTypeExecution,
-			domainID,
-			workflowID,
-			runID,
-			parentDomainID,
-			parentWorkflowID,
-			parentRunID,
-			initiatedID,
-			executionInfo.CompletionEventBatchID,
-			completionData,
-			completionEncoding,
-			executionInfo.TaskList,
-			executionInfo.WorkflowTypeName,
-			executionInfo.WorkflowTimeout,
-			executionInfo.DecisionStartToCloseTimeout,
-			executionInfo.ExecutionContext,
-			executionInfo.State,
-			executionInfo.CloseStatus,
-			executionInfo.LastFirstEventID,
-			executionInfo.LastEventTaskID,
-			executionInfo.NextEventID,
-			executionInfo.LastProcessedEvent,
-			executionInfo.StartTimestamp,
-			executionInfo.LastUpdatedTimestamp,
-			executionInfo.CreateRequestID,
-			executionInfo.SignalCount,
-			executionInfo.HistorySize,
-			executionInfo.DecisionVersion,
-			executionInfo.DecisionScheduleID,
-			executionInfo.DecisionStartedID,
-			executionInfo.DecisionRequestID,
-			executionInfo.DecisionTimeout,
-			executionInfo.DecisionAttempt,
-			executionInfo.DecisionStartedTimestamp,
-			executionInfo.DecisionScheduledTimestamp,
-			executionInfo.DecisionOriginalScheduledTimestamp,
-			executionInfo.CancelRequested,
-			executionInfo.CancelRequestID,
-			executionInfo.StickyTaskList,
-			executionInfo.StickyScheduleToStartTimeout,
-			executionInfo.ClientLibraryVersion,
-			executionInfo.ClientFeatureVersion,
-			executionInfo.ClientImpl,
-			executionInfo.AutoResetPoints.Data,
-			executionInfo.AutoResetPoints.GetEncoding(),
-			executionInfo.Attempt,
-			executionInfo.HasRetryPolicy,
-			executionInfo.InitialInterval,
-			executionInfo.BackoffCoefficient,
-			executionInfo.MaximumInterval,
-			executionInfo.ExpirationTime,
-			executionInfo.MaximumAttempts,
-			executionInfo.NonRetriableErrors,
-			p.EventStoreVersion,
-			executionInfo.BranchToken,
-			executionInfo.CronSchedule,
-			executionInfo.ExpirationSeconds,
-			executionInfo.SearchAttributes,
-			executionInfo.Memo,
-			executionInfo.NextEventID,
-			defaultVisibilityTimestamp,
-			rowTypeExecutionTaskID,
-			versionHistoriesData,
-			versionHistoriesEncoding,
-			checksum.Version,
-			checksum.Flavor,
-			checksum.Value)
-	}
 
+	if versionHistories == nil {
+		return &workflow.InternalServiceError{Message: "encounter empty version histories in createExecution"}
+	}
+	versionHistoriesData, versionHistoriesEncoding := p.FromDataBlob(versionHistories)
+	batch.Query(templateCreateWorkflowExecutionWithVersionHistoriesQuery,
+		shardID,
+		domainID,
+		workflowID,
+		runID,
+		rowTypeExecution,
+		domainID,
+		workflowID,
+		runID,
+		parentDomainID,
+		parentWorkflowID,
+		parentRunID,
+		initiatedID,
+		executionInfo.CompletionEventBatchID,
+		completionData,
+		completionEncoding,
+		executionInfo.TaskList,
+		executionInfo.WorkflowTypeName,
+		executionInfo.WorkflowTimeout,
+		executionInfo.DecisionStartToCloseTimeout,
+		executionInfo.ExecutionContext,
+		executionInfo.State,
+		executionInfo.CloseStatus,
+		executionInfo.LastFirstEventID,
+		executionInfo.LastEventTaskID,
+		executionInfo.NextEventID,
+		executionInfo.LastProcessedEvent,
+		executionInfo.StartTimestamp,
+		executionInfo.LastUpdatedTimestamp,
+		executionInfo.CreateRequestID,
+		executionInfo.SignalCount,
+		executionInfo.HistorySize,
+		executionInfo.DecisionVersion,
+		executionInfo.DecisionScheduleID,
+		executionInfo.DecisionStartedID,
+		executionInfo.DecisionRequestID,
+		executionInfo.DecisionTimeout,
+		executionInfo.DecisionAttempt,
+		executionInfo.DecisionStartedTimestamp,
+		executionInfo.DecisionScheduledTimestamp,
+		executionInfo.DecisionOriginalScheduledTimestamp,
+		executionInfo.CancelRequested,
+		executionInfo.CancelRequestID,
+		executionInfo.StickyTaskList,
+		executionInfo.StickyScheduleToStartTimeout,
+		executionInfo.ClientLibraryVersion,
+		executionInfo.ClientFeatureVersion,
+		executionInfo.ClientImpl,
+		executionInfo.AutoResetPoints.Data,
+		executionInfo.AutoResetPoints.GetEncoding(),
+		executionInfo.Attempt,
+		executionInfo.HasRetryPolicy,
+		executionInfo.InitialInterval,
+		executionInfo.BackoffCoefficient,
+		executionInfo.MaximumInterval,
+		executionInfo.ExpirationTime,
+		executionInfo.MaximumAttempts,
+		executionInfo.NonRetriableErrors,
+		p.EventStoreVersion,
+		executionInfo.BranchToken,
+		executionInfo.CronSchedule,
+		executionInfo.ExpirationSeconds,
+		executionInfo.SearchAttributes,
+		executionInfo.Memo,
+		executionInfo.NextEventID,
+		defaultVisibilityTimestamp,
+		rowTypeExecutionTaskID,
+		versionHistoriesData,
+		versionHistoriesEncoding,
+		checksum.Version,
+		checksum.Flavor,
+		checksum.Value,
+		lastWriteVersion,
+		executionInfo.State,
+	)
 	return nil
 }
 
@@ -550,6 +487,7 @@ func updateExecution(
 	cqlNowTimestampMillis int64,
 	condition int64,
 	checksum checksum.Checksum,
+	lastWriteVersion int64,
 ) error {
 
 	// validate workflow state & close status
@@ -579,155 +517,85 @@ func updateExecution(
 
 	completionData, completionEncoding := p.FromDataBlob(executionInfo.CompletionEvent)
 	if versionHistories == nil {
-		// Updates will be called with null version histories while the feature is disabled
-		batch.Query(templateUpdateWorkflowExecutionQuery,
-			domainID,
-			workflowID,
-			runID,
-			parentDomainID,
-			parentWorkflowID,
-			parentRunID,
-			initiatedID,
-			executionInfo.CompletionEventBatchID,
-			completionData,
-			completionEncoding,
-			executionInfo.TaskList,
-			executionInfo.WorkflowTypeName,
-			executionInfo.WorkflowTimeout,
-			executionInfo.DecisionStartToCloseTimeout,
-			executionInfo.ExecutionContext,
-			executionInfo.State,
-			executionInfo.CloseStatus,
-			executionInfo.LastFirstEventID,
-			executionInfo.LastEventTaskID,
-			executionInfo.NextEventID,
-			executionInfo.LastProcessedEvent,
-			executionInfo.StartTimestamp,
-			executionInfo.LastUpdatedTimestamp,
-			executionInfo.CreateRequestID,
-			executionInfo.SignalCount,
-			executionInfo.HistorySize,
-			executionInfo.DecisionVersion,
-			executionInfo.DecisionScheduleID,
-			executionInfo.DecisionStartedID,
-			executionInfo.DecisionRequestID,
-			executionInfo.DecisionTimeout,
-			executionInfo.DecisionAttempt,
-			executionInfo.DecisionStartedTimestamp,
-			executionInfo.DecisionScheduledTimestamp,
-			executionInfo.DecisionOriginalScheduledTimestamp,
-			executionInfo.CancelRequested,
-			executionInfo.CancelRequestID,
-			executionInfo.StickyTaskList,
-			executionInfo.StickyScheduleToStartTimeout,
-			executionInfo.ClientLibraryVersion,
-			executionInfo.ClientFeatureVersion,
-			executionInfo.ClientImpl,
-			executionInfo.AutoResetPoints.Data,
-			executionInfo.AutoResetPoints.GetEncoding(),
-			executionInfo.Attempt,
-			executionInfo.HasRetryPolicy,
-			executionInfo.InitialInterval,
-			executionInfo.BackoffCoefficient,
-			executionInfo.MaximumInterval,
-			executionInfo.ExpirationTime,
-			executionInfo.MaximumAttempts,
-			executionInfo.NonRetriableErrors,
-			p.EventStoreVersion,
-			executionInfo.BranchToken,
-			executionInfo.CronSchedule,
-			executionInfo.ExpirationSeconds,
-			executionInfo.SearchAttributes,
-			executionInfo.Memo,
-			executionInfo.NextEventID,
-			checksum.Version,
-			checksum.Flavor,
-			checksum.Value,
-			shardID,
-			rowTypeExecution,
-			domainID,
-			workflowID,
-			runID,
-			defaultVisibilityTimestamp,
-			rowTypeExecutionTaskID,
-			condition)
-	} else {
-		// TODO also need to set the start / current / last write version
-		versionHistoriesData, versionHistoriesEncoding := p.FromDataBlob(versionHistories)
-		batch.Query(templateUpdateWorkflowExecutionWithVersionHistoriesQuery,
-			domainID,
-			workflowID,
-			runID,
-			parentDomainID,
-			parentWorkflowID,
-			parentRunID,
-			initiatedID,
-			executionInfo.CompletionEventBatchID,
-			completionData,
-			completionEncoding,
-			executionInfo.TaskList,
-			executionInfo.WorkflowTypeName,
-			executionInfo.WorkflowTimeout,
-			executionInfo.DecisionStartToCloseTimeout,
-			executionInfo.ExecutionContext,
-			executionInfo.State,
-			executionInfo.CloseStatus,
-			executionInfo.LastFirstEventID,
-			executionInfo.LastEventTaskID,
-			executionInfo.NextEventID,
-			executionInfo.LastProcessedEvent,
-			executionInfo.StartTimestamp,
-			executionInfo.LastUpdatedTimestamp,
-			executionInfo.CreateRequestID,
-			executionInfo.SignalCount,
-			executionInfo.HistorySize,
-			executionInfo.DecisionVersion,
-			executionInfo.DecisionScheduleID,
-			executionInfo.DecisionStartedID,
-			executionInfo.DecisionRequestID,
-			executionInfo.DecisionTimeout,
-			executionInfo.DecisionAttempt,
-			executionInfo.DecisionStartedTimestamp,
-			executionInfo.DecisionScheduledTimestamp,
-			executionInfo.DecisionOriginalScheduledTimestamp,
-			executionInfo.CancelRequested,
-			executionInfo.CancelRequestID,
-			executionInfo.StickyTaskList,
-			executionInfo.StickyScheduleToStartTimeout,
-			executionInfo.ClientLibraryVersion,
-			executionInfo.ClientFeatureVersion,
-			executionInfo.ClientImpl,
-			executionInfo.AutoResetPoints.Data,
-			executionInfo.AutoResetPoints.GetEncoding(),
-			executionInfo.Attempt,
-			executionInfo.HasRetryPolicy,
-			executionInfo.InitialInterval,
-			executionInfo.BackoffCoefficient,
-			executionInfo.MaximumInterval,
-			executionInfo.ExpirationTime,
-			executionInfo.MaximumAttempts,
-			executionInfo.NonRetriableErrors,
-			p.EventStoreVersion,
-			executionInfo.BranchToken,
-			executionInfo.CronSchedule,
-			executionInfo.ExpirationSeconds,
-			executionInfo.SearchAttributes,
-			executionInfo.Memo,
-			executionInfo.NextEventID,
-			versionHistoriesData,
-			versionHistoriesEncoding,
-			checksum.Version,
-			checksum.Flavor,
-			checksum.Value,
-			shardID,
-			rowTypeExecution,
-			domainID,
-			workflowID,
-			runID,
-			defaultVisibilityTimestamp,
-			rowTypeExecutionTaskID,
-			condition)
+		return &workflow.InternalServiceError{Message: "encounter empty version histories in updateExecution"}
 	}
+	// TODO also need to set the start / current / last write version
+	versionHistoriesData, versionHistoriesEncoding := p.FromDataBlob(versionHistories)
+	batch.Query(templateUpdateWorkflowExecutionWithVersionHistoriesQuery,
+		domainID,
+		workflowID,
+		runID,
+		parentDomainID,
+		parentWorkflowID,
+		parentRunID,
+		initiatedID,
+		executionInfo.CompletionEventBatchID,
+		completionData,
+		completionEncoding,
+		executionInfo.TaskList,
+		executionInfo.WorkflowTypeName,
+		executionInfo.WorkflowTimeout,
+		executionInfo.DecisionStartToCloseTimeout,
+		executionInfo.ExecutionContext,
+		executionInfo.State,
+		executionInfo.CloseStatus,
+		executionInfo.LastFirstEventID,
+		executionInfo.LastEventTaskID,
+		executionInfo.NextEventID,
+		executionInfo.LastProcessedEvent,
+		executionInfo.StartTimestamp,
+		executionInfo.LastUpdatedTimestamp,
+		executionInfo.CreateRequestID,
+		executionInfo.SignalCount,
+		executionInfo.HistorySize,
+		executionInfo.DecisionVersion,
+		executionInfo.DecisionScheduleID,
+		executionInfo.DecisionStartedID,
+		executionInfo.DecisionRequestID,
+		executionInfo.DecisionTimeout,
+		executionInfo.DecisionAttempt,
+		executionInfo.DecisionStartedTimestamp,
+		executionInfo.DecisionScheduledTimestamp,
+		executionInfo.DecisionOriginalScheduledTimestamp,
+		executionInfo.CancelRequested,
+		executionInfo.CancelRequestID,
+		executionInfo.StickyTaskList,
+		executionInfo.StickyScheduleToStartTimeout,
+		executionInfo.ClientLibraryVersion,
+		executionInfo.ClientFeatureVersion,
+		executionInfo.ClientImpl,
+		executionInfo.AutoResetPoints.Data,
+		executionInfo.AutoResetPoints.GetEncoding(),
+		executionInfo.Attempt,
+		executionInfo.HasRetryPolicy,
+		executionInfo.InitialInterval,
+		executionInfo.BackoffCoefficient,
+		executionInfo.MaximumInterval,
+		executionInfo.ExpirationTime,
+		executionInfo.MaximumAttempts,
+		executionInfo.NonRetriableErrors,
+		p.EventStoreVersion,
+		executionInfo.BranchToken,
+		executionInfo.CronSchedule,
+		executionInfo.ExpirationSeconds,
+		executionInfo.SearchAttributes,
+		executionInfo.Memo,
+		executionInfo.NextEventID,
+		versionHistoriesData,
+		versionHistoriesEncoding,
+		checksum.Version,
+		checksum.Flavor,
+		checksum.Value,
+		lastWriteVersion,
+		executionInfo.State,
+		shardID,
+		rowTypeExecution,
+		domainID,
+		workflowID,
+		runID,
+		defaultVisibilityTimestamp,
+		rowTypeExecutionTaskID,
+		condition)
 
 	return nil
 }
@@ -1034,8 +902,6 @@ func createOrUpdateCurrentExecution(
 			createRequestID,
 			state,
 			closeStatus,
-			startVersion,
-			lastWriteVersion,
 			lastWriteVersion,
 			state,
 			shardID,
@@ -1054,8 +920,6 @@ func createOrUpdateCurrentExecution(
 			createRequestID,
 			state,
 			closeStatus,
-			startVersion,
-			lastWriteVersion,
 			lastWriteVersion,
 			state,
 			shardID,
@@ -1083,8 +947,6 @@ func createOrUpdateCurrentExecution(
 			createRequestID,
 			state,
 			closeStatus,
-			startVersion,
-			lastWriteVersion,
 			lastWriteVersion,
 			state,
 		)
@@ -2344,21 +2206,30 @@ func createChecksum(result map[string]interface{}) checksum.Checksum {
 	return csum
 }
 
-func isTimeoutError(err error) bool {
-	if err == gocql.ErrTimeoutNoResponse {
-		return true
-	}
-	if err == gocql.ErrConnectionClosed {
-		return true
-	}
-	_, ok := err.(*gocql.RequestErrWriteTimeout)
-	return ok
-}
+func convertCommonErrors(
+	db nosqlplugin.DB,
+	operation string,
+	err error,
+) error {
+	// TODO: remove all checks related db and cassandra.IsXXXError(err) after nosql refactoring is done
 
-func isThrottlingError(err error) bool {
-	if req, ok := err.(gocql.RequestError); ok {
-		// gocql does not expose the constant errOverloaded = 0x1001
-		return req.Code() == 0x1001
+	if db != nil && db.IsNotFoundError(err) || db == nil && cassandra.IsNotFoundError(err) {
+		return &shared.EntityNotExistsError{
+			Message: fmt.Sprintf("%v failed. Error: %v ", operation, err),
+		}
 	}
-	return false
+
+	if db != nil && db.IsTimeoutError(err) || db == nil && cassandra.IsTimeoutError(err) {
+		return &p.TimeoutError{Msg: fmt.Sprintf("%v timed out. Error: %v", operation, err)}
+	}
+
+	if db != nil && db.IsThrottlingError(err) || db == nil && cassandra.IsThrottlingError(err) {
+		return &shared.ServiceBusyError{
+			Message: fmt.Sprintf("%v operation failed. Error: %v", operation, err),
+		}
+	}
+
+	return &shared.InternalServiceError{
+		Message: fmt.Sprintf("%v operation failed. Error: %v", operation, err),
+	}
 }

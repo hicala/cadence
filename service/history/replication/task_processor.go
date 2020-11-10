@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-//go:generate mockgen -copyright_file ../../../LICENSE -package $GOPACKAGE -source $GOFILE -destination task_processor_mock.go -self_package github.com/uber/cadence/service/history/replication
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination task_processor_mock.go -self_package github.com/uber/cadence/service/history/replication
 
 package replication
 
@@ -44,6 +44,7 @@ import (
 	"github.com/uber/cadence/common/quotas"
 	"github.com/uber/cadence/service/history/config"
 	"github.com/uber/cadence/service/history/engine"
+	"github.com/uber/cadence/service/history/execution"
 	"github.com/uber/cadence/service/history/shard"
 )
 
@@ -300,7 +301,7 @@ func (p *taskProcessorImpl) processResponse(response *r.ReplicationMessages) {
 		_ = p.shardRateLimiter.Wait(ctx)
 		err := p.processSingleTask(replicationTask)
 		if err != nil {
-			// Processor is shutdown. Exit without updating the checkpoint.
+			// Encounter error and skip updating ack levels
 			return
 		}
 	}
@@ -393,21 +394,32 @@ func (p *taskProcessorImpl) processSingleTask(replicationTask *r.ReplicationTask
 		common.IsServiceBusyError,
 	)
 
-	if err != nil {
-		select {
-		case <-p.done:
-			p.logger.Warn("Skip adding new messages to DLQ.", tag.Error(err))
-		default:
-			p.logger.Error(
-				"Failed to apply replication task after retry. Putting task into DLQ.",
-				tag.TaskID(replicationTask.GetSourceTaskId()),
-				tag.Error(err),
-			)
-			return p.putReplicationTaskToDLQ(replicationTask)
-		}
+	switch {
+	case err == nil:
+		return nil
+	case common.IsServiceBusyError(err):
+		return err
+	case err == execution.ErrMissingVersionHistories:
+		// skip the workflow without version histories
+		p.logger.Warn("Encounter workflow withour version histories")
+		return nil
+	default:
+		//handle error
 	}
 
-	return nil
+	// handle error to DLQ
+	select {
+	case <-p.done:
+		p.logger.Warn("Skip adding new messages to DLQ.", tag.Error(err))
+		return err
+	default:
+		p.logger.Error(
+			"Failed to apply replication task after retry. Putting task into DLQ.",
+			tag.TaskID(replicationTask.GetSourceTaskId()),
+			tag.Error(err),
+		)
+		return p.putReplicationTaskToDLQ(replicationTask)
+	}
 }
 
 func (p *taskProcessorImpl) processTaskOnce(replicationTask *r.ReplicationTask) error {

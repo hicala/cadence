@@ -24,23 +24,21 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-
-	"github.com/uber/cadence/common/persistence/serialization"
-	"github.com/uber/cadence/common/types"
-	"github.com/uber/cadence/common/types/mapper/thrift"
+	"time"
 
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/.gen/go/sqlblobs"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/persistence/serialization"
 	"github.com/uber/cadence/common/persistence/sql/sqlplugin"
+	"github.com/uber/cadence/common/types"
 )
 
 type sqlMetadataManagerV2 struct {
 	sqlStore
 	activeClusterName string
-	serializer        persistence.PayloadSerializer
 }
 
 // newMetadataPersistenceV2 creates an instance of sqlMetadataManagerV2
@@ -56,7 +54,6 @@ func newMetadataPersistenceV2(
 			logger: logger,
 			parser: parser,
 		},
-		serializer:        persistence.NewPayloadSerializer(),
 		activeClusterName: currentClusterName,
 	}, nil
 }
@@ -109,22 +106,17 @@ func (m *sqlMetadataManagerV2) CreateDomain(
 
 	var badBinaries []byte
 	var badBinariesEncoding *string
-
-	serializedBadBinaries, err := m.serializer.SerializeBadBinaries(
-		thrift.FromBadBinaries(&request.Config.BadBinaries),
-		common.EncodingTypeThriftRW)
-	if err != nil {
-		return nil, err
+	if request.Config.BadBinaries != nil {
+		badBinaries = request.Config.BadBinaries.Data
+		badBinariesEncoding = common.StringPtr(string(request.Config.BadBinaries.GetEncoding()))
 	}
-	badBinaries = serializedBadBinaries.Data
-	badBinariesEncoding = common.StringPtr(string(serializedBadBinaries.GetEncoding()))
 
 	domainInfo := &sqlblobs.DomainInfo{
 		Status:                      common.Int32Ptr(int32(request.Info.Status)),
 		Description:                 &request.Info.Description,
 		Owner:                       &request.Info.OwnerEmail,
 		Data:                        request.Info.Data,
-		RetentionDays:               common.Int16Ptr(int16(request.Config.Retention)),
+		RetentionDays:               common.Int16Ptr(int16(common.DurationToDays(request.Config.Retention))),
 		EmitMetric:                  &request.Config.EmitMetric,
 		ArchivalBucket:              &request.Config.ArchivalBucket,
 		ArchivalStatus:              common.Int16Ptr(int16(request.Config.ArchivalStatus)),
@@ -139,7 +131,7 @@ func (m *sqlMetadataManagerV2) CreateDomain(
 		NotificationVersion:         common.Int64Ptr(metadata.NotificationVersion),
 		FailoverNotificationVersion: common.Int64Ptr(persistence.InitialFailoverNotificationVersion),
 		PreviousFailoverVersion:     common.Int64Ptr(common.InitialPreviousFailoverVersion),
-		LastUpdatedTime:             common.Int64Ptr(request.LastUpdatedTime),
+		LastUpdatedTime:             common.Int64Ptr(request.LastUpdatedTime.UnixNano()),
 		BadBinaries:                 badBinaries,
 		BadBinariesEncoding:         badBinariesEncoding,
 	}
@@ -240,14 +232,10 @@ func (m *sqlMetadataManagerV2) domainRowToGetDomainResponse(row *sqlplugin.Domai
 	if domainInfo.BadBinaries != nil {
 		badBinaries = persistence.NewDataBlob(domainInfo.BadBinaries, common.EncodingType(*domainInfo.BadBinariesEncoding))
 	}
-	deserializedBadBinaries, err := m.serializer.DeserializeBadBinaries(badBinaries)
-	if err != nil {
-		return nil, err
-	}
 
-	var failoverEndTime *int64
+	var failoverEndTime *time.Time
 	if domainInfo.IsSetFailoverEndTime() {
-		failoverEndTime = domainInfo.FailoverEndTime
+		failoverEndTime = common.TimePtr(time.Unix(0, *domainInfo.FailoverEndTime))
 	}
 
 	return &persistence.InternalGetDomainResponse{
@@ -260,7 +248,7 @@ func (m *sqlMetadataManagerV2) domainRowToGetDomainResponse(row *sqlplugin.Domai
 			Data:        domainInfo.GetData(),
 		},
 		Config: &persistence.InternalDomainConfig{
-			Retention:                int32(domainInfo.GetRetentionDays()),
+			Retention:                common.DaysToDuration(int32(domainInfo.GetRetentionDays())),
 			EmitMetric:               domainInfo.GetEmitMetric(),
 			ArchivalBucket:           domainInfo.GetArchivalBucket(),
 			ArchivalStatus:           types.ArchivalStatus(*domainInfo.ArchivalStatus),
@@ -268,7 +256,7 @@ func (m *sqlMetadataManagerV2) domainRowToGetDomainResponse(row *sqlplugin.Domai
 			HistoryArchivalURI:       domainInfo.GetHistoryArchivalURI(),
 			VisibilityArchivalStatus: types.ArchivalStatus(*domainInfo.VisibilityArchivalStatus),
 			VisibilityArchivalURI:    domainInfo.GetVisibilityArchivalURI(),
-			BadBinaries:              *thrift.ToBadBinaries(deserializedBadBinaries),
+			BadBinaries:              badBinaries,
 		},
 		ReplicationConfig: &persistence.DomainReplicationConfig{
 			ActiveClusterName: persistence.GetOrUseDefaultActiveCluster(m.activeClusterName, domainInfo.GetActiveClusterName()),
@@ -281,7 +269,7 @@ func (m *sqlMetadataManagerV2) domainRowToGetDomainResponse(row *sqlplugin.Domai
 		FailoverNotificationVersion: domainInfo.GetFailoverNotificationVersion(),
 		PreviousFailoverVersion:     domainInfo.GetPreviousFailoverVersion(),
 		FailoverEndTime:             failoverEndTime,
-		LastUpdatedTime:             domainInfo.GetLastUpdatedTime(),
+		LastUpdatedTime:             time.Unix(0, domainInfo.GetLastUpdatedTime()),
 	}, nil
 }
 
@@ -297,20 +285,14 @@ func (m *sqlMetadataManagerV2) UpdateDomain(
 
 	var badBinaries []byte
 	var badBinariesEncoding *string
-
-	serializedBadBinaries, err := m.serializer.SerializeBadBinaries(
-		thrift.FromBadBinaries(&request.Config.BadBinaries),
-		common.EncodingTypeThriftRW)
-	if err != nil {
-		return err
+	if request.Config.BadBinaries != nil {
+		badBinaries = request.Config.BadBinaries.Data
+		badBinariesEncoding = common.StringPtr(string(request.Config.BadBinaries.GetEncoding()))
 	}
-
-	badBinaries = serializedBadBinaries.Data
-	badBinariesEncoding = common.StringPtr(string(serializedBadBinaries.GetEncoding()))
 
 	var failoverEndTime *int64
 	if request.FailoverEndTime != nil {
-		failoverEndTime = request.FailoverEndTime
+		failoverEndTime = common.Int64Ptr(request.FailoverEndTime.UnixNano())
 	}
 
 	domainInfo := &sqlblobs.DomainInfo{
@@ -318,7 +300,7 @@ func (m *sqlMetadataManagerV2) UpdateDomain(
 		Description:                 &request.Info.Description,
 		Owner:                       &request.Info.OwnerEmail,
 		Data:                        request.Info.Data,
-		RetentionDays:               common.Int16Ptr(int16(request.Config.Retention)),
+		RetentionDays:               common.Int16Ptr(int16(common.DurationToDays(request.Config.Retention))),
 		EmitMetric:                  &request.Config.EmitMetric,
 		ArchivalBucket:              &request.Config.ArchivalBucket,
 		ArchivalStatus:              common.Int16Ptr(int16(request.Config.ArchivalStatus)),
@@ -334,7 +316,7 @@ func (m *sqlMetadataManagerV2) UpdateDomain(
 		FailoverNotificationVersion: common.Int64Ptr(request.FailoverNotificationVersion),
 		PreviousFailoverVersion:     common.Int64Ptr(request.PreviousFailoverVersion),
 		FailoverEndTime:             failoverEndTime,
-		LastUpdatedTime:             common.Int64Ptr(request.LastUpdatedTime),
+		LastUpdatedTime:             common.Int64Ptr(request.LastUpdatedTime.UnixNano()),
 		BadBinaries:                 badBinaries,
 		BadBinariesEncoding:         badBinariesEncoding,
 	}
