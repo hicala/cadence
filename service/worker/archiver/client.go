@@ -30,16 +30,18 @@ import (
 	"go.uber.org/cadence/.gen/go/cadence/workflowserviceclient"
 	cclient "go.uber.org/cadence/client"
 
-	"github.com/uber/cadence/.gen/go/shared"
-	"github.com/uber/cadence/common"
 	carchiver "github.com/uber/cadence/common/archiver"
 	"github.com/uber/cadence/common/archiver/provider"
+	"github.com/uber/cadence/common/constants"
+	"github.com/uber/cadence/common/dynamicconfig/dynamicproperties"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/quotas"
-	"github.com/uber/cadence/common/service/dynamicconfig"
+	"github.com/uber/cadence/common/types"
 )
+
+//go:generate mockgen -package=$GOPACKAGE -destination=client_mock.go -self_package=github.com/uber/cadence/service/worker/archiver github.com/uber/cadence/service/worker/archiver Client
 
 type (
 	// ClientRequest is the archive request sent to the archiver client
@@ -73,9 +75,9 @@ type (
 		StartTimestamp     int64
 		ExecutionTimestamp int64
 		CloseTimestamp     int64
-		CloseStatus        shared.WorkflowExecutionCloseStatus
+		CloseStatus        types.WorkflowExecutionCloseStatus
 		HistoryLength      int64
-		Memo               *shared.Memo
+		Memo               *types.Memo
 		SearchAttributes   map[string][]byte
 		VisibilityURI      string
 
@@ -89,12 +91,15 @@ type (
 	}
 
 	client struct {
-		metricsScope     metrics.Scope
-		logger           log.Logger
-		cadenceClient    cclient.Client
-		numWorkflows     dynamicconfig.IntPropertyFn
-		rateLimiter      quotas.Limiter
-		archiverProvider provider.ArchiverProvider
+		metricsScope                metrics.Scope
+		logger                      log.Logger
+		cadenceClient               cclient.Client
+		numWorkflows                dynamicproperties.IntPropertyFn
+		rateLimiter                 quotas.Limiter
+		inlineHistoryRateLimiter    quotas.Limiter
+		inlineVisibilityRateLimiter quotas.Limiter
+		archiverProvider            provider.ArchiverProvider
+		archivingIncompleteHistory  dynamicproperties.BoolPropertyFn
 	}
 
 	// ArchivalTarget is either history or visibility
@@ -114,37 +119,44 @@ const (
 	ArchiveTargetVisibility
 )
 
+var (
+	errInlineArchivalThrottled = errors.New("inline archival throttled")
+)
+
 // NewClient creates a new Client
 func NewClient(
 	metricsClient metrics.Client,
 	logger log.Logger,
 	publicClient workflowserviceclient.Interface,
-	numWorkflows dynamicconfig.IntPropertyFn,
-	requestRPS dynamicconfig.IntPropertyFn,
+	numWorkflows dynamicproperties.IntPropertyFn,
+	requestRateLimiter quotas.Limiter,
+	inlineHistoryRateLimiter quotas.Limiter,
+	inlineVisibilityRateLimiter quotas.Limiter,
 	archiverProvider provider.ArchiverProvider,
+	archivingIncompleteHistory dynamicproperties.BoolPropertyFn,
 ) Client {
 	return &client{
-		metricsScope:  metricsClient.Scope(metrics.ArchiverClientScope),
-		logger:        logger,
-		cadenceClient: cclient.NewClient(publicClient, common.SystemLocalDomainName, &cclient.Options{}),
-		numWorkflows:  numWorkflows,
-		rateLimiter: quotas.NewDynamicRateLimiter(
-			func() float64 {
-				return float64(requestRPS())
-			},
-		),
-		archiverProvider: archiverProvider,
+		metricsScope:                metricsClient.Scope(metrics.ArchiverClientScope),
+		logger:                      logger,
+		cadenceClient:               cclient.NewClient(publicClient, constants.SystemLocalDomainName, &cclient.Options{}),
+		numWorkflows:                numWorkflows,
+		rateLimiter:                 requestRateLimiter,
+		inlineHistoryRateLimiter:    inlineHistoryRateLimiter,
+		inlineVisibilityRateLimiter: inlineVisibilityRateLimiter,
+		archiverProvider:            archiverProvider,
+		archivingIncompleteHistory:  archivingIncompleteHistory,
 	}
 }
 
 // Archive starts an archival task
 func (c *client) Archive(ctx context.Context, request *ClientRequest) (*ClientResponse, error) {
+	scopeWithDomainTag := c.metricsScope.Tagged(metrics.DomainTag(request.ArchiveRequest.DomainName))
 	for _, target := range request.ArchiveRequest.Targets {
 		switch target {
 		case ArchiveTargetHistory:
-			c.metricsScope.IncCounter(metrics.ArchiverClientHistoryRequestCount)
+			scopeWithDomainTag.IncCounter(metrics.ArchiverClientHistoryRequestCountPerDomain)
 		case ArchiveTargetVisibility:
-			c.metricsScope.IncCounter(metrics.ArchiverClientVisibilityRequestCount)
+			scopeWithDomainTag.IncCounter(metrics.ArchiverClientVisibilityRequestCountPerDomain)
 		}
 	}
 	logger := c.logger.WithTags(
@@ -189,15 +201,23 @@ func (c *client) Archive(ctx context.Context, request *ClientRequest) (*ClientRe
 
 func (c *client) archiveHistoryInline(ctx context.Context, request *ClientRequest, logger log.Logger, errCh chan error) {
 	logger = tagLoggerWithHistoryRequest(logger, request.ArchiveRequest)
+	scopeWithDomainTag := c.metricsScope.Tagged(metrics.DomainTag(request.ArchiveRequest.DomainName))
+	if !c.inlineHistoryRateLimiter.Allow() {
+		scopeWithDomainTag.IncCounter(metrics.ArchiverClientHistoryInlineArchiveThrottledCountPerDomain)
+		logger.Debug("inline history archival throttled")
+		errCh <- errInlineArchivalThrottled
+		return
+	}
+
 	var err error
 	defer func() {
 		if err != nil {
-			c.metricsScope.IncCounter(metrics.ArchiverClientHistoryInlineArchiveFailureCount)
+			scopeWithDomainTag.IncCounter(metrics.ArchiverClientHistoryInlineArchiveFailureCountPerDomain)
 			logger.Info("failed to perform workflow history archival inline", tag.Error(err))
 		}
 		errCh <- err
 	}()
-	c.metricsScope.IncCounter(metrics.ArchiverClientHistoryInlineArchiveAttemptCount)
+	scopeWithDomainTag.IncCounter(metrics.ArchiverClientHistoryInlineArchiveAttemptCountPerDomain)
 	URI, err := carchiver.NewURI(request.ArchiveRequest.URI)
 	if err != nil {
 		return
@@ -208,6 +228,7 @@ func (c *client) archiveHistoryInline(ctx context.Context, request *ClientReques
 		return
 	}
 
+	allowArchivingIncompleteHistoryOpt := carchiver.GetArchivingIncompleteHistoryOption(c.archivingIncompleteHistory)
 	err = historyArchiver.Archive(ctx, URI, &carchiver.ArchiveHistoryRequest{
 		ShardID:              request.ArchiveRequest.ShardID,
 		DomainID:             request.ArchiveRequest.DomainID,
@@ -217,21 +238,28 @@ func (c *client) archiveHistoryInline(ctx context.Context, request *ClientReques
 		BranchToken:          request.ArchiveRequest.BranchToken,
 		NextEventID:          request.ArchiveRequest.NextEventID,
 		CloseFailoverVersion: request.ArchiveRequest.CloseFailoverVersion,
-	})
+	}, allowArchivingIncompleteHistoryOpt)
 }
 
 func (c *client) archiveVisibilityInline(ctx context.Context, request *ClientRequest, logger log.Logger, errCh chan error) {
 	logger = tagLoggerWithVisibilityRequest(logger, request.ArchiveRequest)
+	scopeWithDomainTag := c.metricsScope.Tagged(metrics.DomainTag(request.ArchiveRequest.DomainName))
+	if !c.inlineVisibilityRateLimiter.Allow() {
+		scopeWithDomainTag.IncCounter(metrics.ArchiverClientVisibilityInlineArchiveThrottledCountPerDomain)
+		logger.Debug("inline visibility archival throttled")
+		errCh <- errInlineArchivalThrottled
+		return
+	}
 
 	var err error
 	defer func() {
 		if err != nil {
-			c.metricsScope.IncCounter(metrics.ArchiverClientVisibilityInlineArchiveFailureCount)
+			scopeWithDomainTag.IncCounter(metrics.ArchiverClientVisibilityInlineArchiveFailureCountPerDomain)
 			logger.Info("failed to perform visibility archival inline", tag.Error(err))
 		}
 		errCh <- err
 	}()
-	c.metricsScope.IncCounter(metrics.ArchiverClientVisibilityInlineArchiveAttemptCount)
+	scopeWithDomainTag.IncCounter(metrics.ArchiverClientVisibilityInlineArchiveAttemptCountPerDomain)
 	URI, err := carchiver.NewURI(request.ArchiveRequest.VisibilityURI)
 	if err != nil {
 		return
@@ -260,10 +288,11 @@ func (c *client) archiveVisibilityInline(ctx context.Context, request *ClientReq
 }
 
 func (c *client) sendArchiveSignal(ctx context.Context, request *ArchiveRequest, taggedLogger log.Logger) error {
-	c.metricsScope.IncCounter(metrics.ArchiverClientSendSignalCount)
+	scopeWithDomainTag := c.metricsScope.Tagged(metrics.DomainTag(request.DomainName))
+	scopeWithDomainTag.IncCounter(metrics.ArchiverClientSendSignalCountPerDomain)
 	if ok := c.rateLimiter.Allow(); !ok {
 		c.logger.Error(tooManyRequestsErrMsg)
-		c.metricsScope.IncCounter(metrics.CadenceErrServiceBusyCounter)
+		scopeWithDomainTag.IncCounter(metrics.CadenceErrServiceBusyCounter)
 		return errors.New(tooManyRequestsErrMsg)
 	}
 
@@ -288,7 +317,7 @@ func (c *client) sendArchiveSignal(ctx context.Context, request *ArchiveRequest,
 			tag.Error(err),
 		)
 		taggedLogger.Error("failed to send signal to archival system workflow")
-		c.metricsScope.IncCounter(metrics.ArchiverClientSendSignalFailureCount)
+		scopeWithDomainTag.IncCounter(metrics.ArchiverClientSendSignalFailureCountPerDomain)
 		return err
 	}
 	return nil

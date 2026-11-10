@@ -27,8 +27,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
-	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
+	"github.com/uber/cadence/common/constants"
+	"github.com/uber/cadence/common/types"
 )
 
 func (s *utilSuite) SetupTest() {
@@ -44,27 +45,27 @@ type utilSuite struct {
 }
 
 func (s *utilSuite) TestEncodeDecodeHistoryBatches() {
-	historyBatches := []*shared.History{
-		&shared.History{
-			Events: []*shared.HistoryEvent{
-				&shared.HistoryEvent{
-					EventId: common.Int64Ptr(common.FirstEventID),
-					Version: common.Int64Ptr(1),
+	historyBatches := []*types.History{
+		{
+			Events: []*types.HistoryEvent{
+				{
+					ID:      constants.FirstEventID,
+					Version: 1,
 				},
 			},
 		},
-		&shared.History{
-			Events: []*shared.HistoryEvent{
-				&shared.HistoryEvent{
-					EventId:   common.Int64Ptr(common.FirstEventID + 1),
+		{
+			Events: []*types.HistoryEvent{
+				{
+					ID:        constants.FirstEventID + 1,
 					Timestamp: common.Int64Ptr(time.Now().UnixNano()),
-					Version:   common.Int64Ptr(1),
+					Version:   1,
 				},
-				&shared.HistoryEvent{
-					EventId: common.Int64Ptr(common.FirstEventID + 2),
-					Version: common.Int64Ptr(2),
-					DecisionTaskStartedEventAttributes: &shared.DecisionTaskStartedEventAttributes{
-						Identity: common.StringPtr("some random identity"),
+				{
+					ID:      constants.FirstEventID + 2,
+					Version: 2,
+					DecisionTaskStartedEventAttributes: &types.DecisionTaskStartedEventAttributes{
+						Identity: "some random identity",
 					},
 				},
 			},

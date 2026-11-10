@@ -21,37 +21,44 @@
 package task
 
 import (
+	"context"
 	"sync"
 
-	workflow "github.com/uber/cadence/.gen/go/shared"
+	"github.com/uber/cadence/common/activecluster"
 	"github.com/uber/cadence/common/cache"
+	"github.com/uber/cadence/common/constants"
+	dynamicquotas "github.com/uber/cadence/common/dynamicconfig/quotas"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/quotas"
-	"github.com/uber/cadence/common/task"
+	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/service/history/config"
 )
 
-type (
-	priorityAssignerImpl struct {
-		sync.RWMutex
-
-		currentClusterName string
-		domainCache        cache.DomainCache
-		config             *config.Config
-		logger             log.Logger
-		scope              metrics.Scope
-		rateLimiters       map[string]quotas.Limiter
-	}
+var (
+	highTaskPriority    = constants.GetTaskPriority(constants.HighPriorityClass, constants.DefaultPrioritySubclass)
+	defaultTaskPriority = constants.GetTaskPriority(constants.DefaultPriorityClass, constants.DefaultPrioritySubclass)
+	lowTaskPriority     = constants.GetTaskPriority(constants.LowPriorityClass, constants.DefaultPrioritySubclass)
 )
 
-var _ PriorityAssigner = (*priorityAssignerImpl)(nil)
+type priorityAssignerImpl struct {
+	sync.RWMutex
+
+	currentClusterName string
+	domainCache        cache.DomainCache
+	config             *config.Config
+	logger             log.Logger
+	scope              metrics.Scope
+	rateLimiters       *quotas.Collection[string]
+	activeClusterMgr   activecluster.Manager
+}
 
 // NewPriorityAssigner creates a new task priority assigner
 func NewPriorityAssigner(
 	currentClusterName string,
 	domainCache cache.DomainCache,
+	activeClusterMgr activecluster.Manager,
 	logger log.Logger,
 	metricClient metrics.Client,
 	config *config.Config,
@@ -59,30 +66,35 @@ func NewPriorityAssigner(
 	return &priorityAssignerImpl{
 		currentClusterName: currentClusterName,
 		domainCache:        domainCache,
+		activeClusterMgr:   activeClusterMgr,
 		config:             config,
 		logger:             logger,
 		scope:              metricClient.Scope(metrics.TaskPriorityAssignerScope),
-		rateLimiters:       make(map[string]quotas.Limiter),
+		rateLimiters: quotas.NewCollection(dynamicquotas.NewSimpleDynamicRateLimiterFactory(
+			config.TaskProcessRPS,
+		)),
 	}
 }
 
-func (a *priorityAssignerImpl) Assign(
-	queueTask Task,
-) error {
-	if queueTask.Priority() != task.NoPriority {
+func (a *priorityAssignerImpl) Assign(queueTask Task) error {
+	if priority := queueTask.Priority(); priority != noPriority {
+		if priority != lowTaskPriority && queueTask.GetAttempt() > a.config.TaskCriticalRetryCount() {
+			// automatically lower the priority if task attempt exceeds certain threshold
+			queueTask.SetPriority(lowTaskPriority)
+		}
 		return nil
 	}
 
 	queueType := queueTask.GetQueueType()
 
 	if queueType == QueueTypeReplication {
-		queueTask.SetPriority(task.GetTaskPriority(task.LowPriorityClass, task.DefaultPrioritySubclass))
+		queueTask.SetPriority(lowTaskPriority)
 		return nil
 	}
 
-	// timer or transfer task, first check if task is active or not and if domain is active or not
+	// timer, transfer or cross cluster task, first check if task is active or not and if domain is active or not
 	isActiveTask := queueType == QueueTypeActiveTimer || queueType == QueueTypeActiveTransfer
-	domainName, isActiveDomain, err := a.getDomainInfo(queueTask.GetDomainID())
+	domainName, isActiveDomain, err := a.getDomainInfo(queueTask.GetDomainID(), queueTask.GetWorkflowID(), queueTask.GetRunID())
 	if err != nil {
 		return err
 	}
@@ -95,7 +107,7 @@ func (a *priorityAssignerImpl) Assign(
 
 	if !isActiveTask && !isActiveDomain {
 		// only assign low priority to tasks in the fourth case
-		queueTask.SetPriority(task.GetTaskPriority(task.LowPriorityClass, task.DefaultPrioritySubclass))
+		queueTask.SetPriority(lowTaskPriority)
 		return nil
 	}
 
@@ -103,18 +115,19 @@ func (a *priorityAssignerImpl) Assign(
 	// for case 2 and 3 the task will be a no-op in most cases, also give it a high priority so that
 	// it can be quickly verified/acked and won't prevent the ack level in the processor from advancing
 	// (especially for active processor)
-	if !a.getRateLimiter(domainName).Allow() {
-		queueTask.SetPriority(task.GetTaskPriority(task.DefaultPriorityClass, task.DefaultPrioritySubclass))
+	if !a.rateLimiters.For(domainName).Allow() {
+		queueTask.SetPriority(defaultTaskPriority)
 		taggedScope := a.scope.Tagged(metrics.DomainTag(domainName))
-		if queueType == QueueTypeActiveTransfer || queueType == QueueTypeStandbyTransfer {
+		switch queueType {
+		case QueueTypeActiveTransfer, QueueTypeStandbyTransfer:
 			taggedScope.IncCounter(metrics.TransferTaskThrottledCounter)
-		} else {
+		case QueueTypeActiveTimer, QueueTypeStandbyTimer:
 			taggedScope.IncCounter(metrics.TimerTaskThrottledCounter)
 		}
 		return nil
 	}
 
-	queueTask.SetPriority(task.GetTaskPriority(task.HighPriorityClass, task.DefaultPrioritySubclass))
+	queueTask.SetPriority(highTaskPriority)
 	return nil
 }
 
@@ -122,12 +135,10 @@ func (a *priorityAssignerImpl) Assign(
 //  1. domain name
 //  2. if domain is active
 //  3. error, if any
-func (a *priorityAssignerImpl) getDomainInfo(
-	domainID string,
-) (string, bool, error) {
+func (a *priorityAssignerImpl) getDomainInfo(domainID, wfID, rID string) (string, bool, error) {
 	domainEntry, err := a.domainCache.GetDomainByID(domainID)
 	if err != nil {
-		if _, ok := err.(*workflow.EntityNotExistsError); !ok {
+		if _, ok := err.(*types.EntityNotExistsError); !ok {
 			a.logger.Warn("Cannot find domain", tag.WorkflowDomainID(domainID))
 			return "", false, err
 		}
@@ -137,34 +148,14 @@ func (a *priorityAssignerImpl) getDomainInfo(
 		return "", true, nil
 	}
 
-	if domainEntry.IsGlobalDomain() && a.currentClusterName != domainEntry.GetReplicationConfig().ActiveClusterName {
+	activeClusterInfo, err := a.activeClusterMgr.GetActiveClusterInfoByWorkflow(context.Background(), domainID, wfID, rID)
+	if err != nil {
+		a.logger.Warn("Failed to get active cluster info", tag.WorkflowDomainID(domainID), tag.Error(err))
+		return "", true, nil
+	}
+
+	if activeClusterInfo.ActiveClusterName != a.currentClusterName {
 		return domainEntry.GetInfo().Name, false, nil
 	}
 	return domainEntry.GetInfo().Name, true, nil
-}
-
-func (a *priorityAssignerImpl) getRateLimiter(
-	domainName string,
-) quotas.Limiter {
-	a.RLock()
-	if limiter, ok := a.rateLimiters[domainName]; ok {
-		a.RUnlock()
-		return limiter
-	}
-	a.RUnlock()
-
-	limiter := quotas.NewDynamicRateLimiter(
-		func() float64 {
-			return float64(a.config.TaskProcessRPS(domainName))
-		},
-	)
-
-	a.Lock()
-	defer a.Unlock()
-	if existingLimiter, ok := a.rateLimiters[domainName]; ok {
-		return existingLimiter
-	}
-
-	a.rateLimiters[domainName] = limiter
-	return limiter
 }

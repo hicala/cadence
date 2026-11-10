@@ -26,11 +26,11 @@ import (
 	"context"
 
 	"github.com/uber/cadence/.gen/go/shared"
-	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/codec"
 	"github.com/uber/cadence/common/pagination"
 	"github.com/uber/cadence/common/persistence"
 	"github.com/uber/cadence/common/reconciliation/entity"
+	"github.com/uber/cadence/common/types"
 )
 
 // ConcreteExecutionIterator is used to retrieve Concrete executions.
@@ -51,10 +51,11 @@ func ConcreteExecution(
 
 	req := persistence.GetWorkflowExecutionRequest{
 		DomainID: request.DomainID,
-		Execution: shared.WorkflowExecution{
-			WorkflowId: common.StringPtr(request.WorkflowID),
-			RunId:      common.StringPtr(request.RunID),
+		Execution: types.WorkflowExecution{
+			WorkflowID: request.WorkflowID,
+			RunID:      request.RunID,
 		},
+		DomainName: request.DomainName,
 	}
 	e, err := retryer.GetWorkflowExecution(ctx, &req)
 	if err != nil {
@@ -62,6 +63,9 @@ func ConcreteExecution(
 	}
 
 	branchToken, branch, err := getBranchToken(e.State.ExecutionInfo.BranchToken, e.State.VersionHistories, codec.NewThriftRWEncoder())
+	if err != nil {
+		return nil, err
+	}
 
 	return &entity.ConcreteExecution{
 		BranchToken: branchToken,
@@ -93,7 +97,7 @@ func getConcreteExecutions(
 		if err != nil {
 			return pagination.Page{}, err
 		}
-		executions := make([]pagination.Entity, len(resp.Executions), len(resp.Executions))
+		executions := make([]pagination.Entity, len(resp.Executions))
 		for i, e := range resp.Executions {
 			branchToken, branch, err := getBranchToken(e.ExecutionInfo.BranchToken, e.VersionHistories, encoder)
 			if err != nil {

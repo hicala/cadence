@@ -22,120 +22,175 @@
 package cli
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 
 	"github.com/uber/cadence/common/reconciliation/invariant"
 	"github.com/uber/cadence/service/worker/scanner/executions"
 )
 
-func newAdminWorkflowCommands() []cli.Command {
-	return []cli.Command{
+func newAdminWorkflowCommands() []*cli.Command {
+	return []*cli.Command{
 		{
-			Name:    "show",
-			Aliases: []string{"show"},
-			Usage:   "show workflow history from database",
+			Name:  "show",
+			Usage: "show workflow history from database",
 			Flags: append(getDBFlags(),
 				// v2 history events
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagTreeID,
 					Usage: "TreeID",
 				},
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagBranchID,
 					Usage: "BranchID",
 				},
-				cli.StringFlag{
-					Name:  FlagOutputFilenameWithAlias,
-					Usage: "output file",
+				&cli.Int64Flag{
+					Name:  FlagMinEventID,
+					Value: 1,
+					Usage: "MinEventID",
+				},
+				&cli.Int64Flag{
+					Name:  FlagMaxEventID,
+					Value: 10000,
+					Usage: "MaxEventID",
+				},
+				&cli.StringFlag{
+					Name:    FlagOutputFilename,
+					Aliases: []string{"of"},
+					Usage:   "output file",
 				},
 				// support mysql query
-				cli.IntFlag{
-					Name:  FlagShardIDWithAlias,
-					Usage: "ShardID",
+				&cli.IntFlag{
+					Name:    FlagShardID,
+					Aliases: []string{"sid"},
+					Usage:   "ShardID",
 				}),
-			Action: func(c *cli.Context) {
-				AdminShowWorkflow(c)
-			},
+			Action: AdminShowWorkflow,
 		},
 		{
 			Name:    "describe",
 			Aliases: []string{"desc"},
 			Usage:   "Describe internal information of workflow execution",
 			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  FlagWorkflowIDWithAlias,
-					Usage: "WorkflowID",
+				&cli.StringFlag{
+					Name:    FlagWorkflowID,
+					Aliases: []string{"w", "wid"},
+					Usage:   "WorkflowID",
 				},
-				cli.StringFlag{
-					Name:  FlagRunIDWithAlias,
-					Usage: "RunID",
+				&cli.StringFlag{
+					Name:    FlagRunID,
+					Aliases: []string{"r", "rid"},
+					Usage:   "RunID",
 				},
 			},
-			Action: func(c *cli.Context) {
-				AdminDescribeWorkflow(c)
-			},
+			Action: AdminDescribeWorkflow,
 		},
 		{
 			Name:    "refresh-tasks",
 			Aliases: []string{"rt"},
 			Usage:   "Refreshes all the tasks of a workflow",
 			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  FlagWorkflowIDWithAlias,
-					Usage: "WorkflowID",
+				&cli.StringFlag{
+					Name:    FlagWorkflowID,
+					Aliases: []string{"w", "wid"},
+					Usage:   "WorkflowID",
 				},
-				cli.StringFlag{
-					Name:  FlagRunIDWithAlias,
-					Usage: "RunID",
+				&cli.StringFlag{
+					Name:    FlagRunID,
+					Aliases: []string{"r", "rid"},
+					Usage:   "RunID",
 				},
 			},
-			Action: func(c *cli.Context) {
-				AdminRefreshWorkflowTasks(c)
-			},
+			Action: AdminRefreshWorkflowTasks,
 		},
 		{
 			Name:    "delete",
 			Aliases: []string{"del"},
 			Usage:   "Delete current workflow execution and the mutableState record",
 			Flags: append(getDBFlags(),
-				cli.StringFlag{
-					Name:  FlagWorkflowIDWithAlias,
-					Usage: "WorkflowID",
+				&cli.StringFlag{
+					Name:    FlagWorkflowID,
+					Aliases: []string{"w", "wid"},
+					Usage:   "WorkflowID",
 				},
-				cli.StringFlag{
-					Name:  FlagRunIDWithAlias,
-					Usage: "RunID",
+				&cli.StringFlag{
+					Name:    FlagRunID,
+					Aliases: []string{"r", "rid"},
+					Usage:   "RunID",
 				},
-				cli.BoolFlag{
-					Name:  FlagSkipErrorModeWithAlias,
-					Usage: "skip errors when deleting history",
+				&cli.BoolFlag{
+					Name:    FlagSkipErrorMode,
+					Aliases: []string{"serr"},
+					Usage:   "skip errors when deleting history",
+				},
+				&cli.BoolFlag{
+					Name:  FlagRemote,
+					Usage: "Executes deletion on server side",
 				}),
-			Action: func(c *cli.Context) {
-				AdminDeleteWorkflow(c)
+			Action: AdminDeleteWorkflow,
+		},
+		{
+			Name:    "fix_corruption",
+			Aliases: []string{"fc"},
+			Usage:   "Checks if workflow record is corrupted in database and cleans up",
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:    FlagWorkflowID,
+					Aliases: []string{"w", "wid"},
+					Usage:   "WorkflowID",
+				},
+				&cli.StringFlag{
+					Name:    FlagRunID,
+					Aliases: []string{"r", "rid"},
+					Usage:   "RunID",
+				},
+				&cli.BoolFlag{
+					Name:    FlagSkipErrorMode,
+					Aliases: []string{"serr"},
+					Usage:   "Skip errors and tries to delete as much as possible from the DB",
+				},
 			},
+			Action: AdminMaintainCorruptWorkflow,
 		},
 	}
 }
 
-func newAdminShardManagementCommands() []cli.Command {
-	return []cli.Command{
+func newAdminShardManagementCommands() []*cli.Command {
+	return []*cli.Command{
 		{
 			Name:    "describe",
 			Aliases: []string{"d"},
 			Usage:   "Describe shard by Id",
 			Flags: append(
 				getDBFlags(),
-				cli.IntFlag{
+				&cli.IntFlag{
 					Name:  FlagShardID,
 					Usage: "The Id of the shard to describe",
 				},
 			),
-			Action: func(c *cli.Context) {
-				AdminDescribeShard(c)
+			Action: AdminDescribeShard,
+		},
+		{
+			Name:    "list",
+			Aliases: []string{"l"},
+			Usage:   "List shard distribution",
+			Flags: []cli.Flag{
+				&cli.IntFlag{
+					Name:  FlagPageSize,
+					Value: 100,
+					Usage: "Max number of results to return",
+				},
+				&cli.IntFlag{
+					Name:  FlagPageID,
+					Value: 0,
+					Usage: "Option to show results offset from pagesize * page_id",
+				},
+				getFormatFlag(),
 			},
+			Action: AdminDescribeShardDistribution,
 		},
 		{
 			Name:    "setRangeID",
@@ -143,191 +198,198 @@ func newAdminShardManagementCommands() []cli.Command {
 			Usage:   "Force update shard rangeID",
 			Flags: append(
 				getDBFlags(),
-				cli.IntFlag{
-					Name:  FlagShardIDWithAlias,
-					Usage: "ID of the shard to reset",
+				&cli.IntFlag{
+					Name:    FlagShardID,
+					Aliases: []string{"sid"},
+					Usage:   "ID of the shard to reset",
 				},
-				cli.Int64Flag{
-					Name:  FlagRangeIDWithAlias,
-					Usage: "new shard rangeID",
+				&cli.Int64Flag{
+					Name:    FlagRangeID,
+					Aliases: []string{"rid"},
+					Usage:   "new shard rangeID",
 				},
 			),
-			Action: func(c *cli.Context) {
-				AdminSetShardRangeID(c)
-			},
+			Action: AdminSetShardRangeID,
 		},
 		{
 			Name:    "closeShard",
 			Aliases: []string{"clsh"},
 			Usage:   "close a shard given a shard id",
 			Flags: []cli.Flag{
-				cli.IntFlag{
+				&cli.IntFlag{
 					Name:  FlagShardID,
 					Usage: "ShardID for the cadence cluster to manage",
 				},
 			},
-			Action: func(c *cli.Context) {
-				AdminCloseShard(c)
-			},
+			Action: AdminCloseShard,
 		},
 		{
 			Name:    "removeTask",
 			Aliases: []string{"rmtk"},
 			Usage:   "remove a task based on shardID, task type, taskID, and task visibility timestamp",
 			Flags: []cli.Flag{
-				cli.IntFlag{
+				&cli.IntFlag{
 					Name:  FlagShardID,
 					Usage: "shardID",
 				},
-				cli.Int64Flag{
+				&cli.Int64Flag{
 					Name:  FlagTaskID,
 					Usage: "taskID",
 				},
-				cli.IntFlag{
+				&cli.IntFlag{
 					Name:  FlagTaskType,
-					Usage: "task type: 2 (transfer task), 3 (timer task) or 4 (replication task)",
+					Usage: "task type: 2 (transfer task), 3 (timer task), 4 (replication task) or 6 (cross-cluster task)",
 				},
-				cli.Int64Flag{
+				&cli.Int64Flag{
 					Name:  FlagTaskVisibilityTimestamp,
 					Usage: "task visibility timestamp in nano (required for removing timer task)",
 				},
+				&cli.StringFlag{
+					Name:  FlagCluster,
+					Usage: "target cluster of the task (required for removing cross-cluster task)",
+				},
 			},
-			Action: func(c *cli.Context) {
-				AdminRemoveTask(c)
-			},
+			Action: AdminRemoveTask,
 		},
 		{
 			Name:  "timers",
 			Usage: "get scheduled timers for a given time range",
 			Flags: append(getDBFlags(),
-				cli.IntFlag{
+				&cli.IntFlag{
 					Name:  FlagShardID,
 					Usage: "shardID",
 				},
-				cli.IntFlag{
+				&cli.IntFlag{
 					Name:  FlagPageSize,
 					Usage: "page size used to query db executions table",
 					Value: 500,
 				},
-				cli.IntFlag{
-					Name:  FlagRPS,
-					Usage: "target rps of database queries",
-					Value: 100,
-				},
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagStartDate,
 					Usage: "start date",
 					Value: time.Now().UTC().Format(time.RFC3339),
 				},
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagEndDate,
 					Usage: "end date",
 					Value: time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339),
 				},
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagDomainID,
 					Usage: "filter tasks by DomainID",
 				},
-				cli.IntSliceFlag{
+				&cli.IntSliceFlag{
 					Name: FlagTimerType,
 					Usage: "timer types: 0 - DecisionTimeoutTask, 1 - TaskTypeActivityTimeout, " +
 						"2 - TaskTypeUserTimer, 3 - TaskTypeWorkflowTimeout, 4 - TaskTypeDeleteHistoryEvent, " +
-						"5 - TaskTypeActivityRetryTimer, 6 - TaskTypeWorkflowBackoffTimer",
-					Value: &cli.IntSlice{-1},
+						"5 - TaskTypeActivityRetryTimer, 6 - TaskTypeWorkflowBackoffTimer, 7 - TaskTypeSemaphoreAcquireTimeout",
+					Value: cli.NewIntSlice(-1),
 				},
-				cli.BoolFlag{
+				&cli.BoolFlag{
 					Name:  FlagPrintJSON,
 					Usage: "print raw json data instead of histogram",
 				},
 
-				cli.BoolFlag{
+				&cli.BoolFlag{
 					Name:  FlagSkipErrorMode,
 					Usage: "skip errors",
 				},
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagInputFile,
 					Usage: "file to use, will not connect to persistence",
 				},
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagDateFormat,
 					Usage: "create buckets using time format. Use Go reference time: Mon Jan 2 15:04:05 MST 2006. If set, --" + FlagBucketSize + " is ignored",
 				},
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagBucketSize,
 					Value: "hour",
 					Usage: "group timers by time bucket. Available: day, hour, minute, second",
 				},
-				cli.IntFlag{
+				&cli.IntFlag{
 					Name:  FlagShardMultiplier,
 					Usage: "multiply timer counters for histogram",
 					Value: 16384,
 				},
 			),
-			Action: func(c *cli.Context) {
-				AdminTimers(c)
-			},
+			Action: AdminTimers,
 		},
 	}
 }
 
-func newAdminHistoryHostCommands() []cli.Command {
-	return []cli.Command{
+func newAdminHistoryHostCommands() []*cli.Command {
+	return []*cli.Command{
 		{
 			Name:    "describe",
 			Aliases: []string{"desc"},
 			Usage:   "Describe internal information of history host",
 			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  FlagWorkflowIDWithAlias,
-					Usage: "WorkflowID",
+				&cli.StringFlag{
+					Name:    FlagWorkflowID,
+					Aliases: []string{"w", "wid"},
+					Usage:   "WorkflowID",
 				},
-				cli.StringFlag{
-					Name:  FlagHistoryAddressWithAlias,
-					Usage: "History Host address(IP:PORT)",
+				&cli.StringFlag{
+					Name:    FlagHistoryAddress,
+					Aliases: []string{"had"},
+					Usage:   "History Host address(IP:PORT)",
 				},
-				cli.IntFlag{
-					Name:  FlagShardIDWithAlias,
-					Usage: "ShardID",
+				&cli.IntFlag{
+					Name:    FlagShardID,
+					Aliases: []string{"sid"},
+					Usage:   "ShardID",
 				},
-				cli.BoolFlag{
-					Name:  FlagPrintFullyDetailWithAlias,
-					Usage: "Print fully detail",
+				&cli.BoolFlag{
+					Name:    FlagPrintFullyDetail,
+					Aliases: []string{"pf"},
+					Usage:   "Print fully detail",
 				},
 			},
-			Action: func(c *cli.Context) {
-				AdminDescribeHistoryHost(c)
-			},
+			Action: AdminDescribeHistoryHost,
 		},
 		{
 			Name:    "getshard",
 			Aliases: []string{"gsh"},
 			Usage:   "Get shardID for a workflowID",
 			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  FlagWorkflowIDWithAlias,
-					Usage: "WorkflowID",
+				&cli.StringFlag{
+					Name:    FlagWorkflowID,
+					Aliases: []string{"wid", "w"},
+					Usage:   "WorkflowID",
 				},
-				cli.IntFlag{
+				&cli.IntFlag{
 					Name:  FlagNumberOfShards,
 					Usage: "NumberOfShards for the cadence cluster(see config for numHistoryShards)",
 				},
 			},
-			Action: func(c *cli.Context) {
-				AdminGetShardID(c)
-			},
+			Action: AdminGetShardID,
 		},
 	}
 }
 
-func newAdminDomainCommands() []cli.Command {
-	return []cli.Command{
+// may be better to do this inside an "ensure setup" in each method,
+// but this reduces branches for testing.
+func withDomainClient(c *cli.Context, admin bool, cb func(dc *domainCLIImpl) error) error {
+	dc, err := newDomainCLI(c, admin)
+	if err != nil {
+		return err
+	}
+	return cb(dc)
+}
+
+func newAdminDomainCommands() []*cli.Command {
+
+	return []*cli.Command{
 		{
 			Name:    "register",
 			Aliases: []string{"re"},
 			Usage:   "Register workflow domain",
 			Flags:   adminRegisterDomainFlags,
-			Action: func(c *cli.Context) {
-				newDomainCLI(c, true).RegisterDomain(c)
+			Action: func(c *cli.Context) error {
+				return withDomainClient(c, true, func(dc *domainCLIImpl) error {
+					return dc.RegisterDomain(c)
+				})
 			},
 		},
 		{
@@ -335,8 +397,32 @@ func newAdminDomainCommands() []cli.Command {
 			Aliases: []string{"up", "u"},
 			Usage:   "Update existing workflow domain",
 			Flags:   adminUpdateDomainFlags,
-			Action: func(c *cli.Context) {
-				newDomainCLI(c, true).UpdateDomain(c)
+			Action: func(c *cli.Context) error {
+				return withDomainClient(c, true, func(dc *domainCLIImpl) error {
+					return dc.UpdateDomain(c)
+				})
+			},
+		},
+		{
+			Name:    "delete",
+			Aliases: []string{"del"},
+			Usage:   "Delete existing workflow domain",
+			Flags:   adminDeleteDomainFlags,
+			Action: func(c *cli.Context) error {
+				return withDomainClient(c, true, func(dc *domainCLIImpl) error {
+					return dc.DeleteDomain(c)
+				})
+			},
+		},
+		{
+			Name:    "deprecate",
+			Aliases: []string{"dep"},
+			Usage:   "Deprecate existing workflow domain",
+			Flags:   adminDeprecateDomainFlags,
+			Action: func(c *cli.Context) error {
+				return withDomainClient(c, true, func(dc *domainCLIImpl) error {
+					return dc.DeprecateDomain(c)
+				})
 			},
 		},
 		{
@@ -344,8 +430,10 @@ func newAdminDomainCommands() []cli.Command {
 			Aliases: []string{"desc"},
 			Usage:   "Describe existing workflow domain",
 			Flags:   adminDescribeDomainFlags,
-			Action: func(c *cli.Context) {
-				newDomainCLI(c, true).DescribeDomain(c)
+			Action: func(c *cli.Context) error {
+				return withDomainClient(c, true, func(dc *domainCLIImpl) error {
+					return dc.DescribeDomain(c)
+				})
 			},
 		},
 		{
@@ -353,303 +441,341 @@ func newAdminDomainCommands() []cli.Command {
 			Aliases: []string{"getdn"},
 			Usage:   "Get domainID or domainName",
 			Flags: append(getDBFlags(),
-				cli.StringFlag{
-					Name:  FlagDomain,
-					Usage: "DomainName",
-				},
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagDomainID,
 					Usage: "Domain ID(uuid)",
 				}),
-			Action: func(c *cli.Context) {
-				AdminGetDomainIDOrName(c)
-			},
+			Action: AdminGetDomainIDOrName,
 		},
 		{
 			Name:    "list",
 			Aliases: []string{"l"},
 			Usage:   "List all domains in the cluster",
 			Flags: []cli.Flag{
-				cli.IntFlag{
-					Name:  FlagPageSizeWithAlias,
-					Value: 10,
-					Usage: "Result page size",
+				&cli.IntFlag{
+					Name:    FlagPageSize,
+					Aliases: []string{"ps"},
+					Value:   10,
+					Usage:   "Result page size",
 				},
-				cli.BoolFlag{
-					Name:  FlagAllWithAlias,
-					Usage: "List all domains, by default only domains in REGISTERED status are listed",
+				&cli.BoolFlag{
+					Name:    FlagAll,
+					Aliases: []string{"a"},
+					Usage:   "List all domains, by default only domains in REGISTERED status are listed",
 				},
-				cli.BoolFlag{
-					Name:  FlagPrintFullyDetailWithAlias,
-					Usage: "Print full domain detail",
+				&cli.BoolFlag{
+					Name:    FlagDeprecated,
+					Aliases: []string{"dep"},
+					Usage:   "List deprecated domains only, by default only domains in REGISTERED status are listed",
 				},
+				&cli.StringFlag{
+					Name:  FlagPrefix,
+					Usage: "List domains that are matching to the given prefix",
+					Value: "",
+				},
+				&cli.BoolFlag{
+					Name:    FlagPrintFullyDetail,
+					Aliases: []string{"pf"},
+					Usage:   "Print full domain detail",
+				},
+				&cli.BoolFlag{
+					Name:    FlagPrintJSON,
+					Aliases: []string{"pjson"},
+					Usage:   "Print in raw json format (DEPRECATED: instead use --format json)",
+				},
+				getFormatFlag(),
 			},
-			Action: func(c *cli.Context) {
-				newDomainCLI(c, false).ListDomains(c)
+			Action: func(c *cli.Context) error {
+				return withDomainClient(c, false, func(dc *domainCLIImpl) error {
+					return dc.ListDomains(c)
+				})
 			},
 		},
 	}
 }
 
-func newAdminKafkaCommands() []cli.Command {
-	return []cli.Command{
+func newAdminKafkaCommands() []*cli.Command {
+	return []*cli.Command{
 		{
+			// TODO: do we still need this command given that kafka replication has been deprecated?
 			Name:    "parse",
 			Aliases: []string{"par"},
 			Usage:   "Parse replication tasks from kafka messages",
 			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  FlagInputFileWithAlias,
-					Usage: "Input file to use, if not present assumes piping",
+				&cli.StringFlag{
+					Name:    FlagInputFile,
+					Aliases: []string{"if"},
+					Usage:   "Input file to use, if not present assumes piping",
 				},
-				cli.StringFlag{
-					Name:  FlagWorkflowIDWithAlias,
-					Usage: "WorkflowID, if not provided then no filters by WorkflowID are applied",
+				&cli.StringFlag{
+					Name:    FlagWorkflowID,
+					Aliases: []string{"w", "wid"},
+					Usage:   "WorkflowID",
 				},
-				cli.StringFlag{
-					Name:  FlagRunIDWithAlias,
-					Usage: "RunID, if not provided then no filters by RunID are applied",
+				&cli.StringFlag{
+					Name:    FlagRunID,
+					Aliases: []string{"r", "rid"},
+					Usage:   "RunID",
 				},
-				cli.StringFlag{
-					Name:  FlagOutputFilenameWithAlias,
-					Usage: "Output file to write to, if not provided output is written to stdout",
+				&cli.StringFlag{
+					Name:    FlagOutputFilename,
+					Aliases: []string{"of"},
+					Usage:   "Output file to write to, if not provided output is written to stdout",
 				},
-				cli.BoolFlag{
-					Name:  FlagSkipErrorModeWithAlias,
-					Usage: "Skip errors in parsing messages",
+				&cli.BoolFlag{
+					Name:    FlagSkipErrorMode,
+					Aliases: []string{"serr"},
+					Usage:   "Skip errors in parsing messages",
 				},
-				cli.BoolFlag{
-					Name:  FlagHeadersModeWithAlias,
-					Usage: "Output headers of messages in format: DomainID, WorkflowID, RunID, FirstEventID, NextEventID",
+				&cli.BoolFlag{
+					Name:    FlagHeadersMode,
+					Aliases: []string{"he"},
+					Usage:   "Output headers of messages in format: DomainID, WorkflowID, RunID, FirstEventID, NextEventID",
 				},
-				cli.IntFlag{
-					Name:  FlagMessageTypeWithAlias,
-					Usage: "Kafka message type (0: replicationTasks; 1: visibility)",
-					Value: 0,
+				&cli.IntFlag{
+					Name:    FlagMessageType,
+					Aliases: []string{"mt"},
+					Usage:   "Kafka message type (0: replicationTasks; 1: visibility)",
+					Value:   0,
 				},
 			},
-			Action: func(c *cli.Context) {
-				AdminKafkaParse(c)
-			},
+			Action: AdminKafkaParse,
 		},
 		{
+			// TODO: move this command be a subcommand of admin workflow
 			Name:    "rereplicate",
 			Aliases: []string{"rrp"},
-			Usage:   "Rereplicate replication tasks to target topic from history tables",
-			Flags: append(getDBFlags(),
-				cli.StringFlag{
+			Usage:   "Rereplicate replication tasks from history tables",
+			Flags: []cli.Flag{
+				&cli.StringFlag{
 					Name:  FlagSourceCluster,
 					Usage: "Name of source cluster to resend the replication task",
 				},
-				cli.IntFlag{
-					Name:  FlagNumberOfShards,
-					Usage: "NumberOfShards is required to calculate shardID. (see server config for numHistoryShards)",
-				},
-				// for one workflow
-				cli.Int64Flag{
-					Name:  FlagMaxEventID,
-					Usage: "MaxEventID Optional, default to all events",
-				},
-				cli.StringFlag{
-					Name:  FlagWorkflowIDWithAlias,
-					Usage: "WorkflowID",
-				},
-				cli.StringFlag{
-					Name:  FlagRunIDWithAlias,
-					Usage: "RunID",
-				},
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagDomainID,
 					Usage: "DomainID",
 				},
-				cli.StringFlag{
+				&cli.StringFlag{
+					Name:    FlagWorkflowID,
+					Aliases: []string{"w", "wid"},
+					Usage:   "WorkflowID",
+				},
+				&cli.StringFlag{
+					Name:    FlagRunID,
+					Aliases: []string{"r", "rid"},
+					Usage:   "RunID",
+				},
+				&cli.Int64Flag{
+					Name:  FlagMaxEventID,
+					Usage: "MaxEventID Optional, default to all events",
+				},
+				&cli.StringFlag{
 					Name:  FlagEndEventVersion,
-					Usage: "Workflow end event version",
-				}),
-			Action: func(c *cli.Context) {
-				AdminRereplicate(c)
-			},
+					Usage: "Workflow end event version, required if MaxEventID is specified",
+				}},
+			Action: AdminRereplicate,
 		},
 	}
 }
 
-func newAdminElasticSearchCommands() []cli.Command {
-	return []cli.Command{
+func newAdminElasticSearchCommands() []*cli.Command {
+	return []*cli.Command{
 		{
 			Name:    "catIndex",
 			Aliases: []string{"cind"},
 			Usage:   "Cat Indices on ElasticSearch",
 			Flags: []cli.Flag{
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagURL,
 					Usage: "URL of ElasticSearch cluster",
 				},
-				cli.StringFlag{
-					Name:  FlagMuttleyDestinationWithAlias,
-					Usage: "Optional muttely destination to ElasticSearch cluster",
-				},
+				getFormatFlag(),
 			},
-			Action: func(c *cli.Context) {
-				AdminCatIndices(c)
-			},
+			Action: AdminCatIndices,
 		},
 		{
 			Name:    "index",
 			Aliases: []string{"ind"},
 			Usage:   "Index docs on ElasticSearch",
 			Flags: []cli.Flag{
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagURL,
 					Usage: "URL of ElasticSearch cluster",
 				},
-				cli.StringFlag{
-					Name:  FlagMuttleyDestinationWithAlias,
-					Usage: "Optional muttely destination to ElasticSearch cluster",
-				},
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagIndex,
 					Usage: "ElasticSearch target index",
 				},
-				cli.StringFlag{
-					Name:  FlagInputFileWithAlias,
-					Usage: "Input file of indexer.Message in json format, separated by newline",
+				&cli.StringFlag{
+					Name:    FlagInputFile,
+					Aliases: []string{"if"},
+					Usage:   "Input file of indexer.Message in json format, separated by newline",
 				},
-				cli.IntFlag{
-					Name:  FlagBatchSizeWithAlias,
-					Usage: "Optional batch size of actions for bulk operations",
-					Value: 1000,
+				&cli.IntFlag{
+					Name:    FlagBatchSize,
+					Aliases: []string{"bs"},
+					Usage:   "Optional batch size of actions for bulk operations",
+					Value:   1000,
 				},
 			},
-			Action: func(c *cli.Context) {
-				AdminIndex(c)
-			},
+			Action: AdminIndex,
 		},
 		{
 			Name:    "delete",
 			Aliases: []string{"del"},
 			Usage:   "Delete docs on ElasticSearch",
 			Flags: []cli.Flag{
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagURL,
 					Usage: "URL of ElasticSearch cluster",
 				},
-				cli.StringFlag{
-					Name:  FlagMuttleyDestinationWithAlias,
-					Usage: "Optional muttely destination to ElasticSearch cluster",
-				},
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagIndex,
 					Usage: "ElasticSearch target index",
 				},
-				cli.StringFlag{
-					Name: FlagInputFileWithAlias,
+				&cli.StringFlag{
+					Name:    FlagInputFile,
+					Aliases: []string{"if"},
 					Usage: "Input file name. Redirect cadence wf list result (with tale format) to a file and use as delete input. " +
 						"First line should be table header like WORKFLOW TYPE | WORKFLOW ID | RUN ID | ...",
 				},
-				cli.IntFlag{
-					Name:  FlagBatchSizeWithAlias,
-					Usage: "Optional batch size of actions for bulk operations",
-					Value: 1000,
+				&cli.IntFlag{
+					Name:    FlagBatchSize,
+					Aliases: []string{"bs"},
+					Usage:   "Optional batch size of actions for bulk operations",
+					Value:   1000,
 				},
-				cli.IntFlag{
+				&cli.IntFlag{
 					Name:  FlagRPS,
 					Usage: "Optional batch request rate per second",
 					Value: 30,
 				},
 			},
-			Action: func(c *cli.Context) {
-				AdminDelete(c)
-			},
+			Action: AdminDelete,
 		},
 		{
 			Name:    "report",
 			Aliases: []string{"rep"},
 			Usage:   "Generate Report by Aggregation functions on ElasticSearch",
 			Flags: []cli.Flag{
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagURL,
 					Usage: "URL of ElasticSearch cluster",
 				},
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagIndex,
 					Usage: "ElasticSearch target index",
 				},
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagListQuery,
 					Usage: "SQL query of the report",
 				},
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagOutputFormat,
 					Usage: "Additional output format (html or csv)",
 				},
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagOutputFilename,
 					Usage: "Additional output filename with path",
 				},
 			},
-			Action: func(c *cli.Context) {
-				GenerateReport(c)
-			},
+			Action: GenerateReport,
 		},
 	}
 }
 
-func newAdminTaskListCommands() []cli.Command {
-	return []cli.Command{
+func newAdminTaskListCommands() []*cli.Command {
+	return []*cli.Command{
 		{
 			Name:    "describe",
 			Aliases: []string{"desc"},
 			Usage:   "Describe pollers and status information of tasklist",
 			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  FlagTaskListWithAlias,
-					Usage: "TaskList description",
+				&cli.StringFlag{
+					Name:    FlagTaskList,
+					Aliases: []string{"tl"},
+					Usage:   "TaskList description",
 				},
-				cli.StringFlag{
-					Name:  FlagTaskListTypeWithAlias,
-					Value: "decision",
-					Usage: "Optional TaskList type [decision|activity]",
+				&cli.StringFlag{
+					Name:    FlagTaskListType,
+					Aliases: []string{"tlt"},
+					Value:   "decision",
+					Usage:   "Optional TaskList type [decision|activity]",
 				},
 			},
-			Action: func(c *cli.Context) {
-				AdminDescribeTaskList(c)
+			Action: AdminDescribeTaskList,
+		},
+		{
+			Name:    "list",
+			Aliases: []string{"l"},
+			Usage:   "List active tasklist under a domain",
+			Action:  AdminListTaskList,
+		},
+		{
+			Name:    "update-partition",
+			Aliases: []string{"up"},
+			Usage:   "Update tasklist's partition config",
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:    FlagTaskList,
+					Aliases: []string{"tl"},
+					Usage:   "TaskList Name",
+				},
+				&cli.StringFlag{
+					Name:    FlagTaskListType,
+					Aliases: []string{"tlt"},
+					Usage:   "TaskList type [decision|activity]",
+				},
+				&cli.IntFlag{
+					Name:    FlagNumReadPartitions,
+					Aliases: []string{"nrp"},
+					Usage:   "Number of read partitions",
+				},
+				&cli.IntFlag{
+					Name:    FlagNumWritePartitions,
+					Aliases: []string{"nwp"},
+					Usage:   "Number of write partitions",
+				},
+				&cli.BoolFlag{
+					Name:    FlagForce,
+					Aliases: []string{"f"},
+					Usage:   "Force an update operation that may be unsafe",
+				},
 			},
+			Action: AdminUpdateTaskListPartitionConfig,
 		},
 	}
 }
 
-func newAdminClusterCommands() []cli.Command {
-	return []cli.Command{
+func newAdminClusterCommands() []*cli.Command {
+	return []*cli.Command{
 		{
 			Name:    "add-search-attr",
 			Aliases: []string{"asa"},
 			Usage:   "whitelist search attribute",
 			Flags: []cli.Flag{
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  FlagSearchAttributesKey,
 					Usage: "Search Attribute key to be whitelisted",
 				},
-				cli.IntFlag{
+				&cli.IntFlag{
 					Name:  FlagSearchAttributesType,
 					Value: -1,
 					Usage: "Search Attribute value type. [0:String, 1:Keyword, 2:Int, 3:Double, 4:Bool, 5:Datetime]",
 				},
-				cli.StringFlag{
-					Name:  FlagSecurityTokenWithAlias,
-					Usage: "Optional token for security check",
+				&cli.StringFlag{
+					Name:    FlagSecurityToken,
+					Aliases: []string{"st"},
+					Usage:   "Optional token for security check",
 				},
 			},
-			Action: func(c *cli.Context) {
-				AdminAddSearchAttribute(c)
-			},
+			Action: AdminAddSearchAttribute,
 		},
 		{
 			Name:    "describe",
 			Aliases: []string{"d"},
 			Usage:   "Describe cluster information",
-			Action: func(c *cli.Context) {
-				AdminDescribeCluster(c)
-			},
+			Action:  AdminDescribeCluster,
 		},
 		{
 			Name:        "failover",
@@ -662,175 +788,215 @@ func newAdminClusterCommands() []cli.Command {
 			Aliases: []string{"fof"},
 			Usage:   "Failover domains with domain data IsManagedByCadence=true to target cluster",
 			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  FlagTargetClusterWithAlias,
-					Usage: "Target active cluster name",
+				&cli.StringFlag{
+					Name:    FlagTargetCluster,
+					Aliases: []string{"tc"},
+					Usage:   "Target active cluster name",
 				},
 			},
-			Action: func(c *cli.Context) {
-				newDomainCLI(c, false).FailoverDomains(c)
+			Action: func(c *cli.Context) error {
+				return withDomainClient(c, false, func(dc *domainCLIImpl) error {
+					return dc.FailoverDomains(c)
+				})
 			},
+		},
+		{
+			Name:        "rebalance",
+			Aliases:     []string{"rb"},
+			Usage:       "Rebalance the domains active cluster",
+			Subcommands: newAdminRebalanceCommands(),
 		},
 	}
 }
 
-func newAdminDLQCommands() []cli.Command {
-	return []cli.Command{
+func getDLQFlags() []cli.Flag {
+	return []cli.Flag{
+		&cli.StringFlag{
+			Name:  FlagShards,
+			Usage: "Comma separated shard IDs or inclusive ranges. Example: \"2,5-6,10\".  Alternatively, feed one shard ID per line via STDIN.",
+		},
+		&cli.StringFlag{
+			Name:    FlagDLQType,
+			Aliases: []string{"dt"},
+			Usage:   "Type of DLQ to manage. (Options: domain, history)",
+			Value:   "history",
+		},
+		&cli.StringFlag{
+			Name:  FlagSourceCluster,
+			Usage: "The cluster where the task is generated",
+		},
+		&cli.IntFlag{
+			Name:    FlagLastMessageID,
+			Aliases: []string{"lm"},
+			Usage:   "The upper boundary of the read message",
+		},
+	}
+}
+
+func newAdminDLQCommands() []*cli.Command {
+	return []*cli.Command{
+		{
+			Name:    "count",
+			Aliases: []string{"c"},
+			Usage:   "Count DLQ Messages",
+			Flags: []cli.Flag{
+				getFormatFlag(),
+				&cli.StringFlag{
+					Name:    FlagDLQType,
+					Aliases: []string{"dt"},
+					Usage:   "Type of DLQ to manage. (Options: domain, history)",
+					Value:   "history",
+				},
+				&cli.BoolFlag{
+					Name:  FlagForce,
+					Usage: "Force fetch latest counts (will put additional stress on DB)",
+				},
+			},
+			Action: AdminCountDLQMessages,
+		},
 		{
 			Name:    "read",
 			Aliases: []string{"r"},
 			Usage:   "Read DLQ Messages",
-			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  FlagDLQTypeWithAlias,
-					Usage: "Type of DLQ to manage. (Options: domain, history)",
+			Flags: append(getDLQFlags(),
+				&cli.IntFlag{
+					Name:    FlagMaxMessageCount,
+					Aliases: []string{"mmc"},
+					Usage:   "Max message size to fetch",
 				},
-				cli.StringFlag{
-					Name:  FlagSourceCluster,
-					Usage: "The cluster where the task is generated",
-				},
-				cli.IntFlag{
-					Name:  FlagShardIDWithAlias,
-					Usage: "ShardID",
-				},
-				cli.IntFlag{
-					Name:  FlagMaxMessageCountWithAlias,
-					Usage: "Max message size to fetch",
-				},
-				cli.IntFlag{
-					Name:  FlagLastMessageIDWithAlias,
-					Usage: "The upper boundary of the read message",
-				},
-				cli.StringFlag{
-					Name:  FlagOutputFilenameWithAlias,
-					Usage: "Output file to write to, if not provided output is written to stdout",
-				},
-			},
-			Action: func(c *cli.Context) {
-				AdminGetDLQMessages(c)
-			},
+				getFormatFlag(),
+			),
+			Action: AdminGetDLQMessages,
 		},
 		{
 			Name:    "purge",
 			Aliases: []string{"p"},
 			Usage:   "Delete DLQ messages with equal or smaller ids than the provided task id",
-			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  FlagDLQTypeWithAlias,
-					Usage: "Type of DLQ to manage. (Options: domain, history)",
-				},
-				cli.StringFlag{
-					Name:  FlagSourceCluster,
-					Usage: "The cluster where the task is generated",
-				},
-				cli.IntFlag{
-					Name:  FlagLowerShardBound,
-					Usage: "lower bound of shard to merge (inclusive)",
-				},
-				cli.IntFlag{
-					Name:  FlagUpperShardBound,
-					Usage: "upper bound of shard to merge (inclusive)",
-				},
-				cli.IntFlag{
-					Name:  FlagLastMessageIDWithAlias,
-					Usage: "The upper boundary of the read message",
-				},
-			},
-			Action: func(c *cli.Context) {
-				AdminPurgeDLQMessages(c)
-			},
+			Flags:   getDLQFlags(),
+			Action:  AdminPurgeDLQMessages,
 		},
 		{
 			Name:    "merge",
 			Aliases: []string{"m"},
 			Usage:   "Merge DLQ messages with equal or smaller ids than the provided task id",
-			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  FlagDLQTypeWithAlias,
-					Usage: "Type of DLQ to manage. (Options: domain, history)",
-				},
-				cli.StringFlag{
-					Name:  FlagSourceCluster,
-					Usage: "The cluster where the task is generated",
-				},
-				cli.IntFlag{
-					Name:  FlagLowerShardBound,
-					Usage: "lower bound of shard to merge (inclusive)",
-				},
-				cli.IntFlag{
-					Name:  FlagUpperShardBound,
-					Usage: "upper bound of shard to merge (inclusive)",
-				},
-				cli.IntFlag{
-					Name:  FlagLastMessageIDWithAlias,
-					Usage: "The upper boundary of the read message",
-				},
-			},
-			Action: func(c *cli.Context) {
-				AdminMergeDLQMessages(c)
-			},
+			Flags:   getDLQFlags(),
+			Action:  AdminMergeDLQMessages,
 		},
 	}
 }
 
-func newAdminQueueCommands() []cli.Command {
-	return []cli.Command{
+func newAdminQueueCommands() []*cli.Command {
+	return []*cli.Command{
 		{
-			Name:  "reset",
-			Usage: "reset processing queue states for transfer or timer queue processor",
-			Flags: getQueueCommandFlags(),
-			Action: func(c *cli.Context) {
-				AdminResetQueue(c)
-			},
+			Name:   "reset",
+			Usage:  "reset processing queue states for transfer or timer queue processor",
+			Flags:  getQueueCommandFlags(),
+			Action: AdminResetQueue,
 		},
 		{
 			Name:    "describe",
 			Aliases: []string{"desc"},
 			Usage:   "describe processing queue states for transfer or timer queue processor",
 			Flags:   getQueueCommandFlags(),
-			Action: func(c *cli.Context) {
-				AdminDescribeQueue(c)
-			},
+			Action:  AdminDescribeQueue,
 		},
 	}
 }
 
-func newDBCommands() []cli.Command {
-	var collections cli.StringSlice = invariant.CollectionStrings()
+func newAdminAsyncQueueCommands() []*cli.Command {
+	return []*cli.Command{
+		{
+			Name:   "get",
+			Usage:  "get async workflow queue configuration of a domain",
+			Action: AdminGetAsyncWFConfig,
+		},
+		{
+			Name:  "update",
+			Usage: "upsert async workflow queue configuration of a domain",
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:     FlagJSON,
+					Usage:    `AsyncWorkflowConfiguration in json format. Schema can be found in https://github.com/uber/cadence/blob/master/common/types/admin.go`,
+					Required: true,
+				},
+			},
+			Action: AdminUpdateAsyncWFConfig,
+		},
+	}
+}
 
-	scanFlag := cli.StringFlag{
+func newDBCommands() []*cli.Command {
+	var collections cli.StringSlice = *cli.NewStringSlice(invariant.CollectionStrings()...)
+
+	scanFlag := &cli.StringFlag{
 		Name:     FlagScanType,
 		Usage:    "Scan type to use: " + strings.Join(executions.ScanTypeStrings(), ", "),
 		Required: true,
 	}
 
-	collectionsFlag := cli.StringSliceFlag{
+	collectionsFlag := &cli.StringSliceFlag{
 		Name:  FlagInvariantCollection,
-		Usage: "Scan collection type to use: " + strings.Join(collections, ", "),
+		Usage: "Scan collection type to use: " + strings.Join(collections.Value(), ", "),
 		Value: &collections,
 	}
 
-	return []cli.Command{
+	verboseFlag := &cli.BoolFlag{
+		Name:     FlagVerbose,
+		Usage:    "verbose output",
+		Required: false,
+	}
+
+	return []*cli.Command{
 		{
 			Name:  "scan",
 			Usage: "scan executions in database and detect corruptions",
 			Flags: append(getDBFlags(),
-				cli.IntFlag{
+				&cli.IntFlag{
 					Name:     FlagNumberOfShards,
 					Usage:    "NumberOfShards for the cadence cluster (see config for numHistoryShards)",
 					Required: true,
 				},
 				scanFlag,
 				collectionsFlag,
-				cli.StringFlag{
-					Name:  FlagInputFileWithAlias,
-					Usage: "Input file of executions to scan in JSON format {\"DomainID\":\"x\",\"WorkflowID\":\"x\",\"RunID\":\"x\"} separated by a newline",
+				&cli.StringFlag{
+					Name:    FlagInputFile,
+					Aliases: []string{"if"},
+					Usage:   "Input file of executions to scan in JSON format {\"DomainID\":\"x\",\"WorkflowID\":\"x\",\"RunID\":\"x\"} separated by a newline",
+				},
+				verboseFlag,
+			),
+
+			Action: AdminDBScan,
+		},
+		{
+			Name:  "unsupported-workflow",
+			Usage: "use this command when upgrade the Cadence server from version less than 0.16.0. This scan database and detect unsupported workflow type.",
+			Flags: append(getDBFlags(),
+				&cli.IntFlag{
+					Name:  FlagRPS,
+					Usage: "NumberOfShards for the cadence cluster (see config for numHistoryShards)",
+					Value: 1000,
+				},
+				&cli.StringFlag{
+					Name:    FlagOutputFilename,
+					Aliases: []string{"of"},
+					Usage:   "Output file to write to, if not provided output is written to stdout",
+				},
+				&cli.IntFlag{
+					Name:     FlagLowerShardBound,
+					Usage:    "FlagLowerShardBound for the start shard to scan. (Default: 0)",
+					Value:    0,
+					Required: true,
+				},
+				&cli.IntFlag{
+					Name:     FlagUpperShardBound,
+					Usage:    "FlagLowerShardBound for the end shard to scan. (Default: 16383)",
+					Value:    16383,
+					Required: true,
 				},
 			),
 
-			Action: func(c *cli.Context) {
-				AdminDBScan(c)
-			},
+			Action: AdminDBScanUnsupportedWorkflow,
 		},
 		{
 			Name:  "clean",
@@ -838,236 +1004,554 @@ func newDBCommands() []cli.Command {
 			Flags: append(getDBFlags(),
 				scanFlag,
 				collectionsFlag,
-				cli.StringFlag{
-					Name:  FlagInputFileWithAlias,
-					Usage: "Input file of execution to clean in JSON format. Use `scan` command to generate list of executions.",
+				&cli.StringFlag{
+					Name:    FlagInputFile,
+					Aliases: []string{"if"},
+					Usage:   "Input file of execution to clean in JSON format. Use `scan` command to generate list of executions.",
 				},
+				verboseFlag,
 			),
-			Action: func(c *cli.Context) {
-				AdminDBClean(c)
+			Action: AdminDBClean,
+		},
+		{
+			Name:  "decode_thrift",
+			Usage: "decode thrift object, print into JSON if the data is matching with any supported struct",
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:    FlagInput,
+					Aliases: []string{"i"},
+					EnvVars: []string{"Input"},
+					Usage:   "Input of Thrift encoded data structure.",
+				},
+				&cli.StringFlag{
+					Name:    FlagInputEncoding,
+					Aliases: []string{"enc"},
+					Usage:   "Encoding of the input: [hex|base64] (Default: hex)",
+				},
 			},
-		},
-	}
-}
-
-// TODO need to support other database: https://github.com/uber/cadence/issues/2777
-func getDBFlags() []cli.Flag {
-	return []cli.Flag{
-		cli.StringFlag{
-			Name:  FlagDBAddress,
-			Value: "127.0.0.1",
-			Usage: "persistence address (right now only cassandra is fully supported)",
-		},
-		cli.IntFlag{
-			Name:  FlagDBPort,
-			Value: 9042,
-			Usage: "persistence port",
-		},
-		cli.StringFlag{
-			Name:  FlagUsername,
-			Usage: "cassandra username",
-		},
-		cli.StringFlag{
-			Name:  FlagPassword,
-			Usage: "cassandra password",
-		},
-		cli.StringFlag{
-			Name:  FlagKeyspace,
-			Value: "cadence",
-			Usage: "cassandra keyspace",
-		},
-		cli.BoolFlag{
-			Name:  FlagEnableTLS,
-			Usage: "enable TLS over cassandra connection",
-		},
-		cli.StringFlag{
-			Name:  FlagTLSCertPath,
-			Usage: "cassandra tls client cert path (tls must be enabled)",
-		},
-		cli.StringFlag{
-			Name:  FlagTLSKeyPath,
-			Usage: "cassandra tls client key path (tls must be enabled)",
-		},
-		cli.StringFlag{
-			Name:  FlagTLSCaPath,
-			Usage: "cassandra tls client ca path (tls must be enabled)",
-		},
-		cli.BoolFlag{
-			Name:  FlagTLSEnableHostVerification,
-			Usage: "cassandra tls verify hostname and server cert (tls must be enabled)",
+			Action: AdminDBDataDecodeThrift,
 		},
 	}
 }
 
 func getQueueCommandFlags() []cli.Flag {
 	return []cli.Flag{
-		cli.IntFlag{
-			Name:  FlagShardIDWithAlias,
-			Usage: "shardID",
+		&cli.IntFlag{
+			Name:    FlagShardID,
+			Aliases: []string{"sid"},
+			Usage:   "shardID",
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  FlagCluster,
 			Usage: "cluster the task processor is responsible for",
 		},
-		cli.IntFlag{
+		&cli.IntFlag{
 			Name:  FlagQueueType,
-			Usage: "queue type: 2 (transfer queue) or 3 (timer queue)",
+			Usage: "queue type: 2 (transfer queue), 3 (timer queue) or 6 (cross-cluster queue)",
 		},
 	}
 }
 
-func newAdminFailoverCommands() []cli.Command {
-	return []cli.Command{
+func newAdminFailoverCommands() []*cli.Command {
+	return []*cli.Command{
 		{
 			Name:    "start",
 			Aliases: []string{"s"},
 			Usage:   "start failover workflow",
 			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  FlagTargetClusterWithAlias,
-					Usage: "Target cluster name",
+				&cli.StringFlag{
+					Name:    FlagTargetCluster,
+					Aliases: []string{"tc"},
+					Usage:   "Target cluster name",
 				},
-				cli.StringFlag{
-					Name:  FlagSourceClusterWithAlias,
-					Usage: "Source cluster name",
+				&cli.StringFlag{
+					Name:    FlagSourceCluster,
+					Aliases: []string{"sc"},
+					Usage:   "Source cluster name",
 				},
-				cli.IntFlag{
-					Name:  FlagFailoverTimeoutWithAlias,
-					Usage: "Optional Failover workflow timeout in seconds",
-					Value: defaultFailoverTimeoutInSeconds,
+				&cli.IntFlag{
+					Name:    FlagFailoverTimeout,
+					Aliases: []string{"fts"},
+					Usage:   "Optional graceful failover timeout in seconds. If this field is define, the failover will use graceful failover.",
 				},
-				cli.IntFlag{
-					Name:  FlagFailoverWaitTimeWithAlias,
-					Usage: "Optional Failover wait time after each batch in seconds",
-					Value: defaultBatchFailoverWaitTimeInSeconds,
+				&cli.IntFlag{
+					Name:    FlagExecutionTimeout,
+					Aliases: []string{"et"},
+					Usage:   "Optional Failover workflow timeout in seconds",
+					Value:   defaultFailoverWorkflowTimeoutInSeconds,
 				},
-				cli.IntFlag{
-					Name:  FlagFailoverBatchSizeWithAlias,
-					Usage: "Optional number of domains to failover in one batch",
-					Value: defaultBatchFailoverSize,
+				&cli.IntFlag{
+					Name:    FlagFailoverWaitTime,
+					Aliases: []string{"fwts"},
+					Usage:   "Optional Failover wait time after each batch in seconds",
+					Value:   defaultBatchFailoverWaitTimeInSeconds,
 				},
-				cli.StringSliceFlag{
+				&cli.IntFlag{
+					Name:    FlagFailoverBatchSize,
+					Aliases: []string{"fbs"},
+					Usage:   "Optional number of domains to failover in one batch",
+					Value:   defaultBatchFailoverSize,
+				},
+				&cli.StringSliceFlag{
 					Name: FlagFailoverDomains,
 					Usage: "Optional domains to failover, eg d1,d2..,dn. " +
 						"Only provided domains in source cluster will be failover.",
 				},
+				&cli.IntFlag{
+					Name:    FlagFailoverDrillWaitTime,
+					Aliases: []string{"fdws"},
+					Usage: "Optional failover drill wait time. " +
+						"After the wait time, the domains will be reset to original regions." +
+						"This field is required if the cron schedule is specified.",
+				},
+				&cli.StringFlag{
+					Name: FlagCronSchedule,
+					Usage: "Optional cron schedule on failover drill. Please specify failover drill wait time " +
+						"if this field is specific",
+				},
+				&cli.StringFlag{
+					Name: FlagClusterAttributesJSON,
+					Usage: "Optional cluster attributes to restrict active-active failover scope, in JSON format. " +
+						`Example: [{"scope":"region","name":"us-west"},{"scope":"region","name":"us-east"}]`,
+				},
+				&cli.BoolFlag{
+					Name:  FlagFailoverV2,
+					Usage: "Use the V2 failover workflow, which fails all managed domains out of --source_cluster onto --target_cluster (N-region safe, records a restore snapshot)",
+				},
+				&cli.BoolFlag{
+					Name:  FlagSkipDestinationCheck,
+					Usage: "Only with --failover_v2: allow the failover to be issued from a cluster other than --target_cluster. By default the server rejects FailoverDomain requests that are not received by the destination cluster.",
+				},
 			},
-			Action: func(c *cli.Context) {
-				AdminFailoverStart(c)
-			},
+			Action: AdminFailoverStart,
 		},
 		{
 			Name:    "pause",
 			Aliases: []string{"p"},
 			Usage:   "pause failover workflow",
 			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  FlagRunIDWithAlias,
-					Usage: "Optional Failover workflow runID, default is latest runID",
+				&cli.StringFlag{
+					Name:    FlagRunID,
+					Aliases: []string{"rid", "r"},
+					Usage:   "Optional Failover workflow runID, default is latest runID",
+				},
+				&cli.BoolFlag{
+					Name:    FlagFailoverDrill,
+					Aliases: []string{"fd"},
+					Usage: "Optional to pause failover workflow or failover drill workflow." +
+						" The default is normal failover workflow",
+				},
+				&cli.BoolFlag{
+					Name:  FlagFailoverV2,
+					Usage: "Target the V2 failover workflow",
 				},
 			},
-			Action: func(c *cli.Context) {
-				AdminFailoverPause(c)
-			},
+
+			Action: AdminFailoverPause,
 		},
 		{
 			Name:    "resume",
 			Aliases: []string{"re"},
 			Usage:   "resume paused failover workflow",
 			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  FlagRunIDWithAlias,
-					Usage: "Optional Failover workflow runID, default is latest runID",
+				&cli.StringFlag{
+					Name:    FlagRunID,
+					Aliases: []string{"rid", "r"},
+					Usage:   "Optional Failover workflow runID, default is latest runID",
+				},
+				&cli.BoolFlag{
+					Name:    FlagFailoverDrill,
+					Aliases: []string{"fd"},
+					Usage: "Optional to resume failover workflow or failover drill workflow." +
+						" The default is normal failover workflow",
+				},
+				&cli.BoolFlag{
+					Name:  FlagFailoverV2,
+					Usage: "Target the V2 failover workflow",
 				},
 			},
-			Action: func(c *cli.Context) {
-				AdminFailoverResume(c)
-			},
+			Action: AdminFailoverResume,
 		},
 		{
 			Name:    "query",
 			Aliases: []string{"q"},
 			Usage:   "query failover workflow state",
 			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  FlagRunIDWithAlias,
-					Usage: "Optional Failover workflow runID, default is latest runID",
+				&cli.BoolFlag{
+					Name:    FlagFailoverDrill,
+					Aliases: []string{"fd"},
+					Usage: "Optional to query failover workflow or failover drill workflow." +
+						" The default is normal failover workflow",
+				},
+				&cli.StringFlag{
+					Name:    FlagRunID,
+					Aliases: []string{"rid", "r"},
+					Usage:   "Optional Failover workflow runID, default is latest runID",
+				},
+				&cli.BoolFlag{
+					Name:  FlagFailoverV2,
+					Usage: "Target the V2 failover workflow",
 				},
 			},
-			Action: func(c *cli.Context) {
-				AdminFailoverQuery(c)
-			},
+			Action: AdminFailoverQuery,
 		},
 		{
 			Name:    "abort",
 			Aliases: []string{"a"},
 			Usage:   "abort failover workflow",
 			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  FlagRunIDWithAlias,
-					Usage: "Optional Failover workflow runID, default is latest runID",
+				&cli.StringFlag{
+					Name:    FlagRunID,
+					Aliases: []string{"rid", "r"},
+					Usage:   "Optional Failover workflow runID, default is latest runID",
 				},
-				cli.StringFlag{
-					Name:  FlagReasonWithAlias,
-					Usage: "Optional reason why abort",
+				&cli.StringFlag{
+					Name:    FlagReason,
+					Aliases: []string{"re"},
+					Usage:   "Optional reason why abort",
+				},
+				&cli.BoolFlag{
+					Name:    FlagFailoverDrill,
+					Aliases: []string{"fd"},
+					Usage: "Optional to abort failover workflow or failover drill workflow." +
+						" The default is normal failover workflow",
+				},
+				&cli.BoolFlag{
+					Name:  FlagFailoverV2,
+					Usage: "Target the V2 failover workflow (use this to stop a running V2 failover)",
 				},
 			},
-			Action: func(c *cli.Context) {
-				AdminFailoverAbort(c)
-			},
+			Action: AdminFailoverAbort,
 		},
 		{
 			Name:    "rollback",
 			Aliases: []string{"ro"},
 			Usage:   "rollback failover workflow",
 			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  FlagRunIDWithAlias,
-					Usage: "Optional Failover workflow runID, default is latest runID",
+				&cli.StringFlag{
+					Name:    FlagRunID,
+					Aliases: []string{"rid"},
+					Usage:   "Optional Failover workflow runID, default is latest runID",
 				},
-				cli.IntFlag{
-					Name:  FlagFailoverTimeoutWithAlias,
-					Usage: "Optional Failover workflow timeout in seconds",
-					Value: defaultFailoverTimeoutInSeconds,
+				&cli.IntFlag{
+					Name:    FlagFailoverTimeout,
+					Aliases: []string{"fts"},
+					Usage:   "Optional graceful failover timeout in seconds. If this field is define, the failover will use graceful failover.",
 				},
-				cli.IntFlag{
-					Name:  FlagFailoverWaitTimeWithAlias,
-					Usage: "Optional Failover wait time after each batch in seconds",
-					Value: defaultBatchFailoverWaitTimeInSeconds,
+				&cli.IntFlag{
+					Name:    FlagExecutionTimeout,
+					Aliases: []string{"et"},
+					Usage:   "Optional Failover workflow timeout in seconds",
+					Value:   defaultFailoverWorkflowTimeoutInSeconds,
 				},
-				cli.IntFlag{
-					Name:  FlagFailoverBatchSizeWithAlias,
-					Usage: "Optional number of domains to failover in one batch",
-					Value: defaultBatchFailoverSize,
+				&cli.IntFlag{
+					Name:    FlagFailoverWaitTime,
+					Aliases: []string{"fwts"},
+					Usage:   "Optional Failover wait time after each batch in seconds",
+					Value:   defaultBatchFailoverWaitTimeInSeconds,
+				},
+				&cli.IntFlag{
+					Name:    FlagFailoverBatchSize,
+					Aliases: []string{"fbs"},
+					Usage:   "Optional number of domains to failover in one batch",
+					Value:   defaultBatchFailoverSize,
 				},
 			},
-			Action: func(c *cli.Context) {
-				AdminFailoverRollback(c)
-			},
+			Action: AdminFailoverRollback,
 		},
 		{
 			Name:    "list",
 			Aliases: []string{"l"},
 			Usage:   "list failover workflow runs closed/open. This is just a simplified list cmd",
 			Flags: []cli.Flag{
-				cli.BoolFlag{
-					Name:  FlagOpenWithAlias,
-					Usage: "List for open workflow executions, default is to list for closed ones",
+				&cli.BoolFlag{
+					Name:    FlagOpen,
+					Aliases: []string{"op"},
+					Usage:   "List for open workflow executions, default is to list for closed ones",
 				},
-				cli.IntFlag{
-					Name:  FlagPageSizeWithAlias,
-					Value: 10,
-					Usage: "Result page size",
+				&cli.IntFlag{
+					Name:    FlagPageSize,
+					Aliases: []string{"ps"},
+					Value:   10,
+					Usage:   "Result page size",
 				},
-				cli.StringFlag{
-					Name:  FlagWorkflowIDWithAlias,
-					Usage: "Ignore this. It is a dummy flag which will be forced overwrite",
+				&cli.StringFlag{
+					Name:    FlagWorkflowID,
+					Aliases: []string{"wid", "w"},
+					Usage:   "Ignore this. It is a dummy flag which will be forced overwrite",
+				},
+				&cli.BoolFlag{
+					Name:    FlagFailoverDrill,
+					Aliases: []string{"fd"},
+					Usage: "Optional to query failover workflow or failover drill workflow." +
+						" The default is normal failover workflow",
+				},
+				&cli.BoolFlag{
+					Name:  FlagFailoverV2,
+					Usage: "Target the V2 failover workflow",
 				},
 			},
-			Action: func(c *cli.Context) {
-				AdminFailoverList(c)
-			},
+			Action: AdminFailoverList,
 		},
 	}
+}
 
+func newAdminRebalanceCommands() []*cli.Command {
+	return []*cli.Command{
+		{
+			Name:    "start",
+			Aliases: []string{"s"},
+			Usage:   "start rebalance workflow",
+			Flags: []cli.Flag{
+				&cli.BoolFlag{
+					Name:  FlagFailoverV2,
+					Usage: "Use the V2 rebalance workflow, which corrects domain-level and cluster-attribute drift from stored preferences",
+				},
+			},
+			Action: AdminRebalanceStart,
+		},
+		{
+			Name:    "list",
+			Aliases: []string{"l"},
+			Usage:   "list rebalance workflow runs closed/open.",
+			Flags: []cli.Flag{
+				&cli.BoolFlag{
+					Name:    FlagOpen,
+					Aliases: []string{"op"},
+					Usage:   "List for open workflow executions, default is to list for closed ones",
+				},
+				&cli.IntFlag{
+					Name:    FlagPageSize,
+					Aliases: []string{"ps"},
+					Value:   10,
+					Usage:   "Result page size",
+				},
+			},
+			Action: AdminRebalanceList,
+		},
+	}
+}
+
+func newAdminConfigStoreCommands() []*cli.Command {
+	return []*cli.Command{
+		{
+			Name:    "get",
+			Aliases: []string{"g"},
+			Usage:   "Get Dynamic Config Value",
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:     FlagDynamicConfigName,
+					Usage:    "Name of Dynamic Config parameter to get value of",
+					Required: true,
+				},
+				&cli.GenericFlag{
+					Name:  FlagDynamicConfigFilter,
+					Usage: fmt.Sprintf(`Optional JSON object. ex: --%s '{"domainName":"global-samples-domain", "shardID":1}'`, FlagDynamicConfigFilter),
+					Value: NewDynamicConfigFilterFlag(),
+				},
+			},
+			Action: AdminGetDynamicConfig,
+		},
+		{
+			Name:    "update",
+			Aliases: []string{"u"},
+			Usage:   "Update Dynamic Config Value",
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:     FlagDynamicConfigName,
+					Usage:    "Name of Dynamic Config parameter to update value of",
+					Required: true,
+				},
+				&cli.GenericFlag{
+					Name:  FlagDynamicConfigValue,
+					Usage: fmt.Sprintf(`JSON object. Can be specified multiple times for multiple values. ex: --%s '{"Value":1000,"Filters":[]}' --%s '{"Value":100,"Filters":[{"Name":"domainName","Value":"my-domain"}]}'`, FlagDynamicConfigValue, FlagDynamicConfigValue),
+					Value: NewDynamicConfigValuesFlag(),
+				},
+				&cli.StringFlag{
+					Name:  FlagDynamicConfigValueFile,
+					Usage: fmt.Sprintf(`Path to JSON file containing array of config values. ex: --%s config.json`, FlagDynamicConfigValueFile),
+				},
+			},
+			Action: AdminUpdateDynamicConfig,
+		},
+		{
+			Name:    "restore",
+			Aliases: []string{"r"},
+			Usage:   "Restore Dynamic Config Value",
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:     FlagDynamicConfigName,
+					Usage:    "Name of Dynamic Config parameter to restore",
+					Required: true,
+				},
+				&cli.GenericFlag{
+					Name:  FlagDynamicConfigFilter,
+					Usage: fmt.Sprintf(`Optional JSON object. ex: --%s '{"domainName":"global-samples-domain", "shardID":1}'`, FlagDynamicConfigFilter),
+					Value: NewDynamicConfigFilterFlag(),
+				},
+			},
+			Action: AdminRestoreDynamicConfig,
+		},
+		{
+			Name:    "list",
+			Aliases: []string{"l"},
+			Usage:   "List Dynamic Config Value",
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:  FlagDynamicConfigName,
+					Usage: "Optional name of Dynamic Config parameter to list (omit to list all)",
+				},
+			},
+			Action: AdminListDynamicConfig,
+		},
+		{
+			Name:    "listall",
+			Aliases: []string{"la"},
+			Usage:   "List all available configuration keys",
+			Flags:   []cli.Flag{getFormatFlag()},
+			Action:  AdminListConfigKeys,
+		},
+		{
+			Name:    "operational-get",
+			Aliases: []string{"og"},
+			Usage:   "Get Operational Dynamic Config Value (cassandra-backed store)",
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:     FlagDynamicConfigName,
+					Usage:    "Name of Dynamic Config parameter to get value of",
+					Required: true,
+				},
+				&cli.GenericFlag{
+					Name:  FlagDynamicConfigFilter,
+					Usage: fmt.Sprintf(`Optional JSON object. ex: --%s '{"domainName":"global-samples-domain", "shardID":1}'`, FlagDynamicConfigFilter),
+					Value: NewDynamicConfigFilterFlag(),
+				},
+			},
+			Action: AdminGetOperationalDynamicConfig,
+		},
+		{
+			Name:    "operational-update",
+			Aliases: []string{"ou"},
+			Usage:   "Update Operational Dynamic Config Value (cassandra-backed store)",
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:     FlagDynamicConfigName,
+					Usage:    "Name of Dynamic Config parameter to update value of",
+					Required: true,
+				},
+				&cli.GenericFlag{
+					Name:  FlagDynamicConfigValue,
+					Usage: fmt.Sprintf(`JSON object. Can be specified multiple times for multiple values. ex: --%s '{"Value":1000,"Filters":[]}' --%s '{"Value":100,"Filters":[{"Name":"domainName","Value":"my-domain"}]}'`, FlagDynamicConfigValue, FlagDynamicConfigValue),
+					Value: NewDynamicConfigValuesFlag(),
+				},
+				&cli.StringFlag{
+					Name:  FlagDynamicConfigValueFile,
+					Usage: fmt.Sprintf(`Path to JSON file containing array of config values. ex: --%s config.json`, FlagDynamicConfigValueFile),
+				},
+			},
+			Action: AdminUpdateOperationalDynamicConfig,
+		},
+		{
+			Name:    "operational-restore",
+			Aliases: []string{"or"},
+			Usage:   "Restore Operational Dynamic Config Value (cassandra-backed store)",
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:     FlagDynamicConfigName,
+					Usage:    "Name of Dynamic Config parameter to restore",
+					Required: true,
+				},
+				&cli.GenericFlag{
+					Name:  FlagDynamicConfigFilter,
+					Usage: fmt.Sprintf(`Optional JSON object. ex: --%s '{"domainName":"global-samples-domain", "shardID":1}'`, FlagDynamicConfigFilter),
+					Value: NewDynamicConfigFilterFlag(),
+				},
+			},
+			Action: AdminRestoreOperationalDynamicConfig,
+		},
+		{
+			Name:    "operational-list",
+			Aliases: []string{"ol"},
+			Usage:   "List Operational Dynamic Config Value (cassandra-backed store)",
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:  FlagDynamicConfigName,
+					Usage: "Optional name of Operational Dynamic Config parameter to list (omit to list all)",
+				},
+			},
+			Action: AdminListOperationalDynamicConfig,
+		},
+	}
+}
+
+func newAdminIsolationGroupCommands() []*cli.Command {
+	return []*cli.Command{
+		{
+			Name:  "get-global",
+			Usage: "gets the global isolation groups",
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:  FlagFormat,
+					Usage: `output format`,
+				},
+			},
+			Action: AdminGetGlobalIsolationGroups,
+		},
+		{
+			Name:  "update-global",
+			Usage: "sets the global isolation groups",
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:     FlagJSON,
+					Usage:    `the configurations to upsert: eg: [{"Name": "zone-1": "State": 2}]. To remove groups, specify an empty configuration`,
+					Required: false,
+				},
+				&cli.StringSliceFlag{
+					Name:     FlagIsolationGroupSetDrains,
+					Usage:    "Use to upsert the configuration for all drains. Note that this is an upsert operation and will overwrite all existing configuration",
+					Required: false,
+				},
+				&cli.BoolFlag{
+					Name:     FlagIsolationGroupsRemoveAllDrains,
+					Usage:    "Removes all drains",
+					Required: false,
+				},
+			},
+			Action: AdminUpdateGlobalIsolationGroups,
+		},
+		{
+			Name:  "get-domain",
+			Usage: "gets the domain isolation groups",
+			Flags: []cli.Flag{
+
+				&cli.StringFlag{
+					Name:  FlagFormat,
+					Usage: `output format`,
+				},
+			},
+			Action: AdminGetDomainIsolationGroups,
+		},
+		{
+			Name:  "update-domain",
+			Usage: "sets the domain isolation groups",
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:     FlagJSON,
+					Usage:    `the configurations to upsert: eg: [{"Name": "zone-1": "State": 2}]. To remove groups, specify an empty configuration`,
+					Required: false,
+				},
+				&cli.StringSliceFlag{
+					Name:     FlagIsolationGroupSetDrains,
+					Usage:    "Use to upsert the configuration for all drains. Note that this is an upsert operation and will overwrite all existing configuration",
+					Required: false,
+				},
+				&cli.BoolFlag{
+					Name:     FlagIsolationGroupsRemoveAllDrains,
+					Usage:    "Removes all drains",
+					Required: false,
+				},
+			},
+			Action: AdminUpdateDomainIsolationGroups,
+		},
+	}
 }

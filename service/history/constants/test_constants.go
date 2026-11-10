@@ -21,42 +21,54 @@
 package constants
 
 import (
-	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common/cache"
 	"github.com/uber/cadence/common/cluster"
 	"github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/types"
 )
 
 var (
 	// TestVersion is the workflow version for test
-	TestVersion = int64(1234)
+	TestVersion = cluster.TestCurrentClusterInitialFailoverVersion + (cluster.TestFailoverVersionIncrement * 5)
 	// TestDomainID is the domainID for test
 	TestDomainID = "deadbeef-0123-4567-890a-bcdef0123456"
+	// TestActiveActiveDomainID is the active active domainID for test
+	TestActiveActiveDomainID = "965c78b7-1f6f-4122-9ba7-af6b7a55b27f"
+	// TestActiveActiveDomainName is the active active domain name for test
+	TestActiveActiveDomainName = "active-active-domain"
 	// TestDomainName is the domainName for test
 	TestDomainName = "some random domain name"
-	// TestParentDomainID is the parentDomainID for test
-	TestParentDomainID = "deadbeef-0123-4567-890a-bcdef0123457"
-	// TestParentDomainName is the parentDomainName for test
-	TestParentDomainName = "some random parent domain name"
-	// TestTargetDomainID is the targetDomainID for test
-	TestTargetDomainID = "deadbeef-0123-4567-890a-bcdef0123458"
-	// TestTargetDomainName is the targetDomainName for test
-	TestTargetDomainName = "some random target domain name"
-	// TestChildDomainID is the childDomainID for test
-	TestChildDomainID = "deadbeef-0123-4567-890a-bcdef0123459"
-	// TestChildDomainName is the childDomainName for test
-	TestChildDomainName = "some random child domain name"
+	// TestRateLimitedDomainName is the domain name for testing task processing rate limits
+	TestRateLimitedDomainName = "rate-limited-domain-0123-4567-890a-bcdef0123456"
+	// TestRateLimitedDomainID is the domain ID for testing task processing rate limits
+	TestRateLimitedDomainID = "rate-limited-domain"
+	// TestUnknownDomainID is the domain ID for testing unknown domains
+	TestUnknownDomainID = "unknown-domain-id"
 	// TestWorkflowID is the workflowID for test
 	TestWorkflowID = "random-workflow-id"
 	// TestRunID is the workflow runID for test
 	TestRunID = "0d00698f-08e1-4d36-a3e2-3bf109f5d2d6"
+	// TestRequestID is the request ID for test
+	TestRequestID = "143b22cd-dfac-4d59-9398-893f89d89df6"
+	// CronSkip
+	CronSkip = types.CronOverlapPolicySkipped
+
+	// TestClusterMetadata is the cluster metadata for test
+	TestClusterMetadata = cluster.GetTestClusterMetadata(true)
+
+	// TestActiveClusterSelectionPolicy is the active cluster selection policy for test
+	TestActiveClusterSelectionPolicy = types.ActiveClusterSelectionPolicy{
+		ClusterAttribute: &types.ClusterAttribute{
+			Scope: "region",
+			Name:  "us-east",
+		},
+	}
 
 	// TestLocalDomainEntry is the local domain cache entry for test
 	TestLocalDomainEntry = cache.NewLocalDomainCacheEntryForTest(
 		&persistence.DomainInfo{ID: TestDomainID, Name: TestDomainName},
 		&persistence.DomainConfig{Retention: 1},
 		cluster.TestCurrentClusterName,
-		nil,
 	)
 
 	// TestGlobalDomainEntry is the global domain cache entry for test
@@ -64,7 +76,7 @@ var (
 		&persistence.DomainInfo{ID: TestDomainID, Name: TestDomainName},
 		&persistence.DomainConfig{
 			Retention:                1,
-			VisibilityArchivalStatus: workflow.ArchivalStatusEnabled,
+			VisibilityArchivalStatus: types.ArchivalStatusEnabled,
 			VisibilityArchivalURI:    "test:///visibility/archival",
 		},
 		&persistence.DomainReplicationConfig{
@@ -75,12 +87,60 @@ var (
 			},
 		},
 		TestVersion,
-		nil,
+	)
+
+	TestActiveActiveDomainEntry = cache.NewGlobalDomainCacheEntryForTest(
+		&persistence.DomainInfo{ID: TestActiveActiveDomainID, Name: TestActiveActiveDomainName},
+		&persistence.DomainConfig{
+			Retention:                1,
+			VisibilityArchivalStatus: types.ArchivalStatusEnabled,
+			VisibilityArchivalURI:    "test:///visibility/archival",
+		},
+		&persistence.DomainReplicationConfig{
+			ActiveClusterName: cluster.TestAlternativeClusterName,
+			Clusters: []*persistence.ClusterReplicationConfig{
+				{ClusterName: cluster.TestCurrentClusterName},
+				{ClusterName: cluster.TestAlternativeClusterName},
+			},
+			ActiveClusters: &types.ActiveClusters{
+				AttributeScopes: map[string]types.ClusterAttributeScope{
+					"region": {
+						ClusterAttributes: map[string]types.ActiveClusterInfo{
+							"us-east": {
+								ActiveClusterName: cluster.TestCurrentClusterName,
+							},
+							"us-west": {
+								ActiveClusterName: cluster.TestAlternativeClusterName,
+							},
+						},
+					},
+				},
+			},
+		},
+		TestVersion,
+	)
+
+	// TestRateLimitedDomainEntry is the global domain cache entry for test
+	TestRateLimitedDomainEntry = cache.NewGlobalDomainCacheEntryForTest(
+		&persistence.DomainInfo{ID: TestRateLimitedDomainID, Name: TestRateLimitedDomainName},
+		&persistence.DomainConfig{
+			Retention:                1,
+			VisibilityArchivalStatus: types.ArchivalStatusEnabled,
+			VisibilityArchivalURI:    "test:///visibility/archival",
+		},
+		&persistence.DomainReplicationConfig{
+			ActiveClusterName: cluster.TestCurrentClusterName,
+			Clusters: []*persistence.ClusterReplicationConfig{
+				{ClusterName: cluster.TestCurrentClusterName},
+				{ClusterName: cluster.TestAlternativeClusterName},
+			},
+		},
+		TestVersion,
 	)
 
 	// TestGlobalParentDomainEntry is the global parent domain cache entry for test
 	TestGlobalParentDomainEntry = cache.NewGlobalDomainCacheEntryForTest(
-		&persistence.DomainInfo{ID: TestParentDomainID, Name: TestParentDomainName},
+		&persistence.DomainInfo{ID: TestDomainID, Name: TestDomainName},
 		&persistence.DomainConfig{Retention: 1},
 		&persistence.DomainReplicationConfig{
 			ActiveClusterName: cluster.TestCurrentClusterName,
@@ -90,12 +150,11 @@ var (
 			},
 		},
 		TestVersion,
-		nil,
 	)
 
 	// TestGlobalTargetDomainEntry is the global target domain cache entry for test
 	TestGlobalTargetDomainEntry = cache.NewGlobalDomainCacheEntryForTest(
-		&persistence.DomainInfo{ID: TestTargetDomainID, Name: TestTargetDomainName},
+		&persistence.DomainInfo{ID: TestDomainID, Name: TestDomainName},
 		&persistence.DomainConfig{Retention: 1},
 		&persistence.DomainReplicationConfig{
 			ActiveClusterName: cluster.TestCurrentClusterName,
@@ -105,12 +164,11 @@ var (
 			},
 		},
 		TestVersion,
-		nil,
 	)
 
 	// TestGlobalChildDomainEntry is the global child domain cache entry for test
 	TestGlobalChildDomainEntry = cache.NewGlobalDomainCacheEntryForTest(
-		&persistence.DomainInfo{ID: TestChildDomainID, Name: TestChildDomainName},
+		&persistence.DomainInfo{ID: TestDomainID, Name: TestDomainName},
 		&persistence.DomainConfig{Retention: 1},
 		&persistence.DomainReplicationConfig{
 			ActiveClusterName: cluster.TestCurrentClusterName,
@@ -120,6 +178,23 @@ var (
 			},
 		},
 		TestVersion,
-		nil,
+	)
+
+	// TestGlobalStandbyDomainEntry is the global standby domain cache entry for test
+	TestGlobalStandbyDomainEntry = cache.NewGlobalDomainCacheEntryForTest(
+		&persistence.DomainInfo{ID: TestDomainID, Name: TestDomainName},
+		&persistence.DomainConfig{
+			Retention:                1,
+			VisibilityArchivalStatus: types.ArchivalStatusEnabled,
+			VisibilityArchivalURI:    "test:///visibility/archival",
+		},
+		&persistence.DomainReplicationConfig{
+			ActiveClusterName: cluster.TestAlternativeClusterName,
+			Clusters: []*persistence.ClusterReplicationConfig{
+				{ClusterName: cluster.TestCurrentClusterName},
+				{ClusterName: cluster.TestAlternativeClusterName},
+			},
+		},
+		TestVersion,
 	)
 )

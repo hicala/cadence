@@ -23,34 +23,37 @@ package validator
 import (
 	"fmt"
 
-	gen "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/definition"
+	"github.com/uber/cadence/common/dynamicconfig/dynamicproperties"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
-	"github.com/uber/cadence/common/service/dynamicconfig"
+	"github.com/uber/cadence/common/types"
 )
 
 // SearchAttributesValidator is used to validate search attributes
 type SearchAttributesValidator struct {
 	logger log.Logger
 
-	validSearchAttributes             dynamicconfig.MapPropertyFn
-	searchAttributesNumberOfKeysLimit dynamicconfig.IntPropertyFnWithDomainFilter
-	searchAttributesSizeOfValueLimit  dynamicconfig.IntPropertyFnWithDomainFilter
-	searchAttributesTotalSizeLimit    dynamicconfig.IntPropertyFnWithDomainFilter
+	enableQueryAttributeValidation    dynamicproperties.BoolPropertyFn
+	validSearchAttributes             dynamicproperties.MapPropertyFn
+	searchAttributesNumberOfKeysLimit dynamicproperties.IntPropertyFnWithDomainFilter
+	searchAttributesSizeOfValueLimit  dynamicproperties.IntPropertyFnWithDomainFilter
+	searchAttributesTotalSizeLimit    dynamicproperties.IntPropertyFnWithDomainFilter
 }
 
 // NewSearchAttributesValidator create SearchAttributesValidator
 func NewSearchAttributesValidator(
 	logger log.Logger,
-	validSearchAttributes dynamicconfig.MapPropertyFn,
-	searchAttributesNumberOfKeysLimit dynamicconfig.IntPropertyFnWithDomainFilter,
-	searchAttributesSizeOfValueLimit dynamicconfig.IntPropertyFnWithDomainFilter,
-	searchAttributesTotalSizeLimit dynamicconfig.IntPropertyFnWithDomainFilter,
+	enableQueryAttributeValidation dynamicproperties.BoolPropertyFn,
+	validSearchAttributes dynamicproperties.MapPropertyFn,
+	searchAttributesNumberOfKeysLimit dynamicproperties.IntPropertyFnWithDomainFilter,
+	searchAttributesSizeOfValueLimit dynamicproperties.IntPropertyFnWithDomainFilter,
+	searchAttributesTotalSizeLimit dynamicproperties.IntPropertyFnWithDomainFilter,
 ) *SearchAttributesValidator {
 	return &SearchAttributesValidator{
 		logger:                            logger,
+		enableQueryAttributeValidation:    enableQueryAttributeValidation,
 		validSearchAttributes:             validSearchAttributes,
 		searchAttributesNumberOfKeysLimit: searchAttributesNumberOfKeysLimit,
 		searchAttributesSizeOfValueLimit:  searchAttributesSizeOfValueLimit,
@@ -59,7 +62,7 @@ func NewSearchAttributesValidator(
 }
 
 // ValidateSearchAttributes validate search attributes are valid for writing and not exceed limits
-func (sv *SearchAttributesValidator) ValidateSearchAttributes(input *gen.SearchAttributes, domain string) error {
+func (sv *SearchAttributesValidator) ValidateSearchAttributes(input *types.SearchAttributes, domain string) error {
 	if input == nil {
 		return nil
 	}
@@ -70,35 +73,43 @@ func (sv *SearchAttributesValidator) ValidateSearchAttributes(input *gen.SearchA
 	if lengthOfFields > sv.searchAttributesNumberOfKeysLimit(domain) {
 		sv.logger.WithTags(tag.Number(int64(lengthOfFields)), tag.WorkflowDomainName(domain)).
 			Error("number of keys in search attributes exceed limit")
-		return &gen.BadRequestError{Message: fmt.Sprintf("number of keys %d exceed limit", lengthOfFields)}
+		return &types.BadRequestError{Message: fmt.Sprintf("number of keys %d exceed limit", lengthOfFields)}
 	}
 
 	totalSize := 0
+
+	validateAttrFn := sv.enableQueryAttributeValidation
+	validateAttr := true
+	if validateAttrFn != nil {
+		validateAttr = validateAttrFn()
+	}
 	validAttr := sv.validSearchAttributes()
 	for key, val := range fields {
-		// verify: key is whitelisted
-		if !sv.isValidSearchAttributesKey(validAttr, key) {
-			sv.logger.WithTags(tag.ESKey(key), tag.WorkflowDomainName(domain)).
-				Error("invalid search attribute key")
-			return &gen.BadRequestError{Message: fmt.Sprintf("%s is not a valid search attribute key", key)}
-		}
-		// verify: value has the correct type
-		if !sv.isValidSearchAttributesValue(validAttr, key, val) {
-			sv.logger.WithTags(tag.ESKey(key), tag.ESValue(val), tag.WorkflowDomainName(domain)).
-				Error("invalid search attribute value")
-			return &gen.BadRequestError{Message: fmt.Sprintf("%s is not a valid search attribute value for key %s", val, key)}
+		if validateAttr {
+			// verify: key is whitelisted
+			if !sv.isValidSearchAttributesKey(validAttr, key) {
+				sv.logger.WithTags(tag.ESKey(key), tag.WorkflowDomainName(domain)).
+					Error("invalid search attribute key")
+				return &types.BadRequestError{Message: fmt.Sprintf("%s is not a valid search attribute key", key)}
+			}
+			// verify: value has the correct type
+			if !sv.isValidSearchAttributesValue(validAttr, key, val) {
+				sv.logger.WithTags(tag.ESKey(key), tag.ESValue(val), tag.WorkflowDomainName(domain)).
+					Error("invalid search attribute value")
+				return &types.BadRequestError{Message: fmt.Sprintf("%s is not a valid search attribute value for key %s", val, key)}
+			}
 		}
 		// verify: key is not system reserved
 		if definition.IsSystemIndexedKey(key) {
 			sv.logger.WithTags(tag.ESKey(key), tag.WorkflowDomainName(domain)).
 				Error("illegal update of system reserved attribute")
-			return &gen.BadRequestError{Message: fmt.Sprintf("%s is read-only Cadence reservered attribute", key)}
+			return &types.BadRequestError{Message: fmt.Sprintf("%s is read-only Cadence reserved attribute", key)}
 		}
 		// verify: size of single value <= limit
 		if len(val) > sv.searchAttributesSizeOfValueLimit(domain) {
 			sv.logger.WithTags(tag.ESKey(key), tag.Number(int64(len(val))), tag.WorkflowDomainName(domain)).
 				Error("value size of search attribute exceed limit")
-			return &gen.BadRequestError{Message: fmt.Sprintf("size limit exceed for key %s", key)}
+			return &types.BadRequestError{Message: fmt.Sprintf("size limit exceed for key %s", key)}
 		}
 		totalSize += len(key) + len(val)
 	}
@@ -107,7 +118,7 @@ func (sv *SearchAttributesValidator) ValidateSearchAttributes(input *gen.SearchA
 	if totalSize > sv.searchAttributesTotalSizeLimit(domain) {
 		sv.logger.WithTags(tag.Number(int64(totalSize)), tag.WorkflowDomainName(domain)).
 			Error("total size of search attributes exceed limit")
-		return &gen.BadRequestError{Message: fmt.Sprintf("total size %d exceed limit", totalSize)}
+		return &types.BadRequestError{Message: fmt.Sprintf("total size %d exceed limit", totalSize)}
 	}
 
 	return nil
@@ -128,7 +139,7 @@ func (sv *SearchAttributesValidator) isValidSearchAttributesValue(
 	key string,
 	value []byte,
 ) bool {
-	valueType := common.ConvertIndexedValueTypeToThriftType(validAttr[key], sv.logger)
+	valueType := common.ConvertIndexedValueTypeToInternalType(validAttr[key], sv.logger)
 	_, err := common.DeserializeSearchAttributeValue(value, valueType)
 	return err == nil
 }

@@ -28,13 +28,14 @@ import (
 	"time"
 
 	"github.com/uber/cadence/common"
+	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/metrics"
 )
 
 const flushBufferedMetricsScopeDuration = 10 * time.Second
 
 type (
-	metricsScopeMap map[string]map[int]metrics.Scope
+	metricsScopeMap map[string]map[metrics.ScopeIdx]metrics.Scope
 
 	buffer struct {
 		sync.RWMutex
@@ -47,6 +48,7 @@ type (
 		cache         atomic.Value
 		closeCh       chan struct{}
 		flushDuration time.Duration
+		timeSource    clock.TimeSource
 	}
 )
 
@@ -59,6 +61,7 @@ func NewDomainMetricsScopeCache() DomainMetricsScopeCache {
 		},
 		closeCh:       make(chan struct{}),
 		flushDuration: flushBufferedMetricsScopeDuration,
+		timeSource:    clock.NewRealTimeSource(),
 	}
 
 	mc.cache.Store(make(metricsScopeMap))
@@ -66,9 +69,11 @@ func NewDomainMetricsScopeCache() DomainMetricsScopeCache {
 }
 
 func (c *domainMetricsScopeCache) flushBufferedMetricsScope(flushDuration time.Duration) {
+	ticker := c.timeSource.NewTicker(flushDuration)
+	defer ticker.Stop()
 	for {
 		select {
-		case <-time.After(flushDuration):
+		case <-ticker.Chan():
 			c.buffer.Lock()
 			if len(c.buffer.bufferMap) > 0 {
 				scopeMap := make(metricsScopeMap)
@@ -76,7 +81,7 @@ func (c *domainMetricsScopeCache) flushBufferedMetricsScope(flushDuration time.D
 				data := c.cache.Load().(metricsScopeMap)
 				// Copy everything over after atomic load
 				for key, val := range data {
-					scopeMap[key] = map[int]metrics.Scope{}
+					scopeMap[key] = map[metrics.ScopeIdx]metrics.Scope{}
 					for k, v := range val {
 						scopeMap[key][k] = v
 					}
@@ -85,7 +90,7 @@ func (c *domainMetricsScopeCache) flushBufferedMetricsScope(flushDuration time.D
 				// Copy from buffered array
 				for key, val := range c.buffer.bufferMap {
 					if _, ok := scopeMap[key]; !ok {
-						scopeMap[key] = map[int]metrics.Scope{}
+						scopeMap[key] = map[metrics.ScopeIdx]metrics.Scope{}
 					}
 					for k, v := range val {
 						scopeMap[key][k] = v
@@ -104,7 +109,7 @@ func (c *domainMetricsScopeCache) flushBufferedMetricsScope(flushDuration time.D
 }
 
 // Get retrieves scope for domainID and scopeIdx
-func (c *domainMetricsScopeCache) Get(domainID string, scopeIdx int) (metrics.Scope, bool) {
+func (c *domainMetricsScopeCache) Get(domainID string, scopeIdx metrics.ScopeIdx) (metrics.Scope, bool) {
 	data := c.cache.Load().(metricsScopeMap)
 
 	if data == nil {
@@ -121,12 +126,12 @@ func (c *domainMetricsScopeCache) Get(domainID string, scopeIdx int) (metrics.Sc
 }
 
 // Put puts map of domainID and scopeIdx to metricsScope
-func (c *domainMetricsScopeCache) Put(domainID string, scopeIdx int, scope metrics.Scope) {
+func (c *domainMetricsScopeCache) Put(domainID string, scopeIdx metrics.ScopeIdx, scope metrics.Scope) {
 	c.buffer.Lock()
 	defer c.buffer.Unlock()
 
 	if c.buffer.bufferMap[domainID] == nil {
-		c.buffer.bufferMap[domainID] = map[int]metrics.Scope{}
+		c.buffer.bufferMap[domainID] = map[metrics.ScopeIdx]metrics.Scope{}
 	}
 	c.buffer.bufferMap[domainID][scopeIdx] = scope
 }

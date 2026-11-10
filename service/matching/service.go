@@ -21,51 +21,67 @@
 package matching
 
 import (
+	"errors"
+	"fmt"
 	"sync/atomic"
 	"time"
 
+	"github.com/cadence-workflow/shard-manager/service/sharddistributor/client/clientcommon"
+
 	"github.com/uber/cadence/common"
-	"github.com/uber/cadence/common/log"
-	"github.com/uber/cadence/common/persistence"
-	persistenceClient "github.com/uber/cadence/common/persistence/client"
+	"github.com/uber/cadence/common/membership"
 	"github.com/uber/cadence/common/resource"
 	"github.com/uber/cadence/common/service"
-	"github.com/uber/cadence/common/service/dynamicconfig"
+	"github.com/uber/cadence/service/matching/config"
+	"github.com/uber/cadence/service/matching/handler"
+	"github.com/uber/cadence/service/matching/wrappers/grpc"
+	"github.com/uber/cadence/service/matching/wrappers/thrift"
 )
 
 // Service represents the cadence-matching service
 type Service struct {
 	resource.Resource
 
-	status  int32
-	handler *Handler
-	stopC   chan struct{}
-	config  *Config
+	status                         int32
+	handler                        handler.Handler
+	stopC                          chan struct{}
+	config                         *config.Config
+	ShardDistributorMatchingConfig clientcommon.Config
+	taskListDifferentiator         *membership.TaskListDifferentiator
+	drainObserver                  clientcommon.DrainSignalObserver
+	percentageOnboarded            membership.PercentageOnboarded
 }
 
 // NewService builds a new cadence-matching service
 func NewService(
-	params *service.BootstrapParams,
+	params *resource.Params,
 ) (resource.Resource, error) {
+	if params.TaskListDifferentiator == nil {
+		return nil, errors.New("creating matching service: resource.Params.TaskListDifferentiator must be set")
+	}
+	// The task list registry hashes every task list name into a shard, and a non-positive count
+	// would make that panic. We fail here instead.
+	if shardCount := params.TaskListDifferentiator.ShardCount(); shardCount <= 0 {
+		return nil, fmt.Errorf("creating matching service: numMatchingShards must be positive, got %d", shardCount)
+	}
 
-	serviceConfig := NewConfig(
-		dynamicconfig.NewCollection(
-			params.DynamicConfig,
-			params.Logger,
-			dynamicconfig.ClusterNameFilter(params.ClusterMetadata.GetCurrentClusterName()),
-		),
+	serviceConfig := config.NewConfig(
+		params.DynamicCollection,
+		params.OperationalDynamicConfig,
+		params.HostName,
+		params.RPCConfig,
+		params.GetIsolationGroups,
 	)
+
 	serviceResource, err := resource.New(
 		params,
-		common.MatchingServiceName,
-		serviceConfig.PersistenceMaxQPS,
-		serviceConfig.PersistenceGlobalMaxQPS,
-		serviceConfig.ThrottledLogRPS,
-		func(
-			persistenceBean persistenceClient.Bean,
-			logger log.Logger,
-		) (persistence.VisibilityManager, error) {
-			return persistenceBean.GetVisibilityManager(), nil
+		service.Matching,
+		&service.Config{
+			PersistenceMaxQPS:        serviceConfig.PersistenceMaxQPS,
+			PersistenceGlobalMaxQPS:  serviceConfig.PersistenceGlobalMaxQPS,
+			ThrottledLoggerMaxRPS:    serviceConfig.ThrottledLogRPS,
+			IsErrorRetryableFunction: common.IsServiceTransientError,
+			// matching doesn't need visibility config as it never read or write visibility
 		},
 	)
 	if err != nil {
@@ -73,10 +89,14 @@ func NewService(
 	}
 
 	return &Service{
-		Resource: serviceResource,
-		status:   common.DaemonStatusInitialized,
-		config:   serviceConfig,
-		stopC:    make(chan struct{}),
+		Resource:                       serviceResource,
+		status:                         common.DaemonStatusInitialized,
+		config:                         serviceConfig,
+		stopC:                          make(chan struct{}),
+		ShardDistributorMatchingConfig: params.ShardDistributorMatchingConfig,
+		taskListDifferentiator:         params.TaskListDifferentiator,
+		drainObserver:                  params.DrainObserver,
+		percentageOnboarded:            params.PercentageOnboarded,
 	}, nil
 }
 
@@ -89,8 +109,37 @@ func (s *Service) Start() {
 	logger := s.GetLogger()
 	logger.Info("matching starting")
 
-	s.handler = NewHandler(s, s.config)
-	s.handler.RegisterHandler()
+	engine := handler.NewEngine(
+		s.GetTaskManager(),
+		s.GetSemaphoreTokenManager(),
+		s.GetSemaphoreMetadataManager(),
+		s.GetSemaphoreTaskManager(),
+		s.GetClusterMetadata(),
+		s.GetHistoryClient(),
+		s.GetMatchingRawClient(), // Use non retry client inside matching
+		s.config,
+		s.GetLogger(),
+		s.GetZapLogger(),
+		s.GetMetricsClient(),
+		s.GetMetricsScope(),
+		s.GetDomainCache(),
+		s.GetMembershipResolver(),
+		s.GetIsolationGroupState(),
+		s.GetTimeSource(),
+		s.GetShardDistributorExecutorClient(),
+		s.ShardDistributorMatchingConfig,
+		s.taskListDifferentiator,
+		s.drainObserver,
+		s.percentageOnboarded,
+	)
+
+	s.handler = handler.NewHandler(engine, s.config, s.GetDomainCache(), s.GetMetricsClient(), s.GetLogger(), s.GetThrottledLogger())
+
+	thriftHandler := thrift.NewThriftHandler(s.handler)
+	thriftHandler.Register(s.GetDispatcher())
+
+	grpcHandler := grpc.NewGRPCHandler(s.handler)
+	grpcHandler.Register(s.GetDispatcher())
 
 	// must start base service first
 	s.Resource.Start()
@@ -109,7 +158,7 @@ func (s *Service) Stop() {
 
 	// remove self from membership ring and wait for traffic to drain
 	s.GetLogger().Info("ShutdownHandler: Evicting self from membership ring")
-	s.GetMembershipMonitor().EvictSelf()
+	s.GetMembershipResolver().EvictSelf()
 	s.GetLogger().Info("ShutdownHandler: Waiting for others to discover I am unhealthy")
 	time.Sleep(s.config.ShutdownDrainDuration())
 

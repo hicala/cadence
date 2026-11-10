@@ -18,25 +18,26 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-//go:generate mockgen -copyright_file ../../../LICENSE -package $GOPACKAGE -source $GOFILE -destination state_rebuilder_mock.go -self_package github.com/uber/cadence/service/history/execution
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination state_rebuilder_mock.go -self_package github.com/uber/cadence/service/history/execution
 
 package execution
 
 import (
 	"context"
-	ctx "context"
 	"fmt"
 	"time"
 
-	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/cache"
 	"github.com/uber/cadence/common/cluster"
 	"github.com/uber/cadence/common/collection"
+	"github.com/uber/cadence/common/constants"
 	"github.com/uber/cadence/common/definition"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/persistence"
+	persistenceutils "github.com/uber/cadence/common/persistence/persistence-utils"
+	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/service/history/shard"
 )
 
@@ -49,25 +50,24 @@ type (
 	// StateRebuilder is a mutable state builder to ndc state rebuild
 	StateRebuilder interface {
 		Rebuild(
-			ctx ctx.Context,
+			ctx context.Context,
 			now time.Time,
 			baseWorkflowIdentifier definition.WorkflowIdentifier,
 			baseBranchToken []byte,
 			baseLastEventID int64,
 			baseLastEventVersion int64,
 			targetWorkflowIdentifier definition.WorkflowIdentifier,
-			targetBranchToken []byte,
+			targetBranchFn func() ([]byte, error),
 			requestID string,
 		) (MutableState, int64, error)
 	}
 
 	stateRebuilderImpl struct {
-		shard           shard.Context
-		domainCache     cache.DomainCache
-		clusterMetadata cluster.Metadata
-		historyV2Mgr    persistence.HistoryManager
-		taskRefresher   MutableStateTaskRefresher
-
+		shard              shard.Context
+		domainCache        cache.DomainCache
+		clusterMetadata    cluster.Metadata
+		historyV2Mgr       persistence.HistoryManager
+		taskRefresher      MutableStateTaskRefresher
 		rebuiltHistorySize int64
 		logger             log.Logger
 	}
@@ -88,10 +88,11 @@ func NewStateRebuilder(
 		historyV2Mgr:    shard.GetHistoryManager(),
 		taskRefresher: NewMutableStateTaskRefresher(
 			shard.GetConfig(),
+			shard.GetClusterMetadata(),
 			shard.GetDomainCache(),
 			shard.GetEventsCache(),
-			logger,
 			shard.GetShardID(),
+			logger,
 		),
 		rebuiltHistorySize: 0,
 		logger:             logger,
@@ -99,23 +100,23 @@ func NewStateRebuilder(
 }
 
 func (r *stateRebuilderImpl) Rebuild(
-	ctx ctx.Context,
+	ctx context.Context,
 	now time.Time,
 	baseWorkflowIdentifier definition.WorkflowIdentifier,
 	baseBranchToken []byte,
 	baseLastEventID int64,
 	baseLastEventVersion int64,
 	targetWorkflowIdentifier definition.WorkflowIdentifier,
-	targetBranchToken []byte,
+	targetBranchFn func() ([]byte, error),
 	requestID string,
 ) (MutableState, int64, error) {
 
 	iter := collection.NewPagingIterator(r.getPaginationFn(
 		ctx,
-		baseWorkflowIdentifier,
-		common.FirstEventID,
+		constants.FirstEventID,
 		baseLastEventID+1,
 		baseBranchToken,
+		targetWorkflowIdentifier.DomainID,
 	))
 
 	domainEntry, err := r.domainCache.GetDomainByID(targetWorkflowIdentifier.DomainID)
@@ -123,12 +124,16 @@ func (r *stateRebuilderImpl) Rebuild(
 		return nil, 0, err
 	}
 
+	// Corrupt data handling
+	if !iter.HasNext() {
+		return nil, 0, fmt.Errorf("Attempting to build history state but the iterator has found no history")
+	}
 	// need to specially handling the first batch, to initialize mutable state & state builder
 	batch, err := iter.Next()
 	if err != nil {
 		return nil, 0, err
 	}
-	firstEventBatch := batch.(*shared.History).Events
+	firstEventBatch := batch.(*types.History).Events
 	rebuiltMutableState, stateBuilder := r.initializeBuilders(
 		domainEntry,
 	)
@@ -141,35 +146,48 @@ func (r *stateRebuilderImpl) Rebuild(
 		if err != nil {
 			return nil, 0, err
 		}
-		events := batch.(*shared.History).Events
+		events := batch.(*types.History).Events
 		if err := r.applyEvents(targetWorkflowIdentifier, stateBuilder, events, requestID); err != nil {
 			return nil, 0, err
 		}
 	}
 
+	rebuildVersionHistories := rebuiltMutableState.GetVersionHistories()
+	if rebuildVersionHistories != nil {
+		currentVersionHistory, err := rebuildVersionHistories.GetCurrentVersionHistory()
+		if err != nil {
+			return nil, 0, err
+		}
+		lastItem, err := currentVersionHistory.GetLastItem()
+		if err != nil {
+			return nil, 0, err
+		}
+		if !lastItem.Equals(persistence.NewVersionHistoryItem(
+			baseLastEventID,
+			baseLastEventVersion,
+		)) {
+			return nil, 0, &types.BadRequestError{Message: fmt.Sprintf(
+				"nDCStateRebuilder unable to rebuild mutable state to event ID: %v, version: %v, "+
+					"baseLastEventID + baseLastEventVersion is not the same as the last event of the last "+
+					"batch, event ID: %v, version :%v ,typically because of attemptting to rebuild to a middle of a batch",
+				baseLastEventID,
+				baseLastEventVersion,
+				lastItem.EventID,
+				lastItem.Version,
+			)}
+		}
+	}
+
+	targetBranchToken, err := targetBranchFn()
+	if err != nil {
+		return nil, 0, err
+	}
+
 	if err := rebuiltMutableState.SetCurrentBranchToken(targetBranchToken); err != nil {
 		return nil, 0, err
 	}
-	currentVersionHistory, err := rebuiltMutableState.GetVersionHistories().GetCurrentVersionHistory()
-	if err != nil {
-		return nil, 0, err
-	}
-	lastItem, err := currentVersionHistory.GetLastItem()
-	if err != nil {
-		return nil, 0, err
-	}
-	if !lastItem.Equals(persistence.NewVersionHistoryItem(
-		baseLastEventID,
-		baseLastEventVersion,
-	)) {
-		return nil, 0, &shared.InternalServiceError{Message: fmt.Sprintf(
-			"nDCStateRebuilder unable to rebuild mutable state to event ID: %v, version: %v",
-			baseLastEventID,
-			baseLastEventVersion,
-		)}
-	}
 
-	// close rebuilt mutable state transaction clearing all generated tasks, etc.
+	// close rebuilt mutable state transaction clearing all generated tasks, workflow requests, etc.
 	_, _, err = rebuiltMutableState.CloseTransactionAsSnapshot(now, TransactionPolicyPassive)
 	if err != nil {
 		return nil, 0, err
@@ -192,14 +210,12 @@ func (r *stateRebuilderImpl) initializeBuilders(
 		r.shard,
 		r.logger,
 		domainEntry,
+		constants.EmptyVersion,
 	)
 	stateBuilder := NewStateBuilder(
 		r.shard,
 		r.logger,
 		resetMutableStateBuilder,
-		func(mutableState MutableState) MutableStateTaskGenerator {
-			return NewMutableStateTaskGenerator(r.shard.GetDomainCache(), r.logger, mutableState)
-		},
 	)
 	return resetMutableStateBuilder, stateBuilder
 }
@@ -207,38 +223,38 @@ func (r *stateRebuilderImpl) initializeBuilders(
 func (r *stateRebuilderImpl) applyEvents(
 	workflowIdentifier definition.WorkflowIdentifier,
 	stateBuilder StateBuilder,
-	events []*shared.HistoryEvent,
+	events []*types.HistoryEvent,
 	requestID string,
 ) error {
 
 	_, err := stateBuilder.ApplyEvents(
 		workflowIdentifier.DomainID,
 		requestID,
-		shared.WorkflowExecution{
-			WorkflowId: common.StringPtr(workflowIdentifier.WorkflowID),
-			RunId:      common.StringPtr(workflowIdentifier.RunID),
+		types.WorkflowExecution{
+			WorkflowID: workflowIdentifier.WorkflowID,
+			RunID:      workflowIdentifier.RunID,
 		},
 		events,
 		nil, // no new run history when rebuilding mutable state
 	)
 	if err != nil {
 		r.logger.Error("nDCStateRebuilder unable to rebuild mutable state.", tag.Error(err))
-		return err
 	}
-	return nil
+
+	return err
 }
 
 func (r *stateRebuilderImpl) getPaginationFn(
 	ctx context.Context,
-	workflowIdentifier definition.WorkflowIdentifier,
 	firstEventID int64,
 	nextEventID int64,
 	branchToken []byte,
+	domainID string,
 ) collection.PaginationFn {
 
 	return func(paginationToken []byte) ([]interface{}, []byte, error) {
 
-		_, historyBatches, token, size, err := persistence.PaginateHistory(
+		_, historyBatches, token, size, err := persistenceutils.PaginateHistory(
 			ctx,
 			r.historyV2Mgr,
 			true,
@@ -248,6 +264,8 @@ func (r *stateRebuilderImpl) getPaginationFn(
 			paginationToken,
 			NDCDefaultPageSize,
 			common.IntPtr(r.shard.GetShardID()),
+			domainID,
+			r.domainCache,
 		)
 		if err != nil {
 			return nil, nil, err

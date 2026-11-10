@@ -20,37 +20,43 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//go:generate mockgen -copyright_file ../../../LICENSE -package $GOPACKAGE -source $GOFILE -destination coordinator_mock.go -self_package github.com/uber/cadence/service/history/failover
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination coordinator_mock.go -self_package github.com/uber/cadence/service/history/failover
 
 package failover
 
 import (
 	ctx "context"
+	"sync"
 	"sync/atomic"
 	"time"
 
-	workflow "github.com/uber/cadence/.gen/go/history"
-	"github.com/uber/cadence/.gen/go/replicator"
 	"github.com/uber/cadence/client/history"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/backoff"
+	"github.com/uber/cadence/common/cache"
 	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/domain"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/service/history/config"
 )
 
 const (
-	notificationChanBufferSize       = 800
-	receiveChanBufferSize            = 400
+	notificationChanBufferSize       = 1000
+	receiveChanBufferSize            = 1000
 	cleanupMarkerInterval            = 30 * time.Minute
 	invalidMarkerDuration            = 1 * time.Hour
 	updateDomainRetryInitialInterval = 50 * time.Millisecond
 	updateDomainRetryCoefficient     = 2.0
 	updateDomainMaxRetry             = 2
+	notifyRemoteCoordinatorTimeout   = 5 * time.Second
+)
+
+var (
+	errRecordNotFound = &types.EntityNotExistsError{Message: "Graceful failover record not found in shard coordinator"}
 )
 
 type (
@@ -58,50 +64,57 @@ type (
 	Coordinator interface {
 		common.Daemon
 
-		NotifyFailoverMarkers(shardID int32, markers []*replicator.FailoverMarkerAttributes)
-		ReceiveFailoverMarkers(shardIDs []int32, marker *replicator.FailoverMarkerAttributes)
+		NotifyFailoverMarkers(shardID int32, markers []*types.FailoverMarkerAttributes)
+		ReceiveFailoverMarkers(shardIDs []int32, marker *types.FailoverMarkerAttributes)
+		GetFailoverInfo(domainID string) (*types.GetFailoverInfoResponse, error)
 	}
 
 	coordinatorImpl struct {
 		status           int32
-		recorder         map[string]*failoverRecord
 		notificationChan chan *notificationRequest
 		receiveChan      chan *receiveRequest
 		shutdownChan     chan struct{}
 		retryPolicy      backoff.RetryPolicy
 
-		metadataMgr   persistence.MetadataManager
+		recorderLock sync.Mutex
+		recorder     map[string]*failoverRecord
+
+		domainManager persistence.DomainManager
 		historyClient history.Client
 		config        *config.Config
 		timeSource    clock.TimeSource
-		metrics       metrics.Client
+		domainCache   cache.DomainCache
+		scope         metrics.Scope
 		logger        log.Logger
 	}
 
 	notificationRequest struct {
 		shardID int32
-		markers []*replicator.FailoverMarkerAttributes
+		markers []*types.FailoverMarkerAttributes
 	}
 
 	receiveRequest struct {
 		shardIDs []int32
-		marker   *replicator.FailoverMarkerAttributes
+		marker   *types.FailoverMarkerAttributes
 	}
 
 	failoverRecord struct {
-		failoverVersion int64
-		shards          map[int32]struct{}
-		lastUpdatedTime time.Time
+		failoverVersion         int64
+		shards                  map[int32]struct{}
+		lastUpdatedTime         time.Time
+		firstSeenTime           time.Time
+		firstMarkerCreationTime int64
 	}
 )
 
 // NewCoordinator initialize a failover coordinator
 func NewCoordinator(
-	metadataMgr persistence.MetadataManager,
+	domainManager persistence.DomainManager,
 	historyClient history.Client,
 	timeSource clock.TimeSource,
+	domainCache cache.DomainCache,
 	config *config.Config,
-	metrics metrics.Client,
+	metricsClient metrics.Client,
 	logger log.Logger,
 ) Coordinator {
 
@@ -116,11 +129,12 @@ func NewCoordinator(
 		receiveChan:      make(chan *receiveRequest, receiveChanBufferSize),
 		shutdownChan:     make(chan struct{}),
 		retryPolicy:      retryPolicy,
-		metadataMgr:      metadataMgr,
+		domainManager:    domainManager,
 		historyClient:    historyClient,
 		timeSource:       timeSource,
+		domainCache:      domainCache,
 		config:           config,
-		metrics:          metrics,
+		scope:            metricsClient.Scope(metrics.FailoverMarkerScope),
 		logger:           logger.WithTags(tag.ComponentFailoverCoordinator),
 	}
 }
@@ -157,7 +171,7 @@ func (c *coordinatorImpl) Stop() {
 
 func (c *coordinatorImpl) NotifyFailoverMarkers(
 	shardID int32,
-	markers []*replicator.FailoverMarkerAttributes,
+	markers []*types.FailoverMarkerAttributes,
 ) {
 
 	c.notificationChan <- &notificationRequest{
@@ -168,13 +182,36 @@ func (c *coordinatorImpl) NotifyFailoverMarkers(
 
 func (c *coordinatorImpl) ReceiveFailoverMarkers(
 	shardIDs []int32,
-	marker *replicator.FailoverMarkerAttributes,
+	marker *types.FailoverMarkerAttributes,
 ) {
 
 	c.receiveChan <- &receiveRequest{
 		shardIDs: shardIDs,
 		marker:   marker,
 	}
+}
+
+func (c *coordinatorImpl) GetFailoverInfo(
+	domainID string,
+) (*types.GetFailoverInfoResponse, error) {
+	c.recorderLock.Lock()
+	defer c.recorderLock.Unlock()
+
+	record, ok := c.recorder[domainID]
+	if !ok {
+		return nil, errRecordNotFound
+	}
+
+	var pendingShards []int32
+	for i := 0; i < c.config.NumberOfShards; i++ {
+		if _, ok := record.shards[int32(i)]; !ok {
+			pendingShards = append(pendingShards, int32(i))
+		}
+	}
+	return &types.GetFailoverInfoResponse{
+		CompletedShardCount: int32(len(record.shards)),
+		PendingShards:       pendingShards,
+	}, nil
 }
 
 func (c *coordinatorImpl) receiveFailoverMarkersLoop() {
@@ -201,18 +238,20 @@ func (c *coordinatorImpl) notifyFailoverMarkerLoop() {
 		c.config.NotifyFailoverMarkerTimerJitterCoefficient(),
 	))
 	defer timer.Stop()
-	requestByMarker := make(map[*replicator.FailoverMarkerAttributes]*receiveRequest)
+	requestByMarker := make(map[types.FailoverMarkerAttributes]*receiveRequest)
 
 	for {
 		select {
 		case <-c.shutdownChan:
 			return
 		case notificationReq := <-c.notificationChan:
-			// if there is a shard movement happen, it is fine to have duplicate shard ID in the request
+			// if a shard movement happens, it is fine to have duplicated shard IDs in the request
 			// The receiver side will de-dup the shard IDs. See: handleFailoverMarkers
 			aggregateNotificationRequests(notificationReq, requestByMarker)
 		case <-timer.C:
-			c.notifyRemoteCoordinator(requestByMarker)
+			if err := c.notifyRemoteCoordinator(requestByMarker); err == nil {
+				requestByMarker = make(map[types.FailoverMarkerAttributes]*receiveRequest)
+			}
 			timer.Reset(backoff.JitDuration(
 				c.config.NotifyFailoverMarkerInterval(),
 				c.config.NotifyFailoverMarkerTimerJitterCoefficient(),
@@ -225,19 +264,27 @@ func (c *coordinatorImpl) handleFailoverMarkers(
 	request *receiveRequest,
 ) {
 
+	c.recorderLock.Lock()
+	defer c.recorderLock.Unlock()
+
 	marker := request.marker
 	domainID := marker.GetDomainID()
-
 	if record, ok := c.recorder[domainID]; ok {
-		// if the local failover version is smaller than the new received marker,
-		// it means there is another failover happened and the local one should be invalid.
+		// if the local failover version is less than the failover version in the marker,
+		// it means that another failover happened for this domain and the local one should be invalidated
 		if record.failoverVersion < marker.GetFailoverVersion() {
 			delete(c.recorder, domainID)
 		}
 
-		// if the local failover version is larger than the new received marker,
+		// if the local failover version is larger than the failover version in the marker,
 		// ignore the incoming marker
 		if record.failoverVersion > marker.GetFailoverVersion() {
+			c.logger.Info("Dropped failover marker: local failover version is greater than marker version",
+				tag.WorkflowDomainID(domainID),
+				tag.Number(record.failoverVersion),
+				tag.NextNumber(marker.GetFailoverVersion()),
+			)
+			c.scope.IncCounter(metrics.FailoverMarkerDroppedRegressedDomain)
 			return
 		}
 	}
@@ -247,43 +294,106 @@ func (c *coordinatorImpl) handleFailoverMarkers(
 		c.recorder[marker.GetDomainID()] = &failoverRecord{
 			failoverVersion: marker.GetFailoverVersion(),
 			shards:          make(map[int32]struct{}),
+			firstSeenTime:   c.timeSource.Now(),
 		}
 	}
 
 	record := c.recorder[domainID]
 	record.lastUpdatedTime = c.timeSource.Now()
+	// track the earliest valid CreationTime across all markers for accurate latency;
+	// skip non-positive values so a single bad marker can't poison the minimum
+	if ct := marker.GetCreationTime(); ct > 0 && (record.firstMarkerCreationTime == 0 || ct < record.firstMarkerCreationTime) {
+		record.firstMarkerCreationTime = ct
+	}
 	for _, shardID := range request.shardIDs {
 		record.shards[shardID] = struct{}{}
 	}
 
+	domainName, err := c.domainCache.GetDomainName(domainID)
+	if err != nil {
+		c.logger.Error("Coordinator failed to get domain name while recording failover markers from request",
+			tag.WorkflowDomainID(domainID),
+			tag.Error(err),
+		)
+
+		c.scope.Tagged(metrics.DomainTag(domainName)).IncCounter(metrics.CadenceFailures)
+		return
+	}
+
 	if len(record.shards) == c.config.NumberOfShards {
-		if err := domain.CleanPendingActiveState(
-			c.metadataMgr,
+		firstSeenTime := record.firstSeenTime
+		firstMarkerCreationTime := record.firstMarkerCreationTime
+		cleanStart := c.timeSource.Now()
+		updated, err := domain.CleanPendingActiveState(
+			c.domainManager,
 			domainID,
 			record.failoverVersion,
 			c.retryPolicy,
-		); err != nil {
-			c.logger.Error("Coordinator failed to update domain after receiving all failover markers",
-				tag.WorkflowDomainID(domainID))
-			c.metrics.IncCounter(metrics.FailoverMarkerScope, metrics.GracefulFailoverFailure)
+		)
+		cleanDuration := c.timeSource.Now().Sub(cleanStart)
+		if err != nil {
+			c.logger.Error("Coordinator failed to update domain after receiving failover markers from all shards",
+				tag.WorkflowDomainID(domainID),
+				tag.Error(err),
+			)
+			c.scope.IncCounter(metrics.CadenceFailures)
 			return
 		}
 		delete(c.recorder, domainID)
+		// reset the gauge so it reflects the current (empty) pending state for this domain
+		// rather than the last partial-count value, which would otherwise linger forever
+		c.scope.Tagged(
+			metrics.DomainTag(domainName),
+		).UpdateGauge(
+			metrics.FailoverMarkerCount,
+			0,
+		)
+
+		if !updated {
+			// another path already cleared the pending-active state — avoid the
+			// misleading "Updated domain from pending-active to active" log and
+			// the bogus GracefulFailoverLatency (which would otherwise report
+			// now - marker.CreationTime on a long-stale marker)
+			return
+		}
+
 		now := c.timeSource.Now()
-		c.metrics.Scope(
-			metrics.FailoverMarkerScope,
+		// use the earliest marker creation time across all shards to capture the
+		// full failover duration; the last marker would systematically undercount
+		failoverDuration := now.Sub(time.Unix(0, firstMarkerCreationTime))
+		c.scope.Tagged(
+			metrics.DomainTag(domainName),
 		).RecordTimer(
 			metrics.GracefulFailoverLatency,
-			now.Sub(time.Unix(0, marker.GetCreationTime())),
+			failoverDuration,
+		)
+		c.scope.Tagged(
+			metrics.DomainTag(domainName),
+		).RecordHistogramDuration(
+			metrics.GracefulFailoverLatencyHistogram,
+			failoverDuration,
 		)
 		c.logger.Info("Updated domain from pending-active to active",
-			tag.WorkflowDomainID(domainID),
-			tag.FailoverVersion(*marker.FailoverVersion),
+			tag.WorkflowDomainName(domainName),
+			tag.FailoverVersion(marker.FailoverVersion),
+			tag.Dynamic("failover-duration-seconds", failoverDuration.Seconds()),
+			tag.Dynamic("marker-pipeline-duration-seconds", now.Sub(firstSeenTime).Seconds()),
+			tag.Dynamic("clean-pending-active-duration-seconds", cleanDuration.Seconds()),
+		)
+	} else {
+		c.scope.Tagged(
+			metrics.DomainTag(domainName),
+		).UpdateGauge(
+			metrics.FailoverMarkerCount,
+			float64(len(record.shards)),
 		)
 	}
 }
 
 func (c *coordinatorImpl) cleanupInvalidMarkers() {
+	c.recorderLock.Lock()
+	defer c.recorderLock.Unlock()
+
 	for domainID, record := range c.recorder {
 		if c.timeSource.Now().Sub(record.lastUpdatedTime) > invalidMarkerDuration {
 			delete(c.recorder, domainID)
@@ -292,47 +402,52 @@ func (c *coordinatorImpl) cleanupInvalidMarkers() {
 }
 
 func (c *coordinatorImpl) notifyRemoteCoordinator(
-	requestByMarker map[*replicator.FailoverMarkerAttributes]*receiveRequest,
-) {
+	requestByMarker map[types.FailoverMarkerAttributes]*receiveRequest,
+) error {
 
 	if len(requestByMarker) > 0 {
-		var tokens []*workflow.FailoverMarkerToken
+		var tokens []*types.FailoverMarkerToken
 		for _, request := range requestByMarker {
-			tokens = append(tokens, &workflow.FailoverMarkerToken{
+			tokens = append(tokens, &types.FailoverMarkerToken{
 				ShardIDs:       request.shardIDs,
 				FailoverMarker: request.marker,
 			})
 		}
 
-		if err := c.historyClient.NotifyFailoverMarkers(
-			ctx.Background(),
-			&workflow.NotifyFailoverMarkersRequest{
+		rpcCtx, cancel := ctx.WithTimeout(ctx.Background(), notifyRemoteCoordinatorTimeout)
+		defer cancel()
+		err := c.historyClient.NotifyFailoverMarkers(
+			rpcCtx,
+			&types.NotifyFailoverMarkersRequest{
 				FailoverMarkerTokens: tokens,
 			},
-		); err != nil {
-			c.metrics.IncCounter(metrics.FailoverMarkerScope, metrics.FailoverMarkerNotificationFailure)
+		)
+		if err != nil {
+			c.scope.IncCounter(metrics.FailoverMarkerNotificationFailure)
 			c.logger.Error("Failed to notify failover markers", tag.Error(err))
-		}
-
-		for marker := range requestByMarker {
-			delete(requestByMarker, marker)
+			return err
 		}
 	}
+	return nil
 }
 
 func aggregateNotificationRequests(
 	request *notificationRequest,
-	requestByMarker map[*replicator.FailoverMarkerAttributes]*receiveRequest,
+	requestByMarker map[types.FailoverMarkerAttributes]*receiveRequest,
 ) {
 
 	for _, marker := range request.markers {
-		if _, ok := requestByMarker[marker]; !ok {
-			requestByMarker[marker] = &receiveRequest{
+		markerMask := types.FailoverMarkerAttributes{
+			DomainID:        marker.DomainID,
+			FailoverVersion: marker.FailoverVersion,
+		}
+		if _, ok := requestByMarker[markerMask]; !ok {
+			requestByMarker[markerMask] = &receiveRequest{
 				shardIDs: []int32{},
 				marker:   marker,
 			}
 		}
-		req := requestByMarker[marker]
+		req := requestByMarker[markerMask]
 		req.shardIDs = append(req.shardIDs, request.shardID)
 	}
 }

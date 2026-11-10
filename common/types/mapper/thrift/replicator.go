@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020 Uber Technologies Inc.
+// Copyright (c) 2021 Uber Technologies Inc.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -21,9 +21,8 @@
 package thrift
 
 import (
-	"github.com/uber/cadence/common/types"
-
 	"github.com/uber/cadence/.gen/go/replicator"
+	"github.com/uber/cadence/common/types"
 )
 
 // FromDLQType converts internal DLQType type to thrift
@@ -32,11 +31,11 @@ func FromDLQType(t *types.DLQType) *replicator.DLQType {
 		return nil
 	}
 	switch *t {
-	case types.DLQTypeDomain:
-		v := replicator.DLQTypeDomain
-		return &v
 	case types.DLQTypeReplication:
 		v := replicator.DLQTypeReplication
+		return &v
+	case types.DLQTypeDomain:
+		v := replicator.DLQTypeDomain
 		return &v
 	}
 	panic("unexpected enum value")
@@ -48,11 +47,11 @@ func ToDLQType(t *replicator.DLQType) *types.DLQType {
 		return nil
 	}
 	switch *t {
-	case replicator.DLQTypeDomain:
-		v := types.DLQTypeDomain
-		return &v
 	case replicator.DLQTypeReplication:
 		v := types.DLQTypeReplication
+		return &v
+	case replicator.DLQTypeDomain:
+		v := types.DLQTypeDomain
 		return &v
 	}
 	panic("unexpected enum value")
@@ -70,6 +69,9 @@ func FromDomainOperation(t *types.DomainOperation) *replicator.DomainOperation {
 	case types.DomainOperationUpdate:
 		v := replicator.DomainOperationUpdate
 		return &v
+	case types.DomainOperationDelete:
+		v := replicator.DomainOperationDelete
+		return &v
 	}
 	panic("unexpected enum value")
 }
@@ -86,6 +88,9 @@ func ToDomainOperation(t *replicator.DomainOperation) *types.DomainOperation {
 	case replicator.DomainOperationUpdate:
 		v := types.DomainOperationUpdate
 		return &v
+	case replicator.DomainOperationDelete:
+		v := types.DomainOperationDelete
+		return &v
 	}
 	panic("unexpected enum value")
 }
@@ -97,13 +102,13 @@ func FromDomainTaskAttributes(t *types.DomainTaskAttributes) *replicator.DomainT
 	}
 	return &replicator.DomainTaskAttributes{
 		DomainOperation:         FromDomainOperation(t.DomainOperation),
-		ID:                      t.ID,
+		ID:                      &t.ID,
 		Info:                    FromDomainInfo(t.Info),
 		Config:                  FromDomainConfiguration(t.Config),
 		ReplicationConfig:       FromDomainReplicationConfiguration(t.ReplicationConfig),
-		ConfigVersion:           t.ConfigVersion,
-		FailoverVersion:         t.FailoverVersion,
-		PreviousFailoverVersion: t.PreviousFailoverVersion,
+		ConfigVersion:           &t.ConfigVersion,
+		FailoverVersion:         &t.FailoverVersion,
+		PreviousFailoverVersion: &t.PreviousFailoverVersion,
 	}
 }
 
@@ -114,13 +119,13 @@ func ToDomainTaskAttributes(t *replicator.DomainTaskAttributes) *types.DomainTas
 	}
 	return &types.DomainTaskAttributes{
 		DomainOperation:         ToDomainOperation(t.DomainOperation),
-		ID:                      t.ID,
+		ID:                      t.GetID(),
 		Info:                    ToDomainInfo(t.Info),
 		Config:                  ToDomainConfiguration(t.Config),
 		ReplicationConfig:       ToDomainReplicationConfiguration(t.ReplicationConfig),
-		ConfigVersion:           t.ConfigVersion,
-		FailoverVersion:         t.FailoverVersion,
-		PreviousFailoverVersion: t.PreviousFailoverVersion,
+		ConfigVersion:           t.GetConfigVersion(),
+		FailoverVersion:         t.GetFailoverVersion(),
+		PreviousFailoverVersion: t.GetPreviousFailoverVersion(),
 	}
 }
 
@@ -130,8 +135,8 @@ func FromFailoverMarkerAttributes(t *types.FailoverMarkerAttributes) *replicator
 		return nil
 	}
 	return &replicator.FailoverMarkerAttributes{
-		DomainID:        t.DomainID,
-		FailoverVersion: t.FailoverVersion,
+		DomainID:        &t.DomainID,
+		FailoverVersion: &t.FailoverVersion,
 		CreationTime:    t.CreationTime,
 	}
 }
@@ -142,9 +147,35 @@ func ToFailoverMarkerAttributes(t *replicator.FailoverMarkerAttributes) *types.F
 		return nil
 	}
 	return &types.FailoverMarkerAttributes{
-		DomainID:        t.DomainID,
-		FailoverVersion: t.FailoverVersion,
+		DomainID:        t.GetDomainID(),
+		FailoverVersion: t.GetFailoverVersion(),
 		CreationTime:    t.CreationTime,
+	}
+}
+
+// FromSemaphoreMetadataTaskAttributes converts internal SemaphoreMetadataTaskAttributes type to thrift
+func FromSemaphoreMetadataTaskAttributes(t *types.SemaphoreMetadataTaskAttributes) *replicator.SemaphoreMetadataTaskAttributes {
+	if t == nil {
+		return nil
+	}
+	return &replicator.SemaphoreMetadataTaskAttributes{
+		DomainId:       &t.DomainID,
+		SemaphoreName:  &t.SemaphoreName,
+		Capacity:       &t.Capacity,
+		BucketCapacity: &t.BucketCapacity,
+	}
+}
+
+// ToSemaphoreMetadataTaskAttributes converts thrift SemaphoreMetadataTaskAttributes type to internal
+func ToSemaphoreMetadataTaskAttributes(t *replicator.SemaphoreMetadataTaskAttributes) *types.SemaphoreMetadataTaskAttributes {
+	if t == nil {
+		return nil
+	}
+	return &types.SemaphoreMetadataTaskAttributes{
+		DomainID:       t.GetDomainId(),
+		SemaphoreName:  t.GetSemaphoreName(),
+		Capacity:       t.GetCapacity(),
+		BucketCapacity: t.GetBucketCapacity(),
 	}
 }
 
@@ -168,8 +199,8 @@ func ToFailoverMarkers(t *replicator.FailoverMarkers) *types.FailoverMarkers {
 	}
 }
 
-// FromGetDLQReplicationMessagesRequest converts internal GetDLQReplicationMessagesRequest type to thrift
-func FromGetDLQReplicationMessagesRequest(t *types.GetDLQReplicationMessagesRequest) *replicator.GetDLQReplicationMessagesRequest {
+// FromAdminGetDLQReplicationMessagesRequest converts internal GetDLQReplicationMessagesRequest type to thrift
+func FromAdminGetDLQReplicationMessagesRequest(t *types.GetDLQReplicationMessagesRequest) *replicator.GetDLQReplicationMessagesRequest {
 	if t == nil {
 		return nil
 	}
@@ -178,8 +209,8 @@ func FromGetDLQReplicationMessagesRequest(t *types.GetDLQReplicationMessagesRequ
 	}
 }
 
-// ToGetDLQReplicationMessagesRequest converts thrift GetDLQReplicationMessagesRequest type to internal
-func ToGetDLQReplicationMessagesRequest(t *replicator.GetDLQReplicationMessagesRequest) *types.GetDLQReplicationMessagesRequest {
+// ToAdminGetDLQReplicationMessagesRequest converts thrift GetDLQReplicationMessagesRequest type to internal
+func ToAdminGetDLQReplicationMessagesRequest(t *replicator.GetDLQReplicationMessagesRequest) *types.GetDLQReplicationMessagesRequest {
 	if t == nil {
 		return nil
 	}
@@ -188,8 +219,8 @@ func ToGetDLQReplicationMessagesRequest(t *replicator.GetDLQReplicationMessagesR
 	}
 }
 
-// FromGetDLQReplicationMessagesResponse converts internal GetDLQReplicationMessagesResponse type to thrift
-func FromGetDLQReplicationMessagesResponse(t *types.GetDLQReplicationMessagesResponse) *replicator.GetDLQReplicationMessagesResponse {
+// FromAdminGetDLQReplicationMessagesResponse converts internal GetDLQReplicationMessagesResponse type to thrift
+func FromAdminGetDLQReplicationMessagesResponse(t *types.GetDLQReplicationMessagesResponse) *replicator.GetDLQReplicationMessagesResponse {
 	if t == nil {
 		return nil
 	}
@@ -198,8 +229,8 @@ func FromGetDLQReplicationMessagesResponse(t *types.GetDLQReplicationMessagesRes
 	}
 }
 
-// ToGetDLQReplicationMessagesResponse converts thrift GetDLQReplicationMessagesResponse type to internal
-func ToGetDLQReplicationMessagesResponse(t *replicator.GetDLQReplicationMessagesResponse) *types.GetDLQReplicationMessagesResponse {
+// ToAdminGetDLQReplicationMessagesResponse converts thrift GetDLQReplicationMessagesResponse type to internal
+func ToAdminGetDLQReplicationMessagesResponse(t *replicator.GetDLQReplicationMessagesResponse) *types.GetDLQReplicationMessagesResponse {
 	if t == nil {
 		return nil
 	}
@@ -208,32 +239,32 @@ func ToGetDLQReplicationMessagesResponse(t *replicator.GetDLQReplicationMessages
 	}
 }
 
-// FromGetDomainReplicationMessagesRequest converts internal GetDomainReplicationMessagesRequest type to thrift
-func FromGetDomainReplicationMessagesRequest(t *types.GetDomainReplicationMessagesRequest) *replicator.GetDomainReplicationMessagesRequest {
+// FromAdminGetDomainReplicationMessagesRequest converts internal GetDomainReplicationMessagesRequest type to thrift
+func FromAdminGetDomainReplicationMessagesRequest(t *types.GetDomainReplicationMessagesRequest) *replicator.GetDomainReplicationMessagesRequest {
 	if t == nil {
 		return nil
 	}
 	return &replicator.GetDomainReplicationMessagesRequest{
 		LastRetrievedMessageId: t.LastRetrievedMessageID,
 		LastProcessedMessageId: t.LastProcessedMessageID,
-		ClusterName:            t.ClusterName,
+		ClusterName:            &t.ClusterName,
 	}
 }
 
-// ToGetDomainReplicationMessagesRequest converts thrift GetDomainReplicationMessagesRequest type to internal
-func ToGetDomainReplicationMessagesRequest(t *replicator.GetDomainReplicationMessagesRequest) *types.GetDomainReplicationMessagesRequest {
+// ToAdminGetDomainReplicationMessagesRequest converts thrift GetDomainReplicationMessagesRequest type to internal
+func ToAdminGetDomainReplicationMessagesRequest(t *replicator.GetDomainReplicationMessagesRequest) *types.GetDomainReplicationMessagesRequest {
 	if t == nil {
 		return nil
 	}
 	return &types.GetDomainReplicationMessagesRequest{
 		LastRetrievedMessageID: t.LastRetrievedMessageId,
 		LastProcessedMessageID: t.LastProcessedMessageId,
-		ClusterName:            t.ClusterName,
+		ClusterName:            t.GetClusterName(),
 	}
 }
 
-// FromGetDomainReplicationMessagesResponse converts internal GetDomainReplicationMessagesResponse type to thrift
-func FromGetDomainReplicationMessagesResponse(t *types.GetDomainReplicationMessagesResponse) *replicator.GetDomainReplicationMessagesResponse {
+// FromAdminGetDomainReplicationMessagesResponse converts internal GetDomainReplicationMessagesResponse type to thrift
+func FromAdminGetDomainReplicationMessagesResponse(t *types.GetDomainReplicationMessagesResponse) *replicator.GetDomainReplicationMessagesResponse {
 	if t == nil {
 		return nil
 	}
@@ -242,8 +273,8 @@ func FromGetDomainReplicationMessagesResponse(t *types.GetDomainReplicationMessa
 	}
 }
 
-// ToGetDomainReplicationMessagesResponse converts thrift GetDomainReplicationMessagesResponse type to internal
-func ToGetDomainReplicationMessagesResponse(t *replicator.GetDomainReplicationMessagesResponse) *types.GetDomainReplicationMessagesResponse {
+// ToAdminGetDomainReplicationMessagesResponse converts thrift GetDomainReplicationMessagesResponse type to internal
+func ToAdminGetDomainReplicationMessagesResponse(t *replicator.GetDomainReplicationMessagesResponse) *types.GetDomainReplicationMessagesResponse {
 	if t == nil {
 		return nil
 	}
@@ -252,30 +283,30 @@ func ToGetDomainReplicationMessagesResponse(t *replicator.GetDomainReplicationMe
 	}
 }
 
-// FromGetReplicationMessagesRequest converts internal GetReplicationMessagesRequest type to thrift
-func FromGetReplicationMessagesRequest(t *types.GetReplicationMessagesRequest) *replicator.GetReplicationMessagesRequest {
+// FromAdminGetReplicationMessagesRequest converts internal GetReplicationMessagesRequest type to thrift
+func FromAdminGetReplicationMessagesRequest(t *types.GetReplicationMessagesRequest) *replicator.GetReplicationMessagesRequest {
 	if t == nil {
 		return nil
 	}
 	return &replicator.GetReplicationMessagesRequest{
 		Tokens:      FromReplicationTokenArray(t.Tokens),
-		ClusterName: t.ClusterName,
+		ClusterName: &t.ClusterName,
 	}
 }
 
-// ToGetReplicationMessagesRequest converts thrift GetReplicationMessagesRequest type to internal
-func ToGetReplicationMessagesRequest(t *replicator.GetReplicationMessagesRequest) *types.GetReplicationMessagesRequest {
+// ToAdminGetReplicationMessagesRequest converts thrift GetReplicationMessagesRequest type to internal
+func ToAdminGetReplicationMessagesRequest(t *replicator.GetReplicationMessagesRequest) *types.GetReplicationMessagesRequest {
 	if t == nil {
 		return nil
 	}
 	return &types.GetReplicationMessagesRequest{
 		Tokens:      ToReplicationTokenArray(t.Tokens),
-		ClusterName: t.ClusterName,
+		ClusterName: t.GetClusterName(),
 	}
 }
 
-// FromGetReplicationMessagesResponse converts internal GetReplicationMessagesResponse type to thrift
-func FromGetReplicationMessagesResponse(t *types.GetReplicationMessagesResponse) *replicator.GetReplicationMessagesResponse {
+// FromAdminGetReplicationMessagesResponse converts internal GetReplicationMessagesResponse type to thrift
+func FromAdminGetReplicationMessagesResponse(t *types.GetReplicationMessagesResponse) *replicator.GetReplicationMessagesResponse {
 	if t == nil {
 		return nil
 	}
@@ -284,8 +315,8 @@ func FromGetReplicationMessagesResponse(t *types.GetReplicationMessagesResponse)
 	}
 }
 
-// ToGetReplicationMessagesResponse converts thrift GetReplicationMessagesResponse type to internal
-func ToGetReplicationMessagesResponse(t *replicator.GetReplicationMessagesResponse) *types.GetReplicationMessagesResponse {
+// ToAdminGetReplicationMessagesResponse converts thrift GetReplicationMessagesResponse type to internal
+func ToAdminGetReplicationMessagesResponse(t *replicator.GetReplicationMessagesResponse) *types.GetReplicationMessagesResponse {
 	if t == nil {
 		return nil
 	}
@@ -300,10 +331,9 @@ func FromHistoryTaskV2Attributes(t *types.HistoryTaskV2Attributes) *replicator.H
 		return nil
 	}
 	return &replicator.HistoryTaskV2Attributes{
-		TaskId:              t.TaskID,
-		DomainId:            t.DomainID,
-		WorkflowId:          t.WorkflowID,
-		RunId:               t.RunID,
+		DomainId:            &t.DomainID,
+		WorkflowId:          &t.WorkflowID,
+		RunId:               &t.RunID,
 		VersionHistoryItems: FromVersionHistoryItemArray(t.VersionHistoryItems),
 		Events:              FromDataBlob(t.Events),
 		NewRunEvents:        FromDataBlob(t.NewRunEvents),
@@ -316,48 +346,47 @@ func ToHistoryTaskV2Attributes(t *replicator.HistoryTaskV2Attributes) *types.His
 		return nil
 	}
 	return &types.HistoryTaskV2Attributes{
-		TaskID:              t.TaskId,
-		DomainID:            t.DomainId,
-		WorkflowID:          t.WorkflowId,
-		RunID:               t.RunId,
+		DomainID:            t.GetDomainId(),
+		WorkflowID:          t.GetWorkflowId(),
+		RunID:               t.GetRunId(),
 		VersionHistoryItems: ToVersionHistoryItemArray(t.VersionHistoryItems),
 		Events:              ToDataBlob(t.Events),
 		NewRunEvents:        ToDataBlob(t.NewRunEvents),
 	}
 }
 
-// FromMergeDLQMessagesRequest converts internal MergeDLQMessagesRequest type to thrift
-func FromMergeDLQMessagesRequest(t *types.MergeDLQMessagesRequest) *replicator.MergeDLQMessagesRequest {
+// FromAdminMergeDLQMessagesRequest converts internal MergeDLQMessagesRequest type to thrift
+func FromAdminMergeDLQMessagesRequest(t *types.MergeDLQMessagesRequest) *replicator.MergeDLQMessagesRequest {
 	if t == nil {
 		return nil
 	}
 	return &replicator.MergeDLQMessagesRequest{
 		Type:                  FromDLQType(t.Type),
-		ShardID:               t.ShardID,
-		SourceCluster:         t.SourceCluster,
+		ShardID:               &t.ShardID,
+		SourceCluster:         &t.SourceCluster,
 		InclusiveEndMessageID: t.InclusiveEndMessageID,
-		MaximumPageSize:       t.MaximumPageSize,
+		MaximumPageSize:       &t.MaximumPageSize,
 		NextPageToken:         t.NextPageToken,
 	}
 }
 
-// ToMergeDLQMessagesRequest converts thrift MergeDLQMessagesRequest type to internal
-func ToMergeDLQMessagesRequest(t *replicator.MergeDLQMessagesRequest) *types.MergeDLQMessagesRequest {
+// ToAdminMergeDLQMessagesRequest converts thrift MergeDLQMessagesRequest type to internal
+func ToAdminMergeDLQMessagesRequest(t *replicator.MergeDLQMessagesRequest) *types.MergeDLQMessagesRequest {
 	if t == nil {
 		return nil
 	}
 	return &types.MergeDLQMessagesRequest{
 		Type:                  ToDLQType(t.Type),
-		ShardID:               t.ShardID,
-		SourceCluster:         t.SourceCluster,
+		ShardID:               t.GetShardID(),
+		SourceCluster:         t.GetSourceCluster(),
 		InclusiveEndMessageID: t.InclusiveEndMessageID,
-		MaximumPageSize:       t.MaximumPageSize,
+		MaximumPageSize:       t.GetMaximumPageSize(),
 		NextPageToken:         t.NextPageToken,
 	}
 }
 
-// FromMergeDLQMessagesResponse converts internal MergeDLQMessagesResponse type to thrift
-func FromMergeDLQMessagesResponse(t *types.MergeDLQMessagesResponse) *replicator.MergeDLQMessagesResponse {
+// FromAdminMergeDLQMessagesResponse converts internal MergeDLQMessagesResponse type to thrift
+func FromAdminMergeDLQMessagesResponse(t *types.MergeDLQMessagesResponse) *replicator.MergeDLQMessagesResponse {
 	if t == nil {
 		return nil
 	}
@@ -366,8 +395,8 @@ func FromMergeDLQMessagesResponse(t *types.MergeDLQMessagesResponse) *replicator
 	}
 }
 
-// ToMergeDLQMessagesResponse converts thrift MergeDLQMessagesResponse type to internal
-func ToMergeDLQMessagesResponse(t *replicator.MergeDLQMessagesResponse) *types.MergeDLQMessagesResponse {
+// ToAdminMergeDLQMessagesResponse converts thrift MergeDLQMessagesResponse type to internal
+func ToAdminMergeDLQMessagesResponse(t *replicator.MergeDLQMessagesResponse) *types.MergeDLQMessagesResponse {
 	if t == nil {
 		return nil
 	}
@@ -376,83 +405,85 @@ func ToMergeDLQMessagesResponse(t *replicator.MergeDLQMessagesResponse) *types.M
 	}
 }
 
-// FromPurgeDLQMessagesRequest converts internal PurgeDLQMessagesRequest type to thrift
-func FromPurgeDLQMessagesRequest(t *types.PurgeDLQMessagesRequest) *replicator.PurgeDLQMessagesRequest {
+// FromAdminPurgeDLQMessagesRequest converts internal PurgeDLQMessagesRequest type to thrift
+func FromAdminPurgeDLQMessagesRequest(t *types.PurgeDLQMessagesRequest) *replicator.PurgeDLQMessagesRequest {
 	if t == nil {
 		return nil
 	}
 	return &replicator.PurgeDLQMessagesRequest{
 		Type:                  FromDLQType(t.Type),
-		ShardID:               t.ShardID,
-		SourceCluster:         t.SourceCluster,
+		ShardID:               &t.ShardID,
+		SourceCluster:         &t.SourceCluster,
 		InclusiveEndMessageID: t.InclusiveEndMessageID,
 	}
 }
 
-// ToPurgeDLQMessagesRequest converts thrift PurgeDLQMessagesRequest type to internal
-func ToPurgeDLQMessagesRequest(t *replicator.PurgeDLQMessagesRequest) *types.PurgeDLQMessagesRequest {
+// ToAdminPurgeDLQMessagesRequest converts thrift PurgeDLQMessagesRequest type to internal
+func ToAdminPurgeDLQMessagesRequest(t *replicator.PurgeDLQMessagesRequest) *types.PurgeDLQMessagesRequest {
 	if t == nil {
 		return nil
 	}
 	return &types.PurgeDLQMessagesRequest{
 		Type:                  ToDLQType(t.Type),
-		ShardID:               t.ShardID,
-		SourceCluster:         t.SourceCluster,
+		ShardID:               t.GetShardID(),
+		SourceCluster:         t.GetSourceCluster(),
 		InclusiveEndMessageID: t.InclusiveEndMessageID,
 	}
 }
 
-// FromReadDLQMessagesRequest converts internal ReadDLQMessagesRequest type to thrift
-func FromReadDLQMessagesRequest(t *types.ReadDLQMessagesRequest) *replicator.ReadDLQMessagesRequest {
+// FromAdminReadDLQMessagesRequest converts internal ReadDLQMessagesRequest type to thrift
+func FromAdminReadDLQMessagesRequest(t *types.ReadDLQMessagesRequest) *replicator.ReadDLQMessagesRequest {
 	if t == nil {
 		return nil
 	}
 	return &replicator.ReadDLQMessagesRequest{
 		Type:                  FromDLQType(t.Type),
-		ShardID:               t.ShardID,
-		SourceCluster:         t.SourceCluster,
+		ShardID:               &t.ShardID,
+		SourceCluster:         &t.SourceCluster,
 		InclusiveEndMessageID: t.InclusiveEndMessageID,
-		MaximumPageSize:       t.MaximumPageSize,
+		MaximumPageSize:       &t.MaximumPageSize,
 		NextPageToken:         t.NextPageToken,
 	}
 }
 
-// ToReadDLQMessagesRequest converts thrift ReadDLQMessagesRequest type to internal
-func ToReadDLQMessagesRequest(t *replicator.ReadDLQMessagesRequest) *types.ReadDLQMessagesRequest {
+// ToAdminReadDLQMessagesRequest converts thrift ReadDLQMessagesRequest type to internal
+func ToAdminReadDLQMessagesRequest(t *replicator.ReadDLQMessagesRequest) *types.ReadDLQMessagesRequest {
 	if t == nil {
 		return nil
 	}
 	return &types.ReadDLQMessagesRequest{
 		Type:                  ToDLQType(t.Type),
-		ShardID:               t.ShardID,
-		SourceCluster:         t.SourceCluster,
+		ShardID:               t.GetShardID(),
+		SourceCluster:         t.GetSourceCluster(),
 		InclusiveEndMessageID: t.InclusiveEndMessageID,
-		MaximumPageSize:       t.MaximumPageSize,
+		MaximumPageSize:       t.GetMaximumPageSize(),
 		NextPageToken:         t.NextPageToken,
 	}
 }
 
-// FromReadDLQMessagesResponse converts internal ReadDLQMessagesResponse type to thrift
-func FromReadDLQMessagesResponse(t *types.ReadDLQMessagesResponse) *replicator.ReadDLQMessagesResponse {
+// FromAdminReadDLQMessagesResponse converts internal ReadDLQMessagesResponse type to thrift
+func FromAdminReadDLQMessagesResponse(t *types.ReadDLQMessagesResponse) *replicator.ReadDLQMessagesResponse {
 	if t == nil {
 		return nil
 	}
 	return &replicator.ReadDLQMessagesResponse{
-		Type:             FromDLQType(t.Type),
-		ReplicationTasks: FromReplicationTaskArray(t.ReplicationTasks),
-		NextPageToken:    t.NextPageToken,
+		Type:                 FromDLQType(t.Type),
+		ReplicationTasks:     FromReplicationTaskArray(t.ReplicationTasks),
+		ReplicationTasksInfo: FromReplicationTaskInfoArray(t.ReplicationTasksInfo),
+		NextPageToken:        t.NextPageToken,
 	}
 }
 
-// ToReadDLQMessagesResponse converts thrift ReadDLQMessagesResponse type to internal
-func ToReadDLQMessagesResponse(t *replicator.ReadDLQMessagesResponse) *types.ReadDLQMessagesResponse {
+// ToAdminReadDLQMessagesResponse converts thrift ReadDLQMessagesResponse type to internal
+func ToAdminReadDLQMessagesResponse(t *replicator.ReadDLQMessagesResponse) *types.ReadDLQMessagesResponse {
 	if t == nil {
 		return nil
 	}
 	return &types.ReadDLQMessagesResponse{
-		Type:             ToDLQType(t.Type),
-		ReplicationTasks: ToReplicationTaskArray(t.ReplicationTasks),
-		NextPageToken:    t.NextPageToken,
+		Type:                 ToDLQType(t.Type),
+		ReplicationTasks:     ToReplicationTaskArray(t.ReplicationTasks),
+		ReplicationTasksInfo: ToReplicationTaskInfoArray(t.ReplicationTasksInfo),
+		NextPageToken:        t.NextPageToken,
 	}
 }
 
@@ -463,8 +494,8 @@ func FromReplicationMessages(t *types.ReplicationMessages) *replicator.Replicati
 	}
 	return &replicator.ReplicationMessages{
 		ReplicationTasks:       FromReplicationTaskArray(t.ReplicationTasks),
-		LastRetrievedMessageId: t.LastRetrievedMessageID,
-		HasMore:                t.HasMore,
+		LastRetrievedMessageId: &t.LastRetrievedMessageID,
+		HasMore:                &t.HasMore,
 		SyncShardStatus:        FromSyncShardStatus(t.SyncShardStatus),
 	}
 }
@@ -476,8 +507,8 @@ func ToReplicationMessages(t *replicator.ReplicationMessages) *types.Replication
 	}
 	return &types.ReplicationMessages{
 		ReplicationTasks:       ToReplicationTaskArray(t.ReplicationTasks),
-		LastRetrievedMessageID: t.LastRetrievedMessageId,
-		HasMore:                t.HasMore,
+		LastRetrievedMessageID: t.GetLastRetrievedMessageId(),
+		HasMore:                t.GetHasMore(),
 		SyncShardStatus:        ToSyncShardStatus(t.SyncShardStatus),
 	}
 }
@@ -488,13 +519,15 @@ func FromReplicationTask(t *types.ReplicationTask) *replicator.ReplicationTask {
 		return nil
 	}
 	return &replicator.ReplicationTask{
-		TaskType:                      FromReplicationTaskType(t.TaskType),
-		SourceTaskId:                  t.SourceTaskID,
-		DomainTaskAttributes:          FromDomainTaskAttributes(t.DomainTaskAttributes),
-		SyncShardStatusTaskAttributes: FromSyncShardStatusTaskAttributes(t.SyncShardStatusTaskAttributes),
-		SyncActivityTaskAttributes:    FromSyncActivityTaskAttributes(t.SyncActivityTaskAttributes),
-		HistoryTaskV2Attributes:       FromHistoryTaskV2Attributes(t.HistoryTaskV2Attributes),
-		FailoverMarkerAttributes:      FromFailoverMarkerAttributes(t.FailoverMarkerAttributes),
+		TaskType:                        FromReplicationTaskType(t.TaskType),
+		SourceTaskId:                    &t.SourceTaskID,
+		DomainTaskAttributes:            FromDomainTaskAttributes(t.DomainTaskAttributes),
+		SyncShardStatusTaskAttributes:   FromSyncShardStatusTaskAttributes(t.SyncShardStatusTaskAttributes),
+		SyncActivityTaskAttributes:      FromSyncActivityTaskAttributes(t.SyncActivityTaskAttributes),
+		HistoryTaskV2Attributes:         FromHistoryTaskV2Attributes(t.HistoryTaskV2Attributes),
+		FailoverMarkerAttributes:        FromFailoverMarkerAttributes(t.FailoverMarkerAttributes),
+		CreationTime:                    t.CreationTime,
+		SemaphoreMetadataTaskAttributes: FromSemaphoreMetadataTaskAttributes(t.SemaphoreMetadataTaskAttributes),
 	}
 }
 
@@ -504,13 +537,15 @@ func ToReplicationTask(t *replicator.ReplicationTask) *types.ReplicationTask {
 		return nil
 	}
 	return &types.ReplicationTask{
-		TaskType:                      ToReplicationTaskType(t.TaskType),
-		SourceTaskID:                  t.SourceTaskId,
-		DomainTaskAttributes:          ToDomainTaskAttributes(t.DomainTaskAttributes),
-		SyncShardStatusTaskAttributes: ToSyncShardStatusTaskAttributes(t.SyncShardStatusTaskAttributes),
-		SyncActivityTaskAttributes:    ToSyncActivityTaskAttributes(t.SyncActivityTaskAttributes),
-		HistoryTaskV2Attributes:       ToHistoryTaskV2Attributes(t.HistoryTaskV2Attributes),
-		FailoverMarkerAttributes:      ToFailoverMarkerAttributes(t.FailoverMarkerAttributes),
+		TaskType:                        ToReplicationTaskType(t.TaskType),
+		SourceTaskID:                    t.GetSourceTaskId(),
+		DomainTaskAttributes:            ToDomainTaskAttributes(t.DomainTaskAttributes),
+		SyncShardStatusTaskAttributes:   ToSyncShardStatusTaskAttributes(t.SyncShardStatusTaskAttributes),
+		SyncActivityTaskAttributes:      ToSyncActivityTaskAttributes(t.SyncActivityTaskAttributes),
+		HistoryTaskV2Attributes:         ToHistoryTaskV2Attributes(t.HistoryTaskV2Attributes),
+		FailoverMarkerAttributes:        ToFailoverMarkerAttributes(t.FailoverMarkerAttributes),
+		CreationTime:                    t.CreationTime,
+		SemaphoreMetadataTaskAttributes: ToSemaphoreMetadataTaskAttributes(t.SemaphoreMetadataTaskAttributes),
 	}
 }
 
@@ -520,15 +555,15 @@ func FromReplicationTaskInfo(t *types.ReplicationTaskInfo) *replicator.Replicati
 		return nil
 	}
 	return &replicator.ReplicationTaskInfo{
-		DomainID:     t.DomainID,
-		WorkflowID:   t.WorkflowID,
-		RunID:        t.RunID,
-		TaskType:     t.TaskType,
-		TaskID:       t.TaskID,
-		Version:      t.Version,
-		FirstEventID: t.FirstEventID,
-		NextEventID:  t.NextEventID,
-		ScheduledID:  t.ScheduledID,
+		DomainID:     &t.DomainID,
+		WorkflowID:   &t.WorkflowID,
+		RunID:        &t.RunID,
+		TaskType:     &t.TaskType,
+		TaskID:       &t.TaskID,
+		Version:      &t.Version,
+		FirstEventID: &t.FirstEventID,
+		NextEventID:  &t.NextEventID,
+		ScheduledID:  &t.ScheduledID,
 	}
 }
 
@@ -538,15 +573,15 @@ func ToReplicationTaskInfo(t *replicator.ReplicationTaskInfo) *types.Replication
 		return nil
 	}
 	return &types.ReplicationTaskInfo{
-		DomainID:     t.DomainID,
-		WorkflowID:   t.WorkflowID,
-		RunID:        t.RunID,
-		TaskType:     t.TaskType,
-		TaskID:       t.TaskID,
-		Version:      t.Version,
-		FirstEventID: t.FirstEventID,
-		NextEventID:  t.NextEventID,
-		ScheduledID:  t.ScheduledID,
+		DomainID:     t.GetDomainID(),
+		WorkflowID:   t.GetWorkflowID(),
+		RunID:        t.GetRunID(),
+		TaskType:     t.GetTaskType(),
+		TaskID:       t.GetTaskID(),
+		Version:      t.GetVersion(),
+		FirstEventID: t.GetFirstEventID(),
+		NextEventID:  t.GetNextEventID(),
+		ScheduledID:  t.GetScheduledID(),
 	}
 }
 
@@ -559,11 +594,14 @@ func FromReplicationTaskType(t *types.ReplicationTaskType) *replicator.Replicati
 	case types.ReplicationTaskTypeDomain:
 		v := replicator.ReplicationTaskTypeDomain
 		return &v
-	case types.ReplicationTaskTypeFailoverMarker:
-		v := replicator.ReplicationTaskTypeFailoverMarker
-		return &v
 	case types.ReplicationTaskTypeHistory:
 		v := replicator.ReplicationTaskTypeHistory
+		return &v
+	case types.ReplicationTaskTypeSyncShardStatus:
+		v := replicator.ReplicationTaskTypeSyncShardStatus
+		return &v
+	case types.ReplicationTaskTypeSyncActivity:
+		v := replicator.ReplicationTaskTypeSyncActivity
 		return &v
 	case types.ReplicationTaskTypeHistoryMetadata:
 		v := replicator.ReplicationTaskTypeHistoryMetadata
@@ -571,11 +609,11 @@ func FromReplicationTaskType(t *types.ReplicationTaskType) *replicator.Replicati
 	case types.ReplicationTaskTypeHistoryV2:
 		v := replicator.ReplicationTaskTypeHistoryV2
 		return &v
-	case types.ReplicationTaskTypeSyncActivity:
-		v := replicator.ReplicationTaskTypeSyncActivity
+	case types.ReplicationTaskTypeFailoverMarker:
+		v := replicator.ReplicationTaskTypeFailoverMarker
 		return &v
-	case types.ReplicationTaskTypeSyncShardStatus:
-		v := replicator.ReplicationTaskTypeSyncShardStatus
+	case types.ReplicationTaskTypeSemaphoreMetadata:
+		v := replicator.ReplicationTaskTypeSemaphoreMetadata
 		return &v
 	}
 	panic("unexpected enum value")
@@ -590,11 +628,14 @@ func ToReplicationTaskType(t *replicator.ReplicationTaskType) *types.Replication
 	case replicator.ReplicationTaskTypeDomain:
 		v := types.ReplicationTaskTypeDomain
 		return &v
-	case replicator.ReplicationTaskTypeFailoverMarker:
-		v := types.ReplicationTaskTypeFailoverMarker
-		return &v
 	case replicator.ReplicationTaskTypeHistory:
 		v := types.ReplicationTaskTypeHistory
+		return &v
+	case replicator.ReplicationTaskTypeSyncShardStatus:
+		v := types.ReplicationTaskTypeSyncShardStatus
+		return &v
+	case replicator.ReplicationTaskTypeSyncActivity:
+		v := types.ReplicationTaskTypeSyncActivity
 		return &v
 	case replicator.ReplicationTaskTypeHistoryMetadata:
 		v := types.ReplicationTaskTypeHistoryMetadata
@@ -602,11 +643,11 @@ func ToReplicationTaskType(t *replicator.ReplicationTaskType) *types.Replication
 	case replicator.ReplicationTaskTypeHistoryV2:
 		v := types.ReplicationTaskTypeHistoryV2
 		return &v
-	case replicator.ReplicationTaskTypeSyncActivity:
-		v := types.ReplicationTaskTypeSyncActivity
+	case replicator.ReplicationTaskTypeFailoverMarker:
+		v := types.ReplicationTaskTypeFailoverMarker
 		return &v
-	case replicator.ReplicationTaskTypeSyncShardStatus:
-		v := types.ReplicationTaskTypeSyncShardStatus
+	case replicator.ReplicationTaskTypeSemaphoreMetadata:
+		v := types.ReplicationTaskTypeSemaphoreMetadata
 		return &v
 	}
 	panic("unexpected enum value")
@@ -618,9 +659,9 @@ func FromReplicationToken(t *types.ReplicationToken) *replicator.ReplicationToke
 		return nil
 	}
 	return &replicator.ReplicationToken{
-		ShardID:                t.ShardID,
-		LastRetrievedMessageId: t.LastRetrievedMessageID,
-		LastProcessedMessageId: t.LastProcessedMessageID,
+		ShardID:                &t.ShardID,
+		LastRetrievedMessageId: &t.LastRetrievedMessageID,
+		LastProcessedMessageId: &t.LastProcessedMessageID,
 	}
 }
 
@@ -630,9 +671,9 @@ func ToReplicationToken(t *replicator.ReplicationToken) *types.ReplicationToken 
 		return nil
 	}
 	return &types.ReplicationToken{
-		ShardID:                t.ShardID,
-		LastRetrievedMessageID: t.LastRetrievedMessageId,
-		LastProcessedMessageID: t.LastProcessedMessageId,
+		ShardID:                t.GetShardID(),
+		LastRetrievedMessageID: t.GetLastRetrievedMessageId(),
+		LastProcessedMessageID: t.GetLastProcessedMessageId(),
 	}
 }
 
@@ -642,20 +683,21 @@ func FromSyncActivityTaskAttributes(t *types.SyncActivityTaskAttributes) *replic
 		return nil
 	}
 	return &replicator.SyncActivityTaskAttributes{
-		DomainId:           t.DomainID,
-		WorkflowId:         t.WorkflowID,
-		RunId:              t.RunID,
-		Version:            t.Version,
-		ScheduledId:        t.ScheduledID,
+		DomainId:           &t.DomainID,
+		WorkflowId:         &t.WorkflowID,
+		RunId:              &t.RunID,
+		Version:            &t.Version,
+		ScheduledId:        &t.ScheduledID,
 		ScheduledTime:      t.ScheduledTime,
-		StartedId:          t.StartedID,
+		StartedId:          &t.StartedID,
 		StartedTime:        t.StartedTime,
 		LastHeartbeatTime:  t.LastHeartbeatTime,
 		Details:            t.Details,
-		Attempt:            t.Attempt,
+		Attempt:            &t.Attempt,
 		LastFailureReason:  t.LastFailureReason,
-		LastWorkerIdentity: t.LastWorkerIdentity,
+		LastWorkerIdentity: &t.LastWorkerIdentity,
 		LastFailureDetails: t.LastFailureDetails,
+		LastFailureOptions: FromFailureOptions(t.LastFailureOptions),
 		VersionHistory:     FromVersionHistory(t.VersionHistory),
 	}
 }
@@ -666,20 +708,21 @@ func ToSyncActivityTaskAttributes(t *replicator.SyncActivityTaskAttributes) *typ
 		return nil
 	}
 	return &types.SyncActivityTaskAttributes{
-		DomainID:           t.DomainId,
-		WorkflowID:         t.WorkflowId,
-		RunID:              t.RunId,
-		Version:            t.Version,
-		ScheduledID:        t.ScheduledId,
+		DomainID:           t.GetDomainId(),
+		WorkflowID:         t.GetWorkflowId(),
+		RunID:              t.GetRunId(),
+		Version:            t.GetVersion(),
+		ScheduledID:        t.GetScheduledId(),
 		ScheduledTime:      t.ScheduledTime,
-		StartedID:          t.StartedId,
+		StartedID:          t.GetStartedId(),
 		StartedTime:        t.StartedTime,
 		LastHeartbeatTime:  t.LastHeartbeatTime,
 		Details:            t.Details,
-		Attempt:            t.Attempt,
+		Attempt:            t.GetAttempt(),
 		LastFailureReason:  t.LastFailureReason,
-		LastWorkerIdentity: t.LastWorkerIdentity,
+		LastWorkerIdentity: t.GetLastWorkerIdentity(),
 		LastFailureDetails: t.LastFailureDetails,
+		LastFailureOptions: ToFailureOptions(t.LastFailureOptions),
 		VersionHistory:     ToVersionHistory(t.VersionHistory),
 	}
 }
@@ -710,8 +753,8 @@ func FromSyncShardStatusTaskAttributes(t *types.SyncShardStatusTaskAttributes) *
 		return nil
 	}
 	return &replicator.SyncShardStatusTaskAttributes{
-		SourceCluster: t.SourceCluster,
-		ShardId:       t.ShardID,
+		SourceCluster: &t.SourceCluster,
+		ShardId:       &t.ShardID,
 		Timestamp:     t.Timestamp,
 	}
 }
@@ -722,58 +765,10 @@ func ToSyncShardStatusTaskAttributes(t *replicator.SyncShardStatusTaskAttributes
 		return nil
 	}
 	return &types.SyncShardStatusTaskAttributes{
-		SourceCluster: t.SourceCluster,
-		ShardID:       t.ShardId,
+		SourceCluster: t.GetSourceCluster(),
+		ShardID:       t.GetShardId(),
 		Timestamp:     t.Timestamp,
 	}
-}
-
-// FromReplicationTaskArray converts internal ReplicationTask type array to thrift
-func FromReplicationTaskArray(t []*types.ReplicationTask) []*replicator.ReplicationTask {
-	if t == nil {
-		return nil
-	}
-	v := make([]*replicator.ReplicationTask, len(t))
-	for i := range t {
-		v[i] = FromReplicationTask(t[i])
-	}
-	return v
-}
-
-// ToReplicationTaskArray converts thrift ReplicationTask type array to internal
-func ToReplicationTaskArray(t []*replicator.ReplicationTask) []*types.ReplicationTask {
-	if t == nil {
-		return nil
-	}
-	v := make([]*types.ReplicationTask, len(t))
-	for i := range t {
-		v[i] = ToReplicationTask(t[i])
-	}
-	return v
-}
-
-// FromReplicationTokenArray converts internal ReplicationToken type array to thrift
-func FromReplicationTokenArray(t []*types.ReplicationToken) []*replicator.ReplicationToken {
-	if t == nil {
-		return nil
-	}
-	v := make([]*replicator.ReplicationToken, len(t))
-	for i := range t {
-		v[i] = FromReplicationToken(t[i])
-	}
-	return v
-}
-
-// ToReplicationTokenArray converts thrift ReplicationToken type array to internal
-func ToReplicationTokenArray(t []*replicator.ReplicationToken) []*types.ReplicationToken {
-	if t == nil {
-		return nil
-	}
-	v := make([]*types.ReplicationToken, len(t))
-	for i := range t {
-		v[i] = ToReplicationToken(t[i])
-	}
-	return v
 }
 
 // FromFailoverMarkerAttributesArray converts internal FailoverMarkerAttributes type array to thrift
@@ -820,6 +815,54 @@ func ToReplicationTaskInfoArray(t []*replicator.ReplicationTaskInfo) []*types.Re
 	v := make([]*types.ReplicationTaskInfo, len(t))
 	for i := range t {
 		v[i] = ToReplicationTaskInfo(t[i])
+	}
+	return v
+}
+
+// FromReplicationTaskArray converts internal ReplicationTask type array to thrift
+func FromReplicationTaskArray(t []*types.ReplicationTask) []*replicator.ReplicationTask {
+	if t == nil {
+		return nil
+	}
+	v := make([]*replicator.ReplicationTask, len(t))
+	for i := range t {
+		v[i] = FromReplicationTask(t[i])
+	}
+	return v
+}
+
+// ToReplicationTaskArray converts thrift ReplicationTask type array to internal
+func ToReplicationTaskArray(t []*replicator.ReplicationTask) []*types.ReplicationTask {
+	if t == nil {
+		return nil
+	}
+	v := make([]*types.ReplicationTask, len(t))
+	for i := range t {
+		v[i] = ToReplicationTask(t[i])
+	}
+	return v
+}
+
+// FromReplicationTokenArray converts internal ReplicationToken type array to thrift
+func FromReplicationTokenArray(t []*types.ReplicationToken) []*replicator.ReplicationToken {
+	if t == nil {
+		return nil
+	}
+	v := make([]*replicator.ReplicationToken, len(t))
+	for i := range t {
+		v[i] = FromReplicationToken(t[i])
+	}
+	return v
+}
+
+// ToReplicationTokenArray converts thrift ReplicationToken type array to internal
+func ToReplicationTokenArray(t []*replicator.ReplicationToken) []*types.ReplicationToken {
+	if t == nil {
+		return nil
+	}
+	v := make([]*types.ReplicationToken, len(t))
+	for i := range t {
+		v[i] = ToReplicationToken(t[i])
 	}
 	return v
 }

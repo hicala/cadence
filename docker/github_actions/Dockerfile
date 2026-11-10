@@ -1,0 +1,42 @@
+FROM golang:1.26.10-alpine3.24
+
+# build-base provides gcc/musl-dev/make, needed for cgo (go test -race).
+# bash and the GNU userland are installed because the Makefile and scripts assume them.
+# gcompat/libstdc++/libgcc let glibc-linked prebuilt tools the Makefile downloads (e.g. protoc) run on musl.
+RUN apk add --no-cache \
+      bash \
+      build-base \
+      ca-certificates \
+      coreutils \
+      curl \
+      findutils \
+      gcompat \
+      gettext \
+      git \
+      grep \
+      libgcc \
+      libstdc++ \
+      sed \
+      time \
+      unzip \
+      yaml-dev
+
+# verbose test output from `make`, can be disabled with V=0
+ENV V=0
+
+# allow git-status and similar to work
+RUN git config --global --add safe.directory /cadence
+
+# https://github.com/docker-library/golang/blob/c1baf037d71331eb0b8d4c70cff4c29cf124c5e0/1.4/Dockerfile
+RUN mkdir -p /cadence
+WORKDIR /cadence
+
+# Copy go mod dependencies and try to share the module download cache
+COPY go.* /cadence
+COPY internal/tools/go.* /cadence/internal/tools/
+COPY cmd/server/go.* /cadence/cmd/server/
+COPY common/archiver/gcloud/go.* /cadence/common/archiver/gcloud/
+COPY common/dynamicconfig/openfeatureprovider/unleash/go.* /cadence/common/dynamicconfig/openfeatureprovider/unleash/
+COPY common/persistence/sql/sqlplugin/cloudsql-mysql/go.* /cadence/common/persistence/sql/sqlplugin/cloudsql-mysql/
+# go.work means this downloads everything, not just the top module
+RUN go mod download

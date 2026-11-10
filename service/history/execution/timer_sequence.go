@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-//go:generate mockgen -copyright_file ../../../LICENSE -package $GOPACKAGE -source $GOFILE -destination timer_sequence_mock.go -self_package github.com/uber/cadence/service/history/execution
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination timer_sequence_mock.go -self_package github.com/uber/cadence/service/history/execution
 
 package execution
 
@@ -27,10 +27,9 @@ import (
 	"sort"
 	"time"
 
-	"github.com/uber/cadence/.gen/go/shared"
-	"github.com/uber/cadence/common"
-	"github.com/uber/cadence/common/clock"
+	"github.com/uber/cadence/common/constants"
 	"github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/types"
 )
 
 type (
@@ -40,13 +39,13 @@ type (
 
 const (
 	// TimerTypeStartToClose is the timer type for activity startToClose timer
-	TimerTypeStartToClose = TimerType(shared.TimeoutTypeStartToClose)
+	TimerTypeStartToClose = TimerType(types.TimeoutTypeStartToClose)
 	// TimerTypeScheduleToStart is the timer type for activity scheduleToStart timer
-	TimerTypeScheduleToStart = TimerType(shared.TimeoutTypeScheduleToStart)
+	TimerTypeScheduleToStart = TimerType(types.TimeoutTypeScheduleToStart)
 	// TimerTypeScheduleToClose is the timer type for activity scheduleToClose timer
-	TimerTypeScheduleToClose = TimerType(shared.TimeoutTypeScheduleToClose)
+	TimerTypeScheduleToClose = TimerType(types.TimeoutTypeScheduleToClose)
 	// TimerTypeHeartbeat is the timer type for activity heartbeat timer
-	TimerTypeHeartbeat = TimerType(shared.TimeoutTypeHeartbeat)
+	TimerTypeHeartbeat = TimerType(types.TimeoutTypeHeartbeat)
 )
 
 const (
@@ -82,7 +81,7 @@ type (
 
 	// TimerSequence manages user / activity timer
 	TimerSequence interface {
-		IsExpired(referenceTime time.Time, TimerSequenceID TimerSequenceID) bool
+		IsExpired(referenceTime time.Time, TimerSequenceID TimerSequenceID) (time.Duration, bool)
 
 		CreateNextUserTimer() (bool, error)
 		CreateNextActivityTimer() (bool, error)
@@ -92,7 +91,6 @@ type (
 	}
 
 	timerSequenceImpl struct {
-		timeSource   clock.TimeSource
 		mutableState MutableState
 	}
 )
@@ -101,11 +99,9 @@ var _ TimerSequence = (*timerSequenceImpl)(nil)
 
 // NewTimerSequence creates a new timer sequence
 func NewTimerSequence(
-	timeSource clock.TimeSource,
 	mutableState MutableState,
 ) TimerSequence {
 	return &timerSequenceImpl{
-		timeSource:   timeSource,
 		mutableState: mutableState,
 	}
 }
@@ -113,11 +109,19 @@ func NewTimerSequence(
 func (t *timerSequenceImpl) IsExpired(
 	referenceTime time.Time,
 	TimerSequenceID TimerSequenceID,
-) bool {
+) (time.Duration, bool) {
 
 	// Cassandra timestamp resolution is in millisecond
 	// here we do the check in terms of second resolution.
-	return TimerSequenceID.Timestamp.Unix() <= referenceTime.Unix()
+
+	timerFireTimeInSecond := TimerSequenceID.Timestamp.Unix()
+	referenceTimeInSecond := referenceTime.Unix()
+
+	if timerFireTimeInSecond <= referenceTimeInSecond {
+		return time.Duration(referenceTimeInSecond-timerFireTimeInSecond) * time.Second, true
+	}
+
+	return 0, false
 }
 
 func (t *timerSequenceImpl) CreateNextUserTimer() (bool, error) {
@@ -136,7 +140,7 @@ func (t *timerSequenceImpl) CreateNextUserTimer() (bool, error) {
 
 	timerInfo, ok := t.mutableState.GetUserTimerInfoByEventID(firstTimerTask.EventID)
 	if !ok {
-		return false, &shared.InternalServiceError{
+		return false, &types.InternalServiceError{
 			Message: fmt.Sprintf("unable to load activity info %v", firstTimerTask.EventID),
 		}
 	}
@@ -146,11 +150,20 @@ func (t *timerSequenceImpl) CreateNextUserTimer() (bool, error) {
 	if err := t.mutableState.UpdateUserTimer(timerInfo); err != nil {
 		return false, err
 	}
+	executionInfo := t.mutableState.GetExecutionInfo()
 	t.mutableState.AddTimerTasks(&persistence.UserTimerTask{
-		// TaskID is set by shard
-		VisibilityTimestamp: firstTimerTask.Timestamp,
-		EventID:             firstTimerTask.EventID,
-		Version:             t.mutableState.GetCurrentVersion(),
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   executionInfo.DomainID,
+			WorkflowID: executionInfo.WorkflowID,
+			RunID:      executionInfo.RunID,
+		},
+		TaskData: persistence.TaskData{
+			// TaskID is set by shard
+			VisibilityTimestamp: firstTimerTask.Timestamp,
+			Version:             t.mutableState.GetCurrentVersion(),
+		},
+		EventID:  firstTimerTask.EventID,
+		TaskList: executionInfo.TaskList,
 	})
 	return true, nil
 }
@@ -171,7 +184,7 @@ func (t *timerSequenceImpl) CreateNextActivityTimer() (bool, error) {
 
 	activityInfo, ok := t.mutableState.GetActivityInfo(firstTimerTask.EventID)
 	if !ok {
-		return false, &shared.InternalServiceError{
+		return false, &types.InternalServiceError{
 			Message: fmt.Sprintf("unable to load activity info %v", firstTimerTask.EventID),
 		}
 	}
@@ -183,13 +196,22 @@ func (t *timerSequenceImpl) CreateNextActivityTimer() (bool, error) {
 	if err := t.mutableState.UpdateActivity(activityInfo); err != nil {
 		return false, err
 	}
+	executionInfo := t.mutableState.GetExecutionInfo()
 	t.mutableState.AddTimerTasks(&persistence.ActivityTimeoutTask{
-		// TaskID is set by shard
-		VisibilityTimestamp: firstTimerTask.Timestamp,
-		TimeoutType:         int(firstTimerTask.TimerType),
-		EventID:             firstTimerTask.EventID,
-		Attempt:             int64(firstTimerTask.Attempt),
-		Version:             t.mutableState.GetCurrentVersion(),
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   executionInfo.DomainID,
+			WorkflowID: executionInfo.WorkflowID,
+			RunID:      executionInfo.RunID,
+		},
+		TaskData: persistence.TaskData{
+			// TaskID is set by shard
+			VisibilityTimestamp: firstTimerTask.Timestamp,
+			Version:             t.mutableState.GetCurrentVersion(),
+		},
+		TimeoutType: int(firstTimerTask.TimerType),
+		EventID:     firstTimerTask.EventID,
+		Attempt:     int64(firstTimerTask.Attempt),
+		TaskList:    activityInfo.TaskList,
 	})
 	return true, nil
 }
@@ -267,12 +289,12 @@ func (t *timerSequenceImpl) getActivityScheduleToStartTimeout(
 ) *TimerSequenceID {
 
 	// activity is not scheduled yet, probably due to retry & backoff
-	if activityInfo.ScheduleID == common.EmptyEventID {
+	if activityInfo.ScheduleID == constants.EmptyEventID {
 		return nil
 	}
 
 	// activity is already started
-	if activityInfo.StartedID != common.EmptyEventID {
+	if activityInfo.StartedID != constants.EmptyEventID {
 		return nil
 	}
 
@@ -294,7 +316,7 @@ func (t *timerSequenceImpl) getActivityScheduleToCloseTimeout(
 ) *TimerSequenceID {
 
 	// activity is not scheduled yet, probably due to retry & backoff
-	if activityInfo.ScheduleID == common.EmptyEventID {
+	if activityInfo.ScheduleID == constants.EmptyEventID {
 		return nil
 	}
 
@@ -316,12 +338,12 @@ func (t *timerSequenceImpl) getActivityStartToCloseTimeout(
 ) *TimerSequenceID {
 
 	// activity is not scheduled yet, probably due to retry & backoff
-	if activityInfo.ScheduleID == common.EmptyEventID {
+	if activityInfo.ScheduleID == constants.EmptyEventID {
 		return nil
 	}
 
 	// activity is not started yet
-	if activityInfo.StartedID == common.EmptyEventID {
+	if activityInfo.StartedID == constants.EmptyEventID {
 		return nil
 	}
 
@@ -343,12 +365,12 @@ func (t *timerSequenceImpl) getActivityHeartbeatTimeout(
 ) *TimerSequenceID {
 
 	// activity is not scheduled yet, probably due to retry & backoff
-	if activityInfo.ScheduleID == common.EmptyEventID {
+	if activityInfo.ScheduleID == constants.EmptyEventID {
 		return nil
 	}
 
 	// activity is not started yet
-	if activityInfo.StartedID == common.EmptyEventID {
+	if activityInfo.StartedID == constants.EmptyEventID {
 		return nil
 	}
 
@@ -395,38 +417,38 @@ func TimerTypeToTimerMask(
 	}
 }
 
-// TimerTypeToThrift converts TimeType to its thrift representation
-func TimerTypeToThrift(
+// TimerTypeToInternal converts TimeType to its internal representation
+func TimerTypeToInternal(
 	TimerType TimerType,
-) shared.TimeoutType {
+) types.TimeoutType {
 
 	switch TimerType {
 	case TimerTypeStartToClose:
-		return shared.TimeoutTypeStartToClose
+		return types.TimeoutTypeStartToClose
 	case TimerTypeScheduleToStart:
-		return shared.TimeoutTypeScheduleToStart
+		return types.TimeoutTypeScheduleToStart
 	case TimerTypeScheduleToClose:
-		return shared.TimeoutTypeScheduleToClose
+		return types.TimeoutTypeScheduleToClose
 	case TimerTypeHeartbeat:
-		return shared.TimeoutTypeHeartbeat
+		return types.TimeoutTypeHeartbeat
 	default:
 		panic(fmt.Sprintf("invalid timer type: %v", TimerType))
 	}
 }
 
-// TimerTypeFromThrift gets TimerType from its thrift representation
-func TimerTypeFromThrift(
-	TimerType shared.TimeoutType,
+// TimerTypeFromInternal gets TimerType from internal type
+func TimerTypeFromInternal(
+	TimerType types.TimeoutType,
 ) TimerType {
 
 	switch TimerType {
-	case shared.TimeoutTypeStartToClose:
+	case types.TimeoutTypeStartToClose:
 		return TimerTypeStartToClose
-	case shared.TimeoutTypeScheduleToStart:
+	case types.TimeoutTypeScheduleToStart:
 		return TimerTypeScheduleToStart
-	case shared.TimeoutTypeScheduleToClose:
+	case types.TimeoutTypeScheduleToClose:
 		return TimerTypeScheduleToClose
-	case shared.TimeoutTypeHeartbeat:
+	case types.TimeoutTypeHeartbeat:
 		return TimerTypeHeartbeat
 	default:
 		panic(fmt.Sprintf("invalid timeout type: %v", TimerType))
@@ -437,7 +459,7 @@ func TimerTypeFromThrift(
 func TimerTypeToReason(
 	timerType TimerType,
 ) string {
-	return fmt.Sprintf("cadenceInternal:Timeout %v", TimerTypeToThrift(timerType))
+	return fmt.Sprintf("cadenceInternal:Timeout %v", TimerTypeToInternal(timerType))
 }
 
 // Len implements sort.Interface

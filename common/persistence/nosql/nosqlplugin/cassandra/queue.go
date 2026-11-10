@@ -28,23 +28,14 @@ import (
 	"github.com/uber/cadence/common/persistence/nosql/nosqlplugin"
 )
 
-const (
-	templateEnqueueMessageQuery             = `INSERT INTO queue (queue_type, message_id, message_payload) VALUES(?, ?, ?) IF NOT EXISTS`
-	templateGetLastMessageIDQuery           = `SELECT message_id FROM queue WHERE queue_type=? ORDER BY message_id DESC LIMIT 1`
-	templateGetMessagesQuery                = `SELECT message_id, message_payload FROM queue WHERE queue_type = ? and message_id > ? LIMIT ?`
-	templateGetMessagesFromDLQQuery         = `SELECT message_id, message_payload FROM queue WHERE queue_type = ? and message_id > ? and message_id <= ?`
-	templateRangeDeleteMessagesBeforeQuery  = `DELETE FROM queue WHERE queue_type = ? and message_id < ?`
-	templateRangeDeleteMessagesBetweenQuery = `DELETE FROM queue WHERE queue_type = ? and message_id > ? and message_id <= ?`
-	templateDeleteMessageQuery              = `DELETE FROM queue WHERE queue_type = ? and message_id = ?`
-	templateGetQueueMetadataQuery           = `SELECT cluster_ack_level, version FROM queue_metadata WHERE queue_type = ?`
-	templateInsertQueueMetadataQuery        = `INSERT INTO queue_metadata (queue_type, cluster_ack_level, version) VALUES(?, ?, ?) IF NOT EXISTS`
-	templateUpdateQueueMetadataQuery        = `UPDATE queue_metadata SET cluster_ack_level = ?, version = ? WHERE queue_type = ? IF version = ?`
-)
-
-//Insert message into queue, return error if failed or already exists
-// Must return conditionFailed error if row already exists
-func (db *cdb) InsertIntoQueue(ctx context.Context, row *nosqlplugin.QueueMessageRow) error {
-	query := db.session.Query(templateEnqueueMessageQuery, row.QueueType, row.ID, row.Payload).WithContext(ctx)
+// Insert message into queue, return error if failed or already exists
+// Must return ConditionFailure error if row already exists
+func (db *CDB) InsertIntoQueue(
+	ctx context.Context,
+	row *nosqlplugin.QueueMessageRow,
+) error {
+	timeStamp := row.CurrentTimeStamp
+	query := db.session.Query(templateEnqueueMessageQuery, row.QueueType, row.ID, row.Payload, timeStamp).WithContext(ctx)
 	previous := make(map[string]interface{})
 	applied, err := query.MapScanCAS(previous)
 	if err != nil {
@@ -52,13 +43,16 @@ func (db *cdb) InsertIntoQueue(ctx context.Context, row *nosqlplugin.QueueMessag
 	}
 
 	if !applied {
-		return errConditionFailed
+		return nosqlplugin.NewConditionFailure("queue")
 	}
 	return nil
 }
 
 // Get the ID of last message inserted into the queue
-func (db *cdb) SelectLastEnqueuedMessageID(ctx context.Context, queueType persistence.QueueType) (int64, error) {
+func (db *CDB) SelectLastEnqueuedMessageID(
+	ctx context.Context,
+	queueType persistence.QueueType,
+) (int64, error) {
 	query := db.session.Query(templateGetLastMessageIDQuery, queueType).WithContext(ctx)
 	result := make(map[string]interface{})
 	err := query.MapScan(result)
@@ -70,7 +64,7 @@ func (db *cdb) SelectLastEnqueuedMessageID(ctx context.Context, queueType persis
 }
 
 // Read queue messages starting from the exclusiveBeginMessageID
-func (db *cdb) SelectMessagesFrom(
+func (db *CDB) SelectMessagesFrom(
 	ctx context.Context,
 	queueType persistence.QueueType,
 	exclusiveBeginMessageID int64,
@@ -105,7 +99,7 @@ func (db *cdb) SelectMessagesFrom(
 }
 
 // Read queue message starting from exclusiveBeginMessageID int64, inclusiveEndMessageID int64
-func (db *cdb) SelectMessagesBetween(
+func (db *CDB) SelectMessagesBetween(
 	ctx context.Context,
 	request nosqlplugin.SelectMessagesBetweenRequest,
 ) (*nosqlplugin.SelectMessagesBetweenResponse, error) {
@@ -143,47 +137,48 @@ func (db *cdb) SelectMessagesBetween(
 }
 
 // Delete all messages before exclusiveBeginMessageID
-func (db *cdb) DeleteMessagesBefore(
+func (db *CDB) DeleteMessagesBefore(
 	ctx context.Context,
 	queueType persistence.QueueType,
 	exclusiveBeginMessageID int64,
 ) error {
 	query := db.session.Query(templateRangeDeleteMessagesBeforeQuery, queueType, exclusiveBeginMessageID).WithContext(ctx)
-	return query.Exec()
+	return db.executeWithConsistencyAll(query)
 }
 
 // Delete all messages in a range between exclusiveBeginMessageID and inclusiveEndMessageID
-func (db *cdb) DeleteMessagesInRange(
+func (db *CDB) DeleteMessagesInRange(
 	ctx context.Context,
 	queueType persistence.QueueType,
 	exclusiveBeginMessageID int64,
 	inclusiveEndMessageID int64,
 ) error {
 	query := db.session.Query(templateRangeDeleteMessagesBetweenQuery, queueType, exclusiveBeginMessageID, inclusiveEndMessageID).WithContext(ctx)
-	return query.Exec()
+	return db.executeWithConsistencyAll(query)
 }
 
 // Delete one message
-func (db *cdb) DeleteMessage(
+func (db *CDB) DeleteMessage(
 	ctx context.Context,
 	queueType persistence.QueueType,
 	messageID int64,
 ) error {
 	query := db.session.Query(templateDeleteMessageQuery, queueType, messageID).WithContext(ctx)
-	return query.Exec()
+	return db.executeWithConsistencyAll(query)
 }
 
 // Insert an empty metadata row, starting from a version
-func (db *cdb) InsertQueueMetadata(
-	ctx context.Context,
-	queueType persistence.QueueType,
-	version int64,
-) error {
+func (db *CDB) InsertQueueMetadata(ctx context.Context, row nosqlplugin.QueueMetadataRow) error {
+	timeStamp := row.CurrentTimeStamp
 	clusterAckLevels := map[string]int64{}
-	query := db.session.Query(templateInsertQueueMetadataQuery, queueType, clusterAckLevels, version).WithContext(ctx)
-	_, err := query.ScanCAS()
+	query := db.session.Query(templateInsertQueueMetadataQuery, row.QueueType, clusterAckLevels, row.Version, timeStamp).WithContext(ctx)
+
+	// NOTE: Must pass nils to be compatible with ScyllaDB's LWT behavior
+	// "Scylla always returns the old version of the row, regardless of whether the condition is true or not."
+	// See also https://docs.scylladb.com/kb/lwt-differences/
+	_, err := query.ScanCAS(nil, nil, nil, nil, nil)
 	if err != nil {
-		return fmt.Errorf("failed to insert initial queue metadata record: %v, Type: %v", err, queueType)
+		return err
 	}
 	// it's ok if the query is not applied, which means that the record exists already.
 	return nil
@@ -191,30 +186,36 @@ func (db *cdb) InsertQueueMetadata(
 
 // **Conditionally** update a queue metadata row, if current version is matched(meaning current == row.Version - 1),
 // then the current version will increase by one when updating the metadata row
-// it should return error if the condition is not met
-func (db *cdb) UpdateQueueMetadataCas(
+// it should return ConditionFailure if the condition is not met
+func (db *CDB) UpdateQueueMetadataCas(
 	ctx context.Context,
 	row nosqlplugin.QueueMetadataRow,
 ) error {
+	timeStamp := row.CurrentTimeStamp
 	query := db.session.Query(templateUpdateQueueMetadataQuery,
 		row.ClusterAckLevels,
 		row.Version,
+		timeStamp,
 		row.QueueType,
 		row.Version-1,
 	).WithContext(ctx)
-	applied, err := query.ScanCAS()
+
+	// NOTE: Must pass nils to be compatible with ScyllaDB's LWT behavior
+	// "Scylla always returns the old version of the row, regardless of whether the condition is true or not."
+	// See also https://docs.scylladb.com/kb/lwt-differences/
+	applied, err := query.ScanCAS(nil, nil, nil, nil, nil)
 	if err != nil {
 		return err
 	}
 	if !applied {
-		return errConditionFailed
+		return nosqlplugin.NewConditionFailure("queue")
 	}
 
 	return nil
 }
 
 // Read a QueueMetadata
-func (db *cdb) SelectQueueMetadata(
+func (db *CDB) SelectQueueMetadata(
 	ctx context.Context,
 	queueType persistence.QueueType,
 ) (*nosqlplugin.QueueMetadataRow, error) {
@@ -237,16 +238,24 @@ func (db *cdb) SelectQueueMetadata(
 	}, nil
 }
 
-func getMessagePayload(
-	message map[string]interface{},
-) []byte {
+func (db *CDB) GetQueueSize(
+	ctx context.Context,
+	queueType persistence.QueueType,
+) (int64, error) {
 
+	query := db.session.Query(templateGetQueueSizeQuery, queueType).WithContext(ctx)
+	result := make(map[string]interface{})
+
+	if err := query.MapScan(result); err != nil {
+		return 0, err
+	}
+	return result["count"].(int64), nil
+}
+
+func getMessagePayload(message map[string]interface{}) []byte {
 	return message["message_payload"].([]byte)
 }
 
-func getMessageID(
-	message map[string]interface{},
-) int64 {
-
+func getMessageID(message map[string]interface{}) int64 {
 	return message["message_id"].(int64)
 }

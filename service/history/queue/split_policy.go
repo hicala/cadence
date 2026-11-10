@@ -24,10 +24,10 @@ import (
 	"fmt"
 	"math/rand"
 
+	"github.com/uber/cadence/common/dynamicconfig/dynamicproperties"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/metrics"
-	"github.com/uber/cadence/common/service/dynamicconfig"
 	t "github.com/uber/cadence/common/task"
 	"github.com/uber/cadence/service/history/task"
 )
@@ -44,7 +44,7 @@ type (
 
 	pendingTaskSplitPolicy struct {
 		pendingTaskThreshold map[int]int // queue level -> threshold
-		enabledByDomainID    dynamicconfig.BoolPropertyFnWithDomainIDFilter
+		enabledByDomainID    dynamicproperties.BoolPropertyFnWithDomainIDFilter
 		maxNewQueueLevel     int
 		lookAheadFunc        lookAheadFunc
 
@@ -54,7 +54,7 @@ type (
 
 	stuckTaskSplitPolicy struct {
 		attemptThreshold  map[int]int // queue level -> threshold
-		enabledByDomainID dynamicconfig.BoolPropertyFnWithDomainIDFilter
+		enabledByDomainID dynamicproperties.BoolPropertyFnWithDomainIDFilter
 		maxNewQueueLevel  int
 
 		logger       log.Logger
@@ -71,7 +71,7 @@ type (
 
 	randomSplitPolicy struct {
 		splitProbability  float64
-		enabledByDomainID dynamicconfig.BoolPropertyFnWithDomainIDFilter
+		enabledByDomainID dynamicproperties.BoolPropertyFnWithDomainIDFilter
 		maxNewQueueLevel  int
 		lookAheadFunc     lookAheadFunc
 
@@ -88,7 +88,7 @@ type (
 // based on the number of pending tasks
 func NewPendingTaskSplitPolicy(
 	pendingTaskThreshold map[int]int,
-	enabledByDomainID dynamicconfig.BoolPropertyFnWithDomainIDFilter,
+	enabledByDomainID dynamicproperties.BoolPropertyFnWithDomainIDFilter,
 	lookAheadFunc lookAheadFunc,
 	maxNewQueueLevel int,
 	logger log.Logger,
@@ -108,7 +108,7 @@ func NewPendingTaskSplitPolicy(
 // based on the number of task attempts tasks
 func NewStuckTaskSplitPolicy(
 	attemptThreshold map[int]int,
-	enabledByDomainID dynamicconfig.BoolPropertyFnWithDomainIDFilter,
+	enabledByDomainID dynamicproperties.BoolPropertyFnWithDomainIDFilter,
 	maxNewQueueLevel int,
 	logger log.Logger,
 	metricsScope metrics.Scope,
@@ -142,7 +142,7 @@ func NewSelectedDomainSplitPolicy(
 // or more domains into a new processing queue
 func NewRandomSplitPolicy(
 	splitProbability float64,
-	enabledByDomainID dynamicconfig.BoolPropertyFnWithDomainIDFilter,
+	enabledByDomainID dynamicproperties.BoolPropertyFnWithDomainIDFilter,
 	maxNewQueueLevel int,
 	lookAheadFunc lookAheadFunc,
 	logger log.Logger,
@@ -162,17 +162,13 @@ func NewRandomSplitPolicy(
 // that which combines other policies. Policies are evaluated in the order
 // they passed in, and if one policy returns an non-empty result, that result
 // will be returned as is and policies after that one will not be evaluated
-func NewAggregatedSplitPolicy(
-	policies ...ProcessingQueueSplitPolicy,
-) ProcessingQueueSplitPolicy {
+func NewAggregatedSplitPolicy(policies ...ProcessingQueueSplitPolicy) ProcessingQueueSplitPolicy {
 	return &aggregatedSplitPolicy{
 		policies: policies,
 	}
 }
 
-func (p *pendingTaskSplitPolicy) Evaluate(
-	queue ProcessingQueue,
-) []ProcessingQueueState {
+func (p *pendingTaskSplitPolicy) Evaluate(queue ProcessingQueue) []ProcessingQueueState {
 	queueImpl := queue.(*processingQueueImpl)
 
 	if queueImpl.state.level == p.maxNewQueueLevel {
@@ -221,9 +217,7 @@ func (p *pendingTaskSplitPolicy) Evaluate(
 	)
 }
 
-func (p *stuckTaskSplitPolicy) Evaluate(
-	queue ProcessingQueue,
-) []ProcessingQueueState {
+func (p *stuckTaskSplitPolicy) Evaluate(queue ProcessingQueue) []ProcessingQueueState {
 	queueImpl := queue.(*processingQueueImpl)
 
 	if queueImpl.state.level == p.maxNewQueueLevel {
@@ -267,9 +261,7 @@ func (p *stuckTaskSplitPolicy) Evaluate(
 	)
 }
 
-func (p *selectedDomainSplitPolicy) Evaluate(
-	queue ProcessingQueue,
-) []ProcessingQueueState {
+func (p *selectedDomainSplitPolicy) Evaluate(queue ProcessingQueue) []ProcessingQueueState {
 	domainBelongsToQueue := false
 	currentQueueState := queue.State()
 	currentDomainFilter := currentQueueState.DomainFilter()
@@ -312,9 +304,7 @@ func (p *selectedDomainSplitPolicy) Evaluate(
 	}
 }
 
-func (p *randomSplitPolicy) Evaluate(
-	queue ProcessingQueue,
-) []ProcessingQueueState {
+func (p *randomSplitPolicy) Evaluate(queue ProcessingQueue) []ProcessingQueueState {
 	queueImpl := queue.(*processingQueueImpl)
 
 	if queueImpl.state.level == p.maxNewQueueLevel {
@@ -364,9 +354,7 @@ func (p *randomSplitPolicy) Evaluate(
 	)
 }
 
-func (p *aggregatedSplitPolicy) Evaluate(
-	queue ProcessingQueue,
-) []ProcessingQueueState {
+func (p *aggregatedSplitPolicy) Evaluate(queue ProcessingQueue) []ProcessingQueueState {
 	for _, policy := range p.policies {
 		newStates := policy.Evaluate(queue)
 		if len(newStates) != 0 {

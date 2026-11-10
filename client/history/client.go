@@ -22,71 +22,77 @@ package history
 
 import (
 	"context"
+	"fmt"
+	"slices"
 	"sync"
-	"time"
 
-	"go.uber.org/cadence/.gen/go/shared"
 	"go.uber.org/yarpc"
+	"golang.org/x/sync/errgroup"
 
-	h "github.com/uber/cadence/.gen/go/history"
-	"github.com/uber/cadence/.gen/go/history/historyserviceclient"
-	"github.com/uber/cadence/.gen/go/replicator"
-	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
+	"github.com/uber/cadence/common/future"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
+	"github.com/uber/cadence/common/rpc"
+	"github.com/uber/cadence/common/types"
 )
 
 var _ Client = (*clientImpl)(nil)
 
-const (
-	// DefaultTimeout is the default timeout used to make calls
-	DefaultTimeout = time.Second * 30
-)
+type (
+	clientImpl struct {
+		numberOfShards    int
+		rpcMaxSizeInBytes int // This value currently only used in GetReplicationMessage API
+		tokenSerializer   common.TaskTokenSerializer
+		client            Client
+		peerResolver      PeerResolver
+		logger            log.Logger
+	}
 
-type clientImpl struct {
-	numberOfShards  int
-	tokenSerializer common.TaskTokenSerializer
-	timeout         time.Duration
-	clients         common.ClientCache
-	logger          log.Logger
-}
+	getReplicationMessagesWithSize struct {
+		response *types.GetReplicationMessagesResponse
+		size     int
+		peer     string
+
+		// earliestCreationTime of replication tasks of response
+		earliestCreationTime *int64
+	}
+)
 
 // NewClient creates a new history service TChannel client
 func NewClient(
 	numberOfShards int,
-	timeout time.Duration,
-	clients common.ClientCache,
+	rpcMaxSizeInBytes int,
+	client Client,
+	peerResolver PeerResolver,
 	logger log.Logger,
 ) Client {
 	return &clientImpl{
-		numberOfShards:  numberOfShards,
-		tokenSerializer: common.NewJSONTaskTokenSerializer(),
-		timeout:         timeout,
-		clients:         clients,
-		logger:          logger,
+		numberOfShards:    numberOfShards,
+		rpcMaxSizeInBytes: rpcMaxSizeInBytes,
+		tokenSerializer:   common.NewJSONTaskTokenSerializer(),
+		client:            client,
+		peerResolver:      peerResolver,
+		logger:            logger,
 	}
 }
 
 func (c *clientImpl) StartWorkflowExecution(
 	ctx context.Context,
-	request *h.StartWorkflowExecutionRequest,
+	request *types.HistoryStartWorkflowExecutionRequest,
 	opts ...yarpc.CallOption,
-) (*workflow.StartWorkflowExecutionResponse, error) {
-	client, err := c.getClientForWorkflowID(*request.StartRequest.WorkflowId)
+) (*types.StartWorkflowExecutionResponse, error) {
+	peer, err := c.peerResolver.FromWorkflowID(request.StartRequest.WorkflowID)
 	if err != nil {
 		return nil, err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	var response *workflow.StartWorkflowExecutionResponse
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
+	var response *types.StartWorkflowExecutionResponse
+	op := func(ctx context.Context, peer string) error {
 		var err error
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		response, err = client.StartWorkflowExecution(ctx, request, opts...)
+		response, err = c.client.StartWorkflowExecution(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 		return err
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	if err != nil {
 		return nil, err
 	}
@@ -95,23 +101,20 @@ func (c *clientImpl) StartWorkflowExecution(
 
 func (c *clientImpl) GetMutableState(
 	ctx context.Context,
-	request *h.GetMutableStateRequest,
+	request *types.GetMutableStateRequest,
 	opts ...yarpc.CallOption,
-) (*h.GetMutableStateResponse, error) {
-	client, err := c.getClientForWorkflowID(*request.Execution.WorkflowId)
+) (*types.GetMutableStateResponse, error) {
+	peer, err := c.peerResolver.FromWorkflowID(request.Execution.WorkflowID)
 	if err != nil {
 		return nil, err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	var response *h.GetMutableStateResponse
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
+	var response *types.GetMutableStateResponse
+	op := func(ctx context.Context, peer string) error {
 		var err error
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		response, err = client.GetMutableState(ctx, request, opts...)
+		response, err = c.client.GetMutableState(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 		return err
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	if err != nil {
 		return nil, err
 	}
@@ -120,23 +123,20 @@ func (c *clientImpl) GetMutableState(
 
 func (c *clientImpl) PollMutableState(
 	ctx context.Context,
-	request *h.PollMutableStateRequest,
+	request *types.PollMutableStateRequest,
 	opts ...yarpc.CallOption,
-) (*h.PollMutableStateResponse, error) {
-	client, err := c.getClientForWorkflowID(*request.Execution.WorkflowId)
+) (*types.PollMutableStateResponse, error) {
+	peer, err := c.peerResolver.FromWorkflowID(request.Execution.WorkflowID)
 	if err != nil {
 		return nil, err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	var response *h.PollMutableStateResponse
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
+	var response *types.PollMutableStateResponse
+	op := func(ctx context.Context, peer string) error {
 		var err error
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		response, err = client.PollMutableState(ctx, request, opts...)
+		response, err = c.client.PollMutableState(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 		return err
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	if err != nil {
 		return nil, err
 	}
@@ -145,38 +145,42 @@ func (c *clientImpl) PollMutableState(
 
 func (c *clientImpl) DescribeHistoryHost(
 	ctx context.Context,
-	request *workflow.DescribeHistoryHostRequest,
+	request *types.DescribeHistoryHostRequest,
 	opts ...yarpc.CallOption,
-) (*workflow.DescribeHistoryHostResponse, error) {
+) (*types.DescribeHistoryHostResponse, error) {
 
 	var err error
-	var client historyserviceclient.Interface
+	var peer string
 
-	if request.ShardIdForHost != nil {
-		client, err = c.getClientForShardID(int(request.GetShardIdForHost()))
-	} else if request.ExecutionForHost != nil {
-		client, err = c.getClientForWorkflowID(request.ExecutionForHost.GetWorkflowId())
-	} else {
-		ret, err := c.clients.GetClientForClientKey(request.GetHostAddress())
+	if request.ShardIDForHost != nil {
+		peer, err = c.peerResolver.FromShardID(int(request.GetShardIDForHost()))
 		if err != nil {
+			c.logger.Error("peer could not be resolved for host.", tag.Error(err), tag.ShardID(int(request.GetShardIDForHost())))
 			return nil, err
 		}
-		client = ret.(historyserviceclient.Interface)
-	}
-	if err != nil {
-		return nil, err
-	}
 
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	var response *workflow.DescribeHistoryHostResponse
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
+	} else if request.ExecutionForHost != nil {
+		peer, err = c.peerResolver.FromWorkflowID(request.ExecutionForHost.GetWorkflowID())
+		if err != nil {
+			c.logger.Error("peer could not be resolved for workflow.", tag.Error(err), tag.WorkflowID(request.ExecutionForHost.GetWorkflowID()))
+			return nil, err
+		}
+
+	} else {
+		peer, err = c.peerResolver.FromHostAddress(request.GetHostAddress())
+		if err != nil {
+			c.logger.Error("peer could not be resolved for address.", tag.Error(err), tag.Address(request.GetHostAddress()))
+			return nil, err
+		}
+
+	}
+	var response *types.DescribeHistoryHostResponse
+	op := func(ctx context.Context, peer string) error {
 		var err error
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		response, err = client.DescribeHistoryHost(ctx, request, opts...)
+		response, err = c.client.DescribeHistoryHost(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 		return err
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	if err != nil {
 		return nil, err
 	}
@@ -185,54 +189,39 @@ func (c *clientImpl) DescribeHistoryHost(
 
 func (c *clientImpl) RemoveTask(
 	ctx context.Context,
-	request *workflow.RemoveTaskRequest,
+	request *types.RemoveTaskRequest,
 	opts ...yarpc.CallOption,
 ) error {
-	var err error
-	var client historyserviceclient.Interface
-	if request.ShardID != nil {
-		client, err = c.getClientForShardID(int(request.GetShardID()))
-		if err != nil {
-			return err
-		}
+	peer, err := c.peerResolver.FromShardID(int(request.GetShardID()))
+	if err != nil {
+		return err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
+	op := func(ctx context.Context, peer string) error {
 		var err error
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		err = client.RemoveTask(ctx, request, opts...)
+		err = c.client.RemoveTask(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 		return err
 	}
 
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	return err
 }
 
 func (c *clientImpl) CloseShard(
 	ctx context.Context,
-	request *workflow.CloseShardRequest,
+	request *types.CloseShardRequest,
 	opts ...yarpc.CallOption,
 ) error {
-
-	var err error
-	var client historyserviceclient.Interface
-	if request.ShardID != nil {
-		client, err = c.getClientForShardID(int(request.GetShardID()))
-		if err != nil {
-			return err
-		}
+	peer, err := c.peerResolver.FromShardID(int(request.GetShardID()))
+	if err != nil {
+		return err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
+	op := func(ctx context.Context, peer string) error {
 		var err error
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		err = client.CloseShard(ctx, request, opts...)
+		err = c.client.CloseShard(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 		return err
 	}
 
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	if err != nil {
 		return err
 	}
@@ -241,28 +230,20 @@ func (c *clientImpl) CloseShard(
 
 func (c *clientImpl) ResetQueue(
 	ctx context.Context,
-	request *workflow.ResetQueueRequest,
+	request *types.ResetQueueRequest,
 	opts ...yarpc.CallOption,
 ) error {
-
-	var err error
-	var client historyserviceclient.Interface
-	if request.ShardID != nil {
-		client, err = c.getClientForShardID(int(request.GetShardID()))
-		if err != nil {
-			return err
-		}
+	peer, err := c.peerResolver.FromShardID(int(request.GetShardID()))
+	if err != nil {
+		return err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
+	op := func(ctx context.Context, peer string) error {
 		var err error
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		err = client.ResetQueue(ctx, request, opts...)
+		err = c.client.ResetQueue(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 		return err
 	}
 
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	if err != nil {
 		return err
 	}
@@ -271,29 +252,21 @@ func (c *clientImpl) ResetQueue(
 
 func (c *clientImpl) DescribeQueue(
 	ctx context.Context,
-	request *workflow.DescribeQueueRequest,
+	request *types.DescribeQueueRequest,
 	opts ...yarpc.CallOption,
-) (*workflow.DescribeQueueResponse, error) {
-
-	var err error
-	var client historyserviceclient.Interface
-	if request.ShardID != nil {
-		client, err = c.getClientForShardID(int(request.GetShardID()))
-		if err != nil {
-			return nil, err
-		}
+) (*types.DescribeQueueResponse, error) {
+	peer, err := c.peerResolver.FromShardID(int(request.GetShardID()))
+	if err != nil {
+		return nil, err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	var response *workflow.DescribeQueueResponse
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
+	var response *types.DescribeQueueResponse
+	op := func(ctx context.Context, peer string) error {
 		var err error
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		response, err = client.DescribeQueue(ctx, request, opts...)
+		response, err = c.client.DescribeQueue(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 		return err
 	}
 
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	if err != nil {
 		return nil, err
 	}
@@ -302,23 +275,20 @@ func (c *clientImpl) DescribeQueue(
 
 func (c *clientImpl) DescribeMutableState(
 	ctx context.Context,
-	request *h.DescribeMutableStateRequest,
+	request *types.DescribeMutableStateRequest,
 	opts ...yarpc.CallOption,
-) (*h.DescribeMutableStateResponse, error) {
-	client, err := c.getClientForWorkflowID(*request.Execution.WorkflowId)
+) (*types.DescribeMutableStateResponse, error) {
+	peer, err := c.peerResolver.FromWorkflowID(request.Execution.WorkflowID)
 	if err != nil {
 		return nil, err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	var response *h.DescribeMutableStateResponse
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
+	var response *types.DescribeMutableStateResponse
+	op := func(ctx context.Context, peer string) error {
 		var err error
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		response, err = client.DescribeMutableState(ctx, request, opts...)
+		response, err = c.client.DescribeMutableState(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 		return err
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	if err != nil {
 		return nil, err
 	}
@@ -327,23 +297,20 @@ func (c *clientImpl) DescribeMutableState(
 
 func (c *clientImpl) ResetStickyTaskList(
 	ctx context.Context,
-	request *h.ResetStickyTaskListRequest,
+	request *types.HistoryResetStickyTaskListRequest,
 	opts ...yarpc.CallOption,
-) (*h.ResetStickyTaskListResponse, error) {
-	client, err := c.getClientForWorkflowID(*request.Execution.WorkflowId)
+) (*types.HistoryResetStickyTaskListResponse, error) {
+	peer, err := c.peerResolver.FromWorkflowID(request.Execution.WorkflowID)
 	if err != nil {
 		return nil, err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	var response *h.ResetStickyTaskListResponse
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
+	var response *types.HistoryResetStickyTaskListResponse
+	op := func(ctx context.Context, peer string) error {
 		var err error
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		response, err = client.ResetStickyTaskList(ctx, request, opts...)
+		response, err = c.client.ResetStickyTaskList(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 		return err
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	if err != nil {
 		return nil, err
 	}
@@ -352,23 +319,20 @@ func (c *clientImpl) ResetStickyTaskList(
 
 func (c *clientImpl) DescribeWorkflowExecution(
 	ctx context.Context,
-	request *h.DescribeWorkflowExecutionRequest,
+	request *types.HistoryDescribeWorkflowExecutionRequest,
 	opts ...yarpc.CallOption,
-) (*workflow.DescribeWorkflowExecutionResponse, error) {
-	client, err := c.getClientForWorkflowID(*request.Request.Execution.WorkflowId)
+) (*types.DescribeWorkflowExecutionResponse, error) {
+	peer, err := c.peerResolver.FromWorkflowID(request.Request.Execution.WorkflowID)
 	if err != nil {
 		return nil, err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	var response *workflow.DescribeWorkflowExecutionResponse
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
+	var response *types.DescribeWorkflowExecutionResponse
+	op := func(ctx context.Context, peer string) error {
 		var err error
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		response, err = client.DescribeWorkflowExecution(ctx, request, opts...)
+		response, err = c.client.DescribeWorkflowExecution(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 		return err
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	if err != nil {
 		return nil, err
 	}
@@ -377,23 +341,20 @@ func (c *clientImpl) DescribeWorkflowExecution(
 
 func (c *clientImpl) RecordDecisionTaskStarted(
 	ctx context.Context,
-	request *h.RecordDecisionTaskStartedRequest,
+	request *types.RecordDecisionTaskStartedRequest,
 	opts ...yarpc.CallOption,
-) (*h.RecordDecisionTaskStartedResponse, error) {
-	client, err := c.getClientForWorkflowID(*request.WorkflowExecution.WorkflowId)
+) (*types.RecordDecisionTaskStartedResponse, error) {
+	peer, err := c.peerResolver.FromWorkflowID(request.WorkflowExecution.WorkflowID)
 	if err != nil {
 		return nil, err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	var response *h.RecordDecisionTaskStartedResponse
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
+	var response *types.RecordDecisionTaskStartedResponse
+	op := func(ctx context.Context, peer string) error {
 		var err error
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		response, err = client.RecordDecisionTaskStarted(ctx, request, opts...)
+		response, err = c.client.RecordDecisionTaskStarted(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 		return err
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	if err != nil {
 		return nil, err
 	}
@@ -402,23 +363,20 @@ func (c *clientImpl) RecordDecisionTaskStarted(
 
 func (c *clientImpl) RecordActivityTaskStarted(
 	ctx context.Context,
-	request *h.RecordActivityTaskStartedRequest,
+	request *types.RecordActivityTaskStartedRequest,
 	opts ...yarpc.CallOption,
-) (*h.RecordActivityTaskStartedResponse, error) {
-	client, err := c.getClientForWorkflowID(*request.WorkflowExecution.WorkflowId)
+) (*types.RecordActivityTaskStartedResponse, error) {
+	peer, err := c.peerResolver.FromWorkflowID(request.WorkflowExecution.WorkflowID)
 	if err != nil {
 		return nil, err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	var response *h.RecordActivityTaskStartedResponse
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
+	var response *types.RecordActivityTaskStartedResponse
+	op := func(ctx context.Context, peer string) error {
 		var err error
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		response, err = client.RecordActivityTaskStarted(ctx, request, opts...)
+		response, err = c.client.RecordActivityTaskStarted(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 		return err
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	if err != nil {
 		return nil, err
 	}
@@ -427,144 +385,126 @@ func (c *clientImpl) RecordActivityTaskStarted(
 
 func (c *clientImpl) RespondDecisionTaskCompleted(
 	ctx context.Context,
-	request *h.RespondDecisionTaskCompletedRequest,
+	request *types.HistoryRespondDecisionTaskCompletedRequest,
 	opts ...yarpc.CallOption,
-) (*h.RespondDecisionTaskCompletedResponse, error) {
+) (*types.HistoryRespondDecisionTaskCompletedResponse, error) {
 	taskToken, err := c.tokenSerializer.Deserialize(request.CompleteRequest.TaskToken)
 	if err != nil {
 		return nil, err
 	}
-	client, err := c.getClientForWorkflowID(taskToken.WorkflowID)
+	peer, err := c.peerResolver.FromWorkflowID(taskToken.WorkflowID)
 	if err != nil {
 		return nil, err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	var response *h.RespondDecisionTaskCompletedResponse
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		response, err = client.RespondDecisionTaskCompleted(ctx, request, opts...)
+	var response *types.HistoryRespondDecisionTaskCompletedResponse
+	op := func(ctx context.Context, peer string) error {
+		response, err = c.client.RespondDecisionTaskCompleted(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 		return err
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	return response, err
 }
 
 func (c *clientImpl) RespondDecisionTaskFailed(
 	ctx context.Context,
-	request *h.RespondDecisionTaskFailedRequest,
+	request *types.HistoryRespondDecisionTaskFailedRequest,
 	opts ...yarpc.CallOption,
 ) error {
 	taskToken, err := c.tokenSerializer.Deserialize(request.FailedRequest.TaskToken)
 	if err != nil {
 		return err
 	}
-	client, err := c.getClientForWorkflowID(taskToken.WorkflowID)
+	peer, err := c.peerResolver.FromWorkflowID(taskToken.WorkflowID)
 	if err != nil {
 		return err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		return client.RespondDecisionTaskFailed(ctx, request, opts...)
+	op := func(ctx context.Context, peer string) error {
+		return c.client.RespondDecisionTaskFailed(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	return err
 }
 
 func (c *clientImpl) RespondActivityTaskCompleted(
 	ctx context.Context,
-	request *h.RespondActivityTaskCompletedRequest,
+	request *types.HistoryRespondActivityTaskCompletedRequest,
 	opts ...yarpc.CallOption,
 ) error {
 	taskToken, err := c.tokenSerializer.Deserialize(request.CompleteRequest.TaskToken)
 	if err != nil {
 		return err
 	}
-	client, err := c.getClientForWorkflowID(taskToken.WorkflowID)
+	peer, err := c.peerResolver.FromWorkflowID(taskToken.WorkflowID)
 	if err != nil {
 		return err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		return client.RespondActivityTaskCompleted(ctx, request, opts...)
+	op := func(ctx context.Context, peer string) error {
+		return c.client.RespondActivityTaskCompleted(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	return err
 }
 
 func (c *clientImpl) RespondActivityTaskFailed(
 	ctx context.Context,
-	request *h.RespondActivityTaskFailedRequest,
+	request *types.HistoryRespondActivityTaskFailedRequest,
 	opts ...yarpc.CallOption,
 ) error {
 	taskToken, err := c.tokenSerializer.Deserialize(request.FailedRequest.TaskToken)
 	if err != nil {
 		return err
 	}
-	client, err := c.getClientForWorkflowID(taskToken.WorkflowID)
+	peer, err := c.peerResolver.FromWorkflowID(taskToken.WorkflowID)
 	if err != nil {
 		return err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		return client.RespondActivityTaskFailed(ctx, request, opts...)
+	op := func(ctx context.Context, peer string) error {
+		return c.client.RespondActivityTaskFailed(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	return err
 }
 
 func (c *clientImpl) RespondActivityTaskCanceled(
 	ctx context.Context,
-	request *h.RespondActivityTaskCanceledRequest,
+	request *types.HistoryRespondActivityTaskCanceledRequest,
 	opts ...yarpc.CallOption,
 ) error {
 	taskToken, err := c.tokenSerializer.Deserialize(request.CancelRequest.TaskToken)
 	if err != nil {
 		return err
 	}
-	client, err := c.getClientForWorkflowID(taskToken.WorkflowID)
+	peer, err := c.peerResolver.FromWorkflowID(taskToken.WorkflowID)
 	if err != nil {
 		return err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		return client.RespondActivityTaskCanceled(ctx, request, opts...)
+	op := func(ctx context.Context, peer string) error {
+		return c.client.RespondActivityTaskCanceled(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	return err
 }
 
 func (c *clientImpl) RecordActivityTaskHeartbeat(
 	ctx context.Context,
-	request *h.RecordActivityTaskHeartbeatRequest,
+	request *types.HistoryRecordActivityTaskHeartbeatRequest,
 	opts ...yarpc.CallOption,
-) (*workflow.RecordActivityTaskHeartbeatResponse, error) {
+) (*types.RecordActivityTaskHeartbeatResponse, error) {
 	taskToken, err := c.tokenSerializer.Deserialize(request.HeartbeatRequest.TaskToken)
 	if err != nil {
 		return nil, err
 	}
-	client, err := c.getClientForWorkflowID(taskToken.WorkflowID)
+	peer, err := c.peerResolver.FromWorkflowID(taskToken.WorkflowID)
 	if err != nil {
 		return nil, err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	var response *workflow.RecordActivityTaskHeartbeatResponse
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
+	var response *types.RecordActivityTaskHeartbeatResponse
+	op := func(ctx context.Context, peer string) error {
 		var err error
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		response, err = client.RecordActivityTaskHeartbeat(ctx, request, opts...)
+		response, err = c.client.RecordActivityTaskHeartbeat(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 		return err
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	if err != nil {
 		return nil, err
 	}
@@ -573,61 +513,52 @@ func (c *clientImpl) RecordActivityTaskHeartbeat(
 
 func (c *clientImpl) RequestCancelWorkflowExecution(
 	ctx context.Context,
-	request *h.RequestCancelWorkflowExecutionRequest,
+	request *types.HistoryRequestCancelWorkflowExecutionRequest,
 	opts ...yarpc.CallOption,
 ) error {
-	client, err := c.getClientForWorkflowID(*request.CancelRequest.WorkflowExecution.WorkflowId)
+	peer, err := c.peerResolver.FromWorkflowID(request.CancelRequest.WorkflowExecution.WorkflowID)
 	if err != nil {
 		return err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		return client.RequestCancelWorkflowExecution(ctx, request, opts...)
+	op := func(ctx context.Context, peer string) error {
+		return c.client.RequestCancelWorkflowExecution(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 	}
-	return c.executeWithRedirect(ctx, client, op)
+	return c.executeWithRedirect(ctx, peer, op)
 }
 
 func (c *clientImpl) SignalWorkflowExecution(
 	ctx context.Context,
-	request *h.SignalWorkflowExecutionRequest,
+	request *types.HistorySignalWorkflowExecutionRequest,
 	opts ...yarpc.CallOption,
 ) error {
-	client, err := c.getClientForWorkflowID(*request.SignalRequest.WorkflowExecution.WorkflowId)
+	peer, err := c.peerResolver.FromWorkflowID(request.SignalRequest.WorkflowExecution.WorkflowID)
 	if err != nil {
 		return err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		return client.SignalWorkflowExecution(ctx, request, opts...)
+	op := func(ctx context.Context, peer string) error {
+		return c.client.SignalWorkflowExecution(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 
 	return err
 }
 
 func (c *clientImpl) SignalWithStartWorkflowExecution(
 	ctx context.Context,
-	request *h.SignalWithStartWorkflowExecutionRequest,
+	request *types.HistorySignalWithStartWorkflowExecutionRequest,
 	opts ...yarpc.CallOption,
-) (*workflow.StartWorkflowExecutionResponse, error) {
-	client, err := c.getClientForWorkflowID(*request.SignalWithStartRequest.WorkflowId)
+) (*types.StartWorkflowExecutionResponse, error) {
+	peer, err := c.peerResolver.FromWorkflowID(request.SignalWithStartRequest.WorkflowID)
 	if err != nil {
 		return nil, err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	var response *workflow.StartWorkflowExecutionResponse
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
+	var response *types.StartWorkflowExecutionResponse
+	op := func(ctx context.Context, peer string) error {
 		var err error
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		response, err = client.SignalWithStartWorkflowExecution(ctx, request, opts...)
+		response, err = c.client.SignalWithStartWorkflowExecution(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 		return err
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	if err != nil {
 		return nil, err
 	}
@@ -637,60 +568,52 @@ func (c *clientImpl) SignalWithStartWorkflowExecution(
 
 func (c *clientImpl) RemoveSignalMutableState(
 	ctx context.Context,
-	request *h.RemoveSignalMutableStateRequest,
+	request *types.RemoveSignalMutableStateRequest,
 	opts ...yarpc.CallOption,
 ) error {
-	client, err := c.getClientForWorkflowID(*request.WorkflowExecution.WorkflowId)
+	peer, err := c.peerResolver.FromWorkflowID(request.WorkflowExecution.WorkflowID)
 	if err != nil {
 		return err
 	}
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		return client.RemoveSignalMutableState(ctx, request)
+	op := func(ctx context.Context, peer string) error {
+		return c.client.RemoveSignalMutableState(ctx, request, yarpc.WithShardKey(peer))
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 
 	return err
 }
 
 func (c *clientImpl) TerminateWorkflowExecution(
 	ctx context.Context,
-	request *h.TerminateWorkflowExecutionRequest,
+	request *types.HistoryTerminateWorkflowExecutionRequest,
 	opts ...yarpc.CallOption,
 ) error {
-	client, err := c.getClientForWorkflowID(*request.TerminateRequest.WorkflowExecution.WorkflowId)
+	peer, err := c.peerResolver.FromWorkflowID(request.TerminateRequest.WorkflowExecution.WorkflowID)
 	if err != nil {
 		return err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		return client.TerminateWorkflowExecution(ctx, request, opts...)
+	op := func(ctx context.Context, peer string) error {
+		return c.client.TerminateWorkflowExecution(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	return err
 }
 
 func (c *clientImpl) ResetWorkflowExecution(
 	ctx context.Context,
-	request *h.ResetWorkflowExecutionRequest,
+	request *types.HistoryResetWorkflowExecutionRequest,
 	opts ...yarpc.CallOption,
-) (*workflow.ResetWorkflowExecutionResponse, error) {
-	client, err := c.getClientForWorkflowID(*request.ResetRequest.WorkflowExecution.WorkflowId)
+) (*types.ResetWorkflowExecutionResponse, error) {
+	peer, err := c.peerResolver.FromWorkflowID(request.ResetRequest.WorkflowExecution.WorkflowID)
 	if err != nil {
 		return nil, err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	var response *workflow.ResetWorkflowExecutionResponse
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		response, err = client.ResetWorkflowExecution(ctx, request, opts...)
+	var response *types.ResetWorkflowExecutionResponse
+	op := func(ctx context.Context, peer string) error {
+		response, err = c.client.ResetWorkflowExecution(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 		return err
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	if err != nil {
 		return nil, err
 	}
@@ -699,122 +622,104 @@ func (c *clientImpl) ResetWorkflowExecution(
 
 func (c *clientImpl) ScheduleDecisionTask(
 	ctx context.Context,
-	request *h.ScheduleDecisionTaskRequest,
+	request *types.ScheduleDecisionTaskRequest,
 	opts ...yarpc.CallOption,
 ) error {
-	client, err := c.getClientForWorkflowID(*request.WorkflowExecution.WorkflowId)
+	peer, err := c.peerResolver.FromWorkflowID(request.WorkflowExecution.WorkflowID)
 	if err != nil {
 		return err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		return client.ScheduleDecisionTask(ctx, request, opts...)
+	op := func(ctx context.Context, peer string) error {
+		return c.client.ScheduleDecisionTask(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	return err
 }
 
 func (c *clientImpl) RecordChildExecutionCompleted(
 	ctx context.Context,
-	request *h.RecordChildExecutionCompletedRequest,
+	request *types.RecordChildExecutionCompletedRequest,
 	opts ...yarpc.CallOption,
 ) error {
-	client, err := c.getClientForWorkflowID(*request.WorkflowExecution.WorkflowId)
+	peer, err := c.peerResolver.FromWorkflowID(request.WorkflowExecution.WorkflowID)
 	if err != nil {
 		return err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		return client.RecordChildExecutionCompleted(ctx, request, opts...)
+	op := func(ctx context.Context, peer string) error {
+		return c.client.RecordChildExecutionCompleted(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	return err
 }
 
 func (c *clientImpl) ReplicateEventsV2(
 	ctx context.Context,
-	request *h.ReplicateEventsV2Request,
+	request *types.ReplicateEventsV2Request,
 	opts ...yarpc.CallOption,
 ) error {
-	client, err := c.getClientForWorkflowID(request.WorkflowExecution.GetWorkflowId())
+	peer, err := c.peerResolver.FromWorkflowID(request.WorkflowExecution.GetWorkflowID())
 	if err != nil {
 		return err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		return client.ReplicateEventsV2(ctx, request, opts...)
+	op := func(ctx context.Context, peer string) error {
+		return c.client.ReplicateEventsV2(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	return err
 }
 
 func (c *clientImpl) SyncShardStatus(
 	ctx context.Context,
-	request *h.SyncShardStatusRequest,
+	request *types.SyncShardStatusRequest,
 	opts ...yarpc.CallOption,
 ) error {
 
 	// we do not have a workflow ID here, instead, we have something even better
-	client, err := c.getClientForShardID(int(request.GetShardId()))
+	peer, err := c.peerResolver.FromShardID(int(request.GetShardID()))
 	if err != nil {
 		return err
 	}
 
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		return client.SyncShardStatus(ctx, request, opts...)
+	op := func(ctx context.Context, peer string) error {
+		return c.client.SyncShardStatus(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	return err
 }
 
 func (c *clientImpl) SyncActivity(
 	ctx context.Context,
-	request *h.SyncActivityRequest,
+	request *types.SyncActivityRequest,
 	opts ...yarpc.CallOption,
 ) error {
 
-	client, err := c.getClientForWorkflowID(request.GetWorkflowId())
+	peer, err := c.peerResolver.FromWorkflowID(request.GetWorkflowID())
 	if err != nil {
 		return err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		return client.SyncActivity(ctx, request, opts...)
+	op := func(ctx context.Context, peer string) error {
+		return c.client.SyncActivity(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	return err
 }
 
 func (c *clientImpl) QueryWorkflow(
 	ctx context.Context,
-	request *h.QueryWorkflowRequest,
+	request *types.HistoryQueryWorkflowRequest,
 	opts ...yarpc.CallOption,
-) (*h.QueryWorkflowResponse, error) {
-	client, err := c.getClientForWorkflowID(request.GetRequest().GetExecution().GetWorkflowId())
+) (*types.HistoryQueryWorkflowResponse, error) {
+	peer, err := c.peerResolver.FromWorkflowID(request.GetRequest().GetExecution().GetWorkflowID())
 	if err != nil {
 		return nil, err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	var response *h.QueryWorkflowResponse
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
+	var response *types.HistoryQueryWorkflowResponse
+	op := func(ctx context.Context, peer string) error {
 		var err error
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		response, err = client.QueryWorkflow(ctx, request, opts...)
+		response, err = c.client.QueryWorkflow(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 		return err
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	if err != nil {
 		return nil, err
 	}
@@ -823,246 +728,439 @@ func (c *clientImpl) QueryWorkflow(
 
 func (c *clientImpl) GetReplicationMessages(
 	ctx context.Context,
-	request *replicator.GetReplicationMessagesRequest,
+	request *types.GetReplicationMessagesRequest,
 	opts ...yarpc.CallOption,
-) (*replicator.GetReplicationMessagesResponse, error) {
-	requestsByClient := make(map[historyserviceclient.Interface]*replicator.GetReplicationMessagesRequest)
+) (*types.GetReplicationMessagesResponse, error) {
+	requestsByPeer := make(map[string]*types.GetReplicationMessagesRequest)
 
 	for _, token := range request.Tokens {
-		client, err := c.getClientForShardID(int(token.GetShardID()))
+		peer, err := c.peerResolver.FromShardID(int(token.GetShardID()))
 		if err != nil {
 			return nil, err
 		}
 
-		if _, ok := requestsByClient[client]; !ok {
-			requestsByClient[client] = &replicator.GetReplicationMessagesRequest{
+		if _, ok := requestsByPeer[peer]; !ok {
+			requestsByPeer[peer] = &types.GetReplicationMessagesRequest{
 				ClusterName: request.ClusterName,
 			}
 		}
 
-		req := requestsByClient[client]
+		req := requestsByPeer[peer]
 		req.Tokens = append(req.Tokens, token)
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(len(requestsByClient))
-	respChan := make(chan *replicator.GetReplicationMessagesResponse, len(requestsByClient))
-	errChan := make(chan error, 1)
-	for client, req := range requestsByClient {
-		go func(client historyserviceclient.Interface, request *replicator.GetReplicationMessagesRequest) {
-			defer wg.Done()
+	g := &errgroup.Group{}
+	var responseMutex sync.Mutex
+	peerResponses := make([]*getReplicationMessagesWithSize, 0, len(requestsByPeer))
 
-			ctx, cancel := c.createContext(ctx)
+	for peer, req := range requestsByPeer {
+		peer, req := peer, req
+		g.Go(func() (e error) {
+			defer func() { log.CapturePanic(recover(), c.logger, &e) }()
+
+			requestContext, cancel := common.CreateChildContext(ctx, 0.05)
 			defer cancel()
-			resp, err := client.GetReplicationMessages(ctx, request, opts...)
+
+			requestContext, responseInfo := rpc.ContextWithResponseInfo(requestContext)
+			resp, err := c.client.GetReplicationMessages(requestContext, req, append(opts, yarpc.WithShardKey(peer))...)
 			if err != nil {
-				c.logger.Warn("Failed to get replication tasks from client", tag.Error(err))
+				c.logger.Warn("Failed to get replication tasks from client",
+					tag.Error(err),
+					tag.ShardReplicationToken(req),
+				)
 				// Returns service busy error to notify replication
-				if _, ok := err.(*shared.ServiceBusyError); ok {
-					select {
-					case errChan <- err:
-					default:
-					}
+				if _, ok := err.(*types.ServiceBusyError); ok {
+					return err
 				}
-				return
+				return nil
 			}
-			respChan <- resp
-		}(client, req)
+			responseMutex.Lock()
+			peerResponses = append(peerResponses, &getReplicationMessagesWithSize{
+				response:             resp,
+				size:                 responseInfo.Size,
+				peer:                 peer,
+				earliestCreationTime: resp.GetEarliestCreationTime(),
+			})
+			responseMutex.Unlock()
+			return nil
+		})
 	}
 
-	wg.Wait()
-	close(respChan)
-	close(errChan)
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
 
-	response := &replicator.GetReplicationMessagesResponse{MessagesByShard: make(map[int32]*replicator.ReplicationMessages)}
-	for resp := range respChan {
-		for shardID, tasks := range resp.MessagesByShard {
+	return c.buildGetReplicationMessagesResponse(peerResponses), nil
+}
+
+// buildGetReplicationMessagesResponse builds a new GetReplicationMessagesResponse from peer responses
+// The response can be partial if the total size of the response exceeds the max size.
+// In this case, responses with oldest replication tasks will be returned
+func (c *clientImpl) buildGetReplicationMessagesResponse(peerResponses []*getReplicationMessagesWithSize) *types.GetReplicationMessagesResponse {
+	// Peers with large response can cause the response to exceed the max size.
+	// In this case, we need to skip some peer responses to make sure the result response size is within the limit.
+	// To prevent a replication lag in the future, we should return the response with the oldest replication task.
+	// So we sort the peer responses by the earliest creation time of the replication task.
+	// If the earliest creation time is the same, we compare the size of the response.
+	// This will sure that shards with the oldest replication tasks will be processed first.
+	sortGetReplicationMessageWithSize(peerResponses)
+
+	response := &types.GetReplicationMessagesResponse{MessagesByShard: make(map[int32]*types.ReplicationMessages)}
+	responseTotalSize := 0
+	rpcMaxResponseSize := c.rpcMaxSizeInBytes
+	for _, resp := range peerResponses {
+		if (responseTotalSize + resp.size) >= rpcMaxResponseSize {
+			// Log shards that did not fit for debugging purposes
+			for shardID := range resp.response.GetMessagesByShard() {
+				c.logger.Warn("Replication messages did not fit in the response",
+					tag.ShardID(int(shardID)),
+					tag.Address(resp.peer),
+					tag.ResponseSize(resp.size),
+					tag.ResponseTotalSize(responseTotalSize),
+					tag.ResponseMaxSize(rpcMaxResponseSize),
+				)
+			}
+
+			// return partial response if the response size exceeded supported max size
+			// but continue with next peer response, as it may still fit
+			continue
+		}
+
+		responseTotalSize += resp.size
+
+		for shardID, tasks := range resp.response.GetMessagesByShard() {
 			response.MessagesByShard[shardID] = tasks
 		}
 	}
-	var err error
-	if len(errChan) > 0 {
-		err = <-errChan
+
+	return response
+}
+
+// sortGetReplicationMessageWithSize sorts the peer responses by the earliest creation time of the replication tasks
+func sortGetReplicationMessageWithSize(peerResponses []*getReplicationMessagesWithSize) {
+	slices.SortStableFunc(peerResponses, cmpGetReplicationMessagesWithSize)
+}
+
+// cmpGetReplicationMessagesWithSize compares
+// two getReplicationMessagesWithSize objects by earliest creation time
+// it can be used as a comparison func for slices.SortStableFunc
+// if a, b, or their earliestCreationTime is nil, slices.SortStableFunc will put them to the end of a slice
+// otherwise it will compare the earliestCreationTime of the replication tasks
+// if earliestCreationTime is equal, it will compare the size of the response
+func cmpGetReplicationMessagesWithSize(a, b *getReplicationMessagesWithSize) int {
+	// a > b
+	if a == nil || a.earliestCreationTime == nil {
+		return 1
 	}
-	return response, err
+	// a < b
+	if b == nil || b.earliestCreationTime == nil {
+		return -1
+	}
+
+	// if both are not nil, compare the creation time
+	if *a.earliestCreationTime < *b.earliestCreationTime {
+		return -1
+	}
+
+	if *a.earliestCreationTime > *b.earliestCreationTime {
+		return 1
+	}
+
+	// if both equal, compare the size
+	if a.size < b.size {
+		return -1
+	}
+
+	if a.size > b.size {
+		return 1
+	}
+
+	return 0
 }
 
 func (c *clientImpl) GetDLQReplicationMessages(
 	ctx context.Context,
-	request *replicator.GetDLQReplicationMessagesRequest,
+	request *types.GetDLQReplicationMessagesRequest,
 	opts ...yarpc.CallOption,
-) (*replicator.GetDLQReplicationMessagesResponse, error) {
+) (*types.GetDLQReplicationMessagesResponse, error) {
 	// All workflow IDs are in the same shard per request
 	workflowID := request.GetTaskInfos()[0].GetWorkflowID()
-	client, err := c.getClientForWorkflowID(workflowID)
+	peer, err := c.peerResolver.FromWorkflowID(workflowID)
 	if err != nil {
 		return nil, err
 	}
 
-	return client.GetDLQReplicationMessages(
+	return c.client.GetDLQReplicationMessages(
 		ctx,
 		request,
-		opts...,
+		append(opts, yarpc.WithShardKey(peer))...,
 	)
 }
 
 func (c *clientImpl) ReapplyEvents(
 	ctx context.Context,
-	request *h.ReapplyEventsRequest,
+	request *types.HistoryReapplyEventsRequest,
 	opts ...yarpc.CallOption,
 ) error {
-	client, err := c.getClientForWorkflowID(request.GetRequest().GetWorkflowExecution().GetWorkflowId())
+	peer, err := c.peerResolver.FromWorkflowID(request.GetRequest().GetWorkflowExecution().GetWorkflowID())
 	if err != nil {
 		return err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		return client.ReapplyEvents(ctx, request, opts...)
+	op := func(ctx context.Context, peer string) error {
+		return c.client.ReapplyEvents(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	err = c.executeWithRedirect(ctx, peer, op)
 	return err
+}
+
+func (c *clientImpl) CountDLQMessages(
+	ctx context.Context,
+	request *types.CountDLQMessagesRequest,
+	opts ...yarpc.CallOption,
+) (*types.HistoryCountDLQMessagesResponse, error) {
+
+	peers, err := c.peerResolver.GetAllPeers()
+	if err != nil {
+		return nil, err
+	}
+
+	var mu sync.Mutex
+	responses := make([]*types.HistoryCountDLQMessagesResponse, 0, len(peers))
+
+	g := &errgroup.Group{}
+	for _, peer := range peers {
+		peer := peer
+		g.Go(func() (e error) {
+			defer func() { log.CapturePanic(recover(), c.logger, &e) }()
+
+			response, err := c.client.CountDLQMessages(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
+			if err == nil {
+				mu.Lock()
+				responses = append(responses, response)
+				mu.Unlock()
+			}
+
+			return err
+		})
+	}
+
+	err = g.Wait()
+
+	entries := map[types.HistoryDLQCountKey]int64{}
+	for _, response := range responses {
+		for key, count := range response.Entries {
+			entries[key] = count
+		}
+	}
+	return &types.HistoryCountDLQMessagesResponse{Entries: entries}, err
 }
 
 func (c *clientImpl) ReadDLQMessages(
 	ctx context.Context,
-	request *replicator.ReadDLQMessagesRequest,
+	request *types.ReadDLQMessagesRequest,
 	opts ...yarpc.CallOption,
-) (*replicator.ReadDLQMessagesResponse, error) {
+) (*types.ReadDLQMessagesResponse, error) {
 
-	client, err := c.getClientForShardID(int(request.GetShardID()))
+	peer, err := c.peerResolver.FromShardID(int(request.GetShardID()))
 	if err != nil {
 		return nil, err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	return client.ReadDLQMessages(ctx, request, opts...)
+	return c.client.ReadDLQMessages(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 }
 
 func (c *clientImpl) PurgeDLQMessages(
 	ctx context.Context,
-	request *replicator.PurgeDLQMessagesRequest,
+	request *types.PurgeDLQMessagesRequest,
 	opts ...yarpc.CallOption,
 ) error {
 
-	client, err := c.getClientForShardID(int(request.GetShardID()))
+	peer, err := c.peerResolver.FromShardID(int(request.GetShardID()))
 	if err != nil {
 		return err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	return client.PurgeDLQMessages(ctx, request, opts...)
+	return c.client.PurgeDLQMessages(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 }
 
 func (c *clientImpl) MergeDLQMessages(
 	ctx context.Context,
-	request *replicator.MergeDLQMessagesRequest,
+	request *types.MergeDLQMessagesRequest,
 	opts ...yarpc.CallOption,
-) (*replicator.MergeDLQMessagesResponse, error) {
+) (*types.MergeDLQMessagesResponse, error) {
 
-	client, err := c.getClientForShardID(int(request.GetShardID()))
+	peer, err := c.peerResolver.FromShardID(int(request.GetShardID()))
 	if err != nil {
 		return nil, err
 	}
-	opts = common.AggregateYarpcOptions(ctx, opts...)
-	return client.MergeDLQMessages(ctx, request, opts...)
+	return c.client.MergeDLQMessages(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
 }
 
 func (c *clientImpl) RefreshWorkflowTasks(
 	ctx context.Context,
-	request *h.RefreshWorkflowTasksRequest,
+	request *types.HistoryRefreshWorkflowTasksRequest,
 	opts ...yarpc.CallOption,
 ) error {
-	client, err := c.getClientForWorkflowID(request.GetRequest().GetExecution().GetWorkflowId())
-	op := func(ctx context.Context, client historyserviceclient.Interface) error {
-		ctx, cancel := c.createContext(ctx)
-		defer cancel()
-		return client.RefreshWorkflowTasks(ctx, request, opts...)
+	peer, err := c.peerResolver.FromWorkflowID(request.GetRequest().GetExecution().GetWorkflowID())
+	if err != nil {
+		return err
 	}
-	err = c.executeWithRedirect(ctx, client, op)
+	op := func(ctx context.Context, peer string) error {
+		return c.client.RefreshWorkflowTasks(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
+	}
+	err = c.executeWithRedirect(ctx, peer, op)
 	return err
 }
 
 func (c *clientImpl) NotifyFailoverMarkers(
 	ctx context.Context,
-	request *h.NotifyFailoverMarkersRequest,
+	request *types.NotifyFailoverMarkersRequest,
 	opts ...yarpc.CallOption,
 ) error {
-	requestsByClient := make(map[historyserviceclient.Interface]*h.NotifyFailoverMarkersRequest)
+	requestsByPeer := make(map[string]*types.NotifyFailoverMarkersRequest)
 
 	for _, token := range request.GetFailoverMarkerTokens() {
 		marker := token.GetFailoverMarker()
-		client, err := c.getClientForDomainID(marker.GetDomainID())
+		peer, err := c.peerResolver.FromDomainID(marker.GetDomainID())
 		if err != nil {
 			return err
 		}
-		if _, ok := requestsByClient[client]; !ok {
-			requestsByClient[client] = &h.NotifyFailoverMarkersRequest{
-				FailoverMarkerTokens: []*h.FailoverMarkerToken{},
+		if _, ok := requestsByPeer[peer]; !ok {
+			requestsByPeer[peer] = &types.NotifyFailoverMarkersRequest{
+				FailoverMarkerTokens: []*types.FailoverMarkerToken{},
 			}
 		}
 
-		req := requestsByClient[client]
+		req := requestsByPeer[peer]
 		req.FailoverMarkerTokens = append(req.FailoverMarkerTokens, token)
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(len(requestsByClient))
-	respChan := make(chan error, len(requestsByClient))
-	for client, req := range requestsByClient {
-		go func(client historyserviceclient.Interface, request *h.NotifyFailoverMarkersRequest) {
-			defer wg.Done()
-
-			ctx, cancel := c.createContext(ctx)
-			defer cancel()
-			err := client.NotifyFailoverMarkers(
-				ctx,
-				request,
-				opts...,
-			)
-			respChan <- err
-		}(client, req)
+	g := &errgroup.Group{}
+	for peer, req := range requestsByPeer {
+		peer, req := peer, req
+		g.Go(func() (e error) {
+			defer func() { log.CapturePanic(recover(), c.logger, &e) }()
+			return c.client.NotifyFailoverMarkers(ctx, req, append(opts, yarpc.WithShardKey(peer))...)
+		})
 	}
 
-	wg.Wait()
-	close(respChan)
+	return g.Wait()
+}
 
-	for err := range respChan {
+func (c *clientImpl) GetCrossClusterTasks(
+	ctx context.Context,
+	request *types.GetCrossClusterTasksRequest,
+	opts ...yarpc.CallOption,
+) (*types.GetCrossClusterTasksResponse, error) {
+	requestByPeer := make(map[string]*types.GetCrossClusterTasksRequest)
+	for _, shardID := range request.GetShardIDs() {
+		peer, err := c.peerResolver.FromShardID(int(shardID))
 		if err != nil {
-			return err
+			return nil, err
+		}
+
+		if _, ok := requestByPeer[peer]; !ok {
+			requestByPeer[peer] = &types.GetCrossClusterTasksRequest{
+				TargetCluster: request.TargetCluster,
+			}
+		}
+		requestByPeer[peer].ShardIDs = append(requestByPeer[peer].ShardIDs, shardID)
+	}
+
+	// preserve 5% timeout to return partial of the result if context is timing out
+	ctx, cancel := common.CreateChildContext(ctx, 0.05)
+	defer cancel()
+
+	futureByPeer := make(map[string]future.Future, len(requestByPeer))
+	for peer, req := range requestByPeer {
+		future, settable := future.NewFuture()
+		go func(ctx context.Context, peer string, req *types.GetCrossClusterTasksRequest) {
+			settable.Set(c.client.GetCrossClusterTasks(ctx, req, yarpc.WithShardKey(peer)))
+		}(ctx, peer, req)
+
+		futureByPeer[peer] = future
+	}
+
+	response := &types.GetCrossClusterTasksResponse{
+		TasksByShard:       make(map[int32][]*types.CrossClusterTaskRequest),
+		FailedCauseByShard: make(map[int32]types.GetTaskFailedCause),
+	}
+	for peer, future := range futureByPeer {
+		var resp *types.GetCrossClusterTasksResponse
+		if futureErr := future.Get(ctx, &resp); futureErr != nil {
+			c.logger.Error("Failed to get cross cluster tasks", tag.Error(futureErr))
+			for _, failedShardID := range requestByPeer[peer].ShardIDs {
+				response.FailedCauseByShard[failedShardID] = common.ConvertErrToGetTaskFailedCause(futureErr)
+			}
+		} else {
+			for shardID, tasks := range resp.TasksByShard {
+				response.TasksByShard[shardID] = tasks
+			}
+			for shardID, failedCause := range resp.FailedCauseByShard {
+				response.FailedCauseByShard[shardID] = failedCause
+			}
 		}
 	}
-	return nil
+	// not using a waitGroup for created goroutines as once all futures are unblocked,
+	// those goroutines will eventually be completed
+
+	return response, nil
 }
 
-func (c *clientImpl) createContext(parent context.Context) (context.Context, context.CancelFunc) {
-	if parent == nil {
-		return context.WithTimeout(context.Background(), c.timeout)
-	}
-	return context.WithTimeout(parent, c.timeout)
-}
-
-func (c *clientImpl) getClientForWorkflowID(workflowID string) (historyserviceclient.Interface, error) {
-	key := common.WorkflowIDToHistoryShard(workflowID, c.numberOfShards)
-	return c.getClientForShardID(key)
-}
-
-func (c *clientImpl) getClientForDomainID(domainID string) (historyserviceclient.Interface, error) {
-	key := common.DomainIDToHistoryShard(domainID, c.numberOfShards)
-	return c.getClientForShardID(key)
-}
-
-func (c *clientImpl) getClientForShardID(shardID int) (historyserviceclient.Interface, error) {
-	client, err := c.clients.GetClientForKey(string(shardID))
+func (c *clientImpl) RespondCrossClusterTasksCompleted(
+	ctx context.Context,
+	request *types.RespondCrossClusterTasksCompletedRequest,
+	opts ...yarpc.CallOption,
+) (*types.RespondCrossClusterTasksCompletedResponse, error) {
+	peer, err := c.peerResolver.FromShardID(int(request.GetShardID()))
 	if err != nil {
 		return nil, err
 	}
-	return client.(historyserviceclient.Interface), nil
+
+	var response *types.RespondCrossClusterTasksCompletedResponse
+	op := func(ctx context.Context, peer string) error {
+		var err error
+		response, err = c.client.RespondCrossClusterTasksCompleted(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
+		return err
+	}
+
+	err = c.executeWithRedirect(ctx, peer, op)
+	if err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+func (c *clientImpl) GetFailoverInfo(
+	ctx context.Context,
+	request *types.GetFailoverInfoRequest,
+	opts ...yarpc.CallOption,
+) (*types.GetFailoverInfoResponse, error) {
+	peer, err := c.peerResolver.FromDomainID(request.GetDomainID())
+	if err != nil {
+		return nil, err
+	}
+	return c.client.GetFailoverInfo(ctx, request, append(opts, yarpc.WithShardKey(peer))...)
+}
+
+func (c *clientImpl) RatelimitUpdate(ctx context.Context, request *types.RatelimitUpdateRequest, opts ...yarpc.CallOption) (*types.RatelimitUpdateResponse, error) {
+	if len(opts) == 0 {
+		// unfortunately there is not really any way to ensure "must have a shard key option"
+		// due to the closed nature of yarpc.CallOption's implementation, outside private-field-reading reflection.
+		//
+		// there are a few options to work around this, but they are currently rather high effort or
+		// run into import cycles or similar.  risk is low for now as there is only one caller, and likely
+		// never will be others.
+		return nil, fmt.Errorf("invalid arguments, missing yarpc.WithShardKey(peer) at a minimum")
+	}
+
+	// intentionally does not use peer-redirecting retries, as keys in this request
+	// could end up on multiple different hosts after a peer change.
+	return c.client.RatelimitUpdate(ctx, request, opts...)
 }
 
 func (c *clientImpl) executeWithRedirect(
 	ctx context.Context,
-	client historyserviceclient.Interface,
-	op func(ctx context.Context, client historyserviceclient.Interface) error,
+	peer string,
+	op func(ctx context.Context, peer string) error,
 ) error {
 	var err error
 	if ctx == nil {
@@ -1074,15 +1172,14 @@ redirectLoop:
 		if err != nil {
 			break redirectLoop
 		}
-		err = op(ctx, client)
+		err = op(ctx, peer)
 		if err != nil {
-			if s, ok := err.(*h.ShardOwnershipLostError); ok {
+			if s, ok := err.(*types.ShardOwnershipLostError); ok {
 				// TODO: consider emitting a metric for number of redirects
-				ret, err := c.clients.GetClientForClientKey(s.GetOwner())
+				peer, err = c.peerResolver.FromHostAddress(s.GetOwner())
 				if err != nil {
 					return err
 				}
-				client = ret.(historyserviceclient.Interface)
 				continue redirectLoop
 			}
 		}

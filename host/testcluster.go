@@ -24,41 +24,49 @@ import (
 	"context"
 	"io/ioutil"
 	"os"
+	"testing"
 	"time"
 
+	"github.com/startreedata/pinot-client-go/pinot"
 	"github.com/uber-go/tally"
-	"go.uber.org/zap"
 
-	"github.com/uber/cadence/client"
 	adminClient "github.com/uber/cadence/client/admin"
-	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/archiver"
 	"github.com/uber/cadence/common/archiver/filestore"
 	"github.com/uber/cadence/common/archiver/provider"
 	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/cluster"
-	"github.com/uber/cadence/common/definition"
+	"github.com/uber/cadence/common/config"
+	"github.com/uber/cadence/common/config/yaml"
+	"github.com/uber/cadence/common/constants"
 	"github.com/uber/cadence/common/domain"
+	"github.com/uber/cadence/common/dynamicconfig"
+	"github.com/uber/cadence/common/dynamicconfig/dynamicproperties"
 	"github.com/uber/cadence/common/elasticsearch"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
+	"github.com/uber/cadence/common/log/testlogger"
 	"github.com/uber/cadence/common/messaging"
+	"github.com/uber/cadence/common/messaging/kafka"
+	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/mocks"
 	"github.com/uber/cadence/common/persistence"
-	pes "github.com/uber/cadence/common/persistence/elasticsearch"
+	public "github.com/uber/cadence/common/persistence/nosql/nosqlplugin/cassandra/gocql/public"
 	persistencetests "github.com/uber/cadence/common/persistence/persistence-tests"
 	"github.com/uber/cadence/common/persistence/sql/sqlplugin/mysql"
 	"github.com/uber/cadence/common/persistence/sql/sqlplugin/postgres"
-	"github.com/uber/cadence/common/service/config"
-	"github.com/uber/cadence/common/service/dynamicconfig"
+	"github.com/uber/cadence/common/persistence/sql/sqlplugin/sqlite"
+	pnt "github.com/uber/cadence/common/pinot"
+	"github.com/uber/cadence/testflags"
 )
 
 type (
 	// TestCluster is a base struct for integration tests
 	TestCluster struct {
-		testBase     persistencetests.TestBase
+		testBase     *persistencetests.TestBase
 		archiverBase *ArchiverBase
 		host         Cadence
+		doneCh       chan struct{}
 	}
 
 	// ArchiverBase is a base struct for archiver provider being used in integration tests
@@ -75,28 +83,42 @@ type (
 	TestClusterConfig struct {
 		FrontendAddress       string
 		EnableArchival        bool
-		IsMasterCluster       bool
+		IsPrimaryCluster      bool
 		ClusterNo             int
-		ClusterMetadata       config.ClusterMetadata
+		ClusterGroupMetadata  config.ClusterGroupMetadata
 		MessagingClientConfig *MessagingClientConfig
-		Persistence           persistencetests.TestBaseOptions
 		HistoryConfig         *HistoryConfig
-		ESConfig              *elasticsearch.Config
+		MatchingConfig        *MatchingConfig
+		ESConfig              *config.ElasticSearchConfig
 		WorkerConfig          *WorkerConfig
 		MockAdminClient       map[string]adminClient.Client
+		PinotConfig           *config.PinotVisibilityConfig
+		AsyncWFQueues         map[string]config.AsyncWorkflowQueueProvider
+		DynamicClientConfig   dynamicconfig.FileBasedClientConfig
+
+		// TimeSource is used to override the time source of internal components.
+		// Note that most components don't respect this, and it's only used in a few places.
+		// e.g. async workflow test's consumer manager and domain manager
+		TimeSource                     clock.MockedTimeSource
+		FrontendDynamicConfigOverrides map[dynamicproperties.Key]interface{}
+		HistoryDynamicConfigOverrides  map[dynamicproperties.Key]interface{}
+		MatchingDynamicConfigOverrides map[dynamicproperties.Key]interface{}
+		WorkerDynamicConfigOverrides   map[dynamicproperties.Key]interface{}
 	}
 
 	// MessagingClientConfig is the config for messaging config
 	MessagingClientConfig struct {
 		UseMock     bool
-		KafkaConfig *messaging.KafkaConfig
+		KafkaConfig *config.KafkaConfig
 	}
 
 	// WorkerConfig is the config for enabling/disabling cadence worker
 	WorkerConfig struct {
-		EnableArchiver   bool
-		EnableIndexer    bool
-		EnableReplicator bool
+		EnableArchiver        bool
+		EnableIndexer         bool
+		EnableReplicator      bool
+		EnableAsyncWFConsumer bool
+		EnableScheduler       bool
 	}
 )
 
@@ -106,107 +128,251 @@ const (
 )
 
 // NewCluster creates and sets up the test cluster
-func NewCluster(options *TestClusterConfig, logger log.Logger) (*TestCluster, error) {
-
-	clusterMetadata := cluster.GetTestClusterMetadata(
-		options.ClusterMetadata.EnableGlobalDomain,
-		options.IsMasterCluster,
-	)
-	if !options.IsMasterCluster && options.ClusterMetadata.MasterClusterName != "" { // xdc cluster metadata setup
-		clusterMetadata = cluster.NewMetadata(
-			logger,
-			dynamicconfig.GetBoolPropertyFn(options.ClusterMetadata.EnableGlobalDomain),
-			options.ClusterMetadata.FailoverVersionIncrement,
-			options.ClusterMetadata.MasterClusterName,
-			options.ClusterMetadata.CurrentClusterName,
-			options.ClusterMetadata.ClusterInformation,
-		)
+func NewCluster(t *testing.T, options *TestClusterConfig, logger log.Logger, params persistencetests.TestBaseParams) (*TestCluster, error) {
+	// Copy visibility config to the PersistenceConfig so persistence test base can do setup/teardown
+	if options.PinotConfig != nil {
+		params.PersistenceConfig.DataStores[constants.PinotVisibilityStoreName] = config.DataStore{Pinot: options.PinotConfig}
 	}
-
-	options.Persistence.StoreType = TestFlags.PersistenceType
-	if TestFlags.PersistenceType == config.StoreTypeSQL {
-		var ops *persistencetests.TestBaseOptions
-		if TestFlags.SQLPluginName == mysql.PluginName {
-			ops = mysql.GetTestClusterOption()
-		} else if TestFlags.SQLPluginName == postgres.PluginName {
-			ops = postgres.GetTestClusterOption()
-		} else {
-			panic("not supported plugin " + TestFlags.SQLPluginName)
-		}
-		options.Persistence.SQLDBPluginName = TestFlags.SQLPluginName
-		options.Persistence.DBUsername = ops.DBUsername
-		options.Persistence.DBPassword = ops.DBPassword
-		options.Persistence.DBHost = ops.DBHost
-		options.Persistence.DBPort = ops.DBPort
-		options.Persistence.SchemaDir = ops.SchemaDir
+	if options.ESConfig != nil {
+		params.PersistenceConfig.DataStores[constants.ESVisibilityStoreName] = config.DataStore{ElasticSearch: options.ESConfig}
 	}
-	options.Persistence.ClusterMetadata = clusterMetadata
-	testBase := persistencetests.NewTestBase(&options.Persistence)
+	testBase := persistencetests.NewTestBase(t, params)
 	testBase.Setup()
 	setupShards(testBase, options.HistoryConfig.NumHistoryShards, logger)
 	archiverBase := newArchiverBase(options.EnableArchival, logger)
 	messagingClient := getMessagingClient(options.MessagingClientConfig, logger)
-	var esClient elasticsearch.Client
-	var esVisibilityMgr persistence.VisibilityManager
-	advancedVisibilityWritingMode := dynamicconfig.GetStringPropertyFn(common.AdvancedVisibilityWritingModeOff)
-	if options.WorkerConfig.EnableIndexer {
-		advancedVisibilityWritingMode = dynamicconfig.GetStringPropertyFn(common.AdvancedVisibilityWritingModeOn)
-		var err error
-		esClient, err = elasticsearch.NewClient(options.ESConfig)
-		if err != nil {
-			return nil, err
-		}
-
-		indexName := options.ESConfig.Indices[common.VisibilityAppName]
-		visProducer, err := messagingClient.NewProducer(common.VisibilityAppName)
-		if err != nil {
-			return nil, err
-		}
-		visConfig := &config.VisibilityConfig{
-			VisibilityListMaxQPS:   dynamicconfig.GetIntPropertyFilteredByDomain(2000),
-			ESIndexMaxResultWindow: dynamicconfig.GetIntPropertyFn(defaultTestValueOfESIndexMaxResultWindow),
-			ValidSearchAttributes:  dynamicconfig.GetMapPropertyFn(definition.GetDefaultIndexedKeys()),
-		}
-		esVisibilityStore := pes.NewElasticSearchVisibilityStore(esClient, indexName, visProducer, visConfig, logger)
-		esVisibilityMgr = persistence.NewVisibilityManagerImpl(esVisibilityStore, logger)
-	}
-	visibilityMgr := persistence.NewVisibilityManagerWrapper(testBase.VisibilityMgr, esVisibilityMgr,
-		dynamicconfig.GetBoolPropertyFnFilteredByDomain(options.WorkerConfig.EnableIndexer), advancedVisibilityWritingMode)
-
-	pConfig := testBase.Config()
+	pConfig := testBase.PersistenceConfig
 	pConfig.NumHistoryShards = options.HistoryConfig.NumHistoryShards
+	var esClient elasticsearch.GenericClient
+	if options.WorkerConfig.EnableIndexer {
+		var err error
+		esClient, err = elasticsearch.NewGenericClient(options.ESConfig, logger)
+		if err != nil {
+			return nil, err
+		}
+		pConfig.AdvancedVisibilityStore = constants.ESVisibilityStoreName
+	}
+
+	scope := tally.NewTestScope("integration-test", nil)
+	metricsClient := metrics.NewClient(scope, metrics.ServiceIdx(0), metrics.MigrationConfig{} /* default, only used in test setups */)
+	domainReplicationQueue := domain.NewReplicationQueue(
+		testBase.DomainReplicationQueueMgr,
+		options.ClusterGroupMetadata.CurrentClusterName,
+		metricsClient,
+		logger,
+	)
+	semaphoreMetadataMgr, err := testBase.PersistenceFactory.NewSemaphoreMetadataManager()
+	if err != nil {
+		return nil, err
+	}
+	aConfig := noopAuthorizationConfig()
+	doneCh := make(chan struct{})
+	dynamicClient, err := dynamicconfig.NewFileBasedClient(
+		&options.DynamicClientConfig,
+		logger,
+		doneCh,
+	)
+	if err != nil {
+		return nil, err
+	}
 	cadenceParams := &CadenceParams{
-		ClusterMetadata:               clusterMetadata,
-		PersistenceConfig:             pConfig,
-		DispatcherProvider:            client.NewDNSYarpcDispatcherProvider(logger, 0),
-		MessagingClient:               messagingClient,
-		MetadataMgr:                   testBase.MetadataManager,
-		ShardMgr:                      testBase.ShardMgr,
-		HistoryV2Mgr:                  testBase.HistoryV2Mgr,
-		ExecutionMgrFactory:           testBase.ExecutionMgrFactory,
-		DomainReplicationQueue:        testBase.DomainReplicationQueue,
-		TaskMgr:                       testBase.TaskMgr,
-		VisibilityMgr:                 visibilityMgr,
-		Logger:                        logger,
-		ClusterNo:                     options.ClusterNo,
-		ESConfig:                      options.ESConfig,
-		ESClient:                      esClient,
-		ArchiverMetadata:              archiverBase.metadata,
-		ArchiverProvider:              archiverBase.provider,
-		HistoryConfig:                 options.HistoryConfig,
-		WorkerConfig:                  options.WorkerConfig,
-		MockAdminClient:               options.MockAdminClient,
-		DomainReplicationTaskExecutor: domain.NewReplicationTaskExecutor(testBase.MetadataManager, clock.NewRealTimeSource(), logger),
+		ClusterMetadata:                  *params.ClusterMetadata,
+		PersistenceConfig:                pConfig,
+		MessagingClient:                  messagingClient,
+		DomainManager:                    testBase.DomainManager,
+		HistoryV2Mgr:                     testBase.HistoryV2Mgr,
+		ExecutionMgr:                     testBase.ExecutionManager,
+		DomainReplicationQueue:           domainReplicationQueue,
+		Logger:                           logger,
+		ZapLogger:                        testlogger.NewZap(t),
+		ClusterNo:                        options.ClusterNo,
+		ESConfig:                         options.ESConfig,
+		ESClient:                         esClient,
+		ArchiverMetadata:                 archiverBase.metadata,
+		ArchiverProvider:                 archiverBase.provider,
+		HistoryConfig:                    options.HistoryConfig,
+		MatchingConfig:                   options.MatchingConfig,
+		WorkerConfig:                     options.WorkerConfig,
+		MockAdminClient:                  options.MockAdminClient,
+		DomainReplicationTaskExecutor:    domain.NewReplicationTaskExecutor(testBase.DomainManager, newNoopDomainAuditManager(), clock.NewRealTimeSource(), logger, dynamicproperties.GetBoolPropertyFn(false)),
+		SemaphoreReplicationTaskExecutor: domain.NewSemaphoreReplicationTaskExecutor(semaphoreMetadataMgr, logger),
+		AuthorizationConfig:              aConfig,
+		AsyncWFQueues:                    options.AsyncWFQueues,
+		TimeSource:                       options.TimeSource,
+		DynamicClient:                    dynamicClient,
+		FrontendDynCfgOverrides:          options.FrontendDynamicConfigOverrides,
+		HistoryDynCfgOverrides:           options.HistoryDynamicConfigOverrides,
+		MatchingDynCfgOverrides:          options.MatchingDynamicConfigOverrides,
+		WorkerDynCfgOverrides:            options.WorkerDynamicConfigOverrides,
 	}
 	cluster := NewCadence(cadenceParams)
 	if err := cluster.Start(); err != nil {
 		return nil, err
 	}
 
-	return &TestCluster{testBase: testBase, archiverBase: archiverBase, host: cluster}, nil
+	return &TestCluster{testBase: testBase, archiverBase: archiverBase, host: cluster, doneCh: doneCh}, nil
 }
 
-func setupShards(testBase persistencetests.TestBase, numHistoryShards int, logger log.Logger) {
+func NewPinotTestCluster(t *testing.T, options *TestClusterConfig, logger log.Logger, params persistencetests.TestBaseParams) (*TestCluster, error) {
+	// Copy visibility config to the PersistenceConfig so persistence test base can do setup/teardown
+	if options.PinotConfig != nil {
+		params.PersistenceConfig.DataStores[constants.PinotVisibilityStoreName] = config.DataStore{Pinot: options.PinotConfig}
+	}
+	if options.ESConfig != nil {
+		params.PersistenceConfig.DataStores[constants.ESVisibilityStoreName] = config.DataStore{ElasticSearch: options.ESConfig}
+	}
+	testBase := persistencetests.NewTestBase(t, params)
+	testBase.Setup()
+	setupShards(testBase, options.HistoryConfig.NumHistoryShards, logger)
+	archiverBase := newArchiverBase(options.EnableArchival, logger)
+	messagingClient := getMessagingClient(options.MessagingClientConfig, logger)
+	pConfig := testBase.PersistenceConfig
+	pConfig.NumHistoryShards = options.HistoryConfig.NumHistoryShards
+	var esClient elasticsearch.GenericClient
+	var pinotClient pnt.GenericClient
+	if options.WorkerConfig.EnableIndexer {
+		var err error
+		if options.PinotConfig.Migration.Enabled {
+			esClient, err = elasticsearch.NewGenericClient(options.ESConfig, logger)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	pConfig.AdvancedVisibilityStore = constants.PinotVisibilityStoreName
+	pinotBroker := options.PinotConfig.Broker
+	pinotRawClient, err := pinot.NewFromBrokerList([]string{pinotBroker})
+	if err != nil || pinotRawClient == nil {
+		return nil, err
+	}
+	pinotClient = pnt.NewPinotClient(pinotRawClient, logger, options.PinotConfig)
+
+	scope := tally.NewTestScope("integration-test", nil)
+	metricsClient := metrics.NewClient(scope, metrics.ServiceIdx(0), metrics.MigrationConfig{} /* default, only used in test setups */)
+	domainReplicationQueue := domain.NewReplicationQueue(
+		testBase.DomainReplicationQueueMgr,
+		options.ClusterGroupMetadata.CurrentClusterName,
+		metricsClient,
+		logger,
+	)
+	semaphoreMetadataMgr, err := testBase.PersistenceFactory.NewSemaphoreMetadataManager()
+	if err != nil {
+		return nil, err
+	}
+	aConfig := noopAuthorizationConfig()
+	doneCh := make(chan struct{})
+	dynamicClient, err := dynamicconfig.NewFileBasedClient(
+		&options.DynamicClientConfig,
+		logger,
+		doneCh,
+	)
+	if err != nil {
+		return nil, err
+	}
+	cadenceParams := &CadenceParams{
+		ClusterMetadata:                  *params.ClusterMetadata,
+		PersistenceConfig:                pConfig,
+		MessagingClient:                  messagingClient,
+		DomainManager:                    testBase.DomainManager,
+		HistoryV2Mgr:                     testBase.HistoryV2Mgr,
+		ExecutionMgr:                     testBase.ExecutionManager,
+		DomainReplicationQueue:           domainReplicationQueue,
+		Logger:                           logger,
+		ZapLogger:                        testlogger.NewZap(t),
+		ClusterNo:                        options.ClusterNo,
+		ESConfig:                         options.ESConfig,
+		ESClient:                         esClient,
+		ArchiverMetadata:                 archiverBase.metadata,
+		ArchiverProvider:                 archiverBase.provider,
+		HistoryConfig:                    options.HistoryConfig,
+		MatchingConfig:                   options.MatchingConfig,
+		WorkerConfig:                     options.WorkerConfig,
+		MockAdminClient:                  options.MockAdminClient,
+		DomainReplicationTaskExecutor:    domain.NewReplicationTaskExecutor(testBase.DomainManager, newNoopDomainAuditManager(), clock.NewRealTimeSource(), logger, dynamicproperties.GetBoolPropertyFn(false)),
+		SemaphoreReplicationTaskExecutor: domain.NewSemaphoreReplicationTaskExecutor(semaphoreMetadataMgr, logger),
+		AuthorizationConfig:              aConfig,
+		PinotConfig:                      options.PinotConfig,
+		PinotClient:                      pinotClient,
+		DynamicClient:                    dynamicClient,
+	}
+	cluster := NewCadence(cadenceParams)
+	if err := cluster.Start(); err != nil {
+		return nil, err
+	}
+
+	return &TestCluster{testBase: testBase, archiverBase: archiverBase, host: cluster, doneCh: doneCh}, nil
+}
+
+func noopAuthorizationConfig() config.Authorization {
+	return config.Authorization{
+		OAuthAuthorizer: config.OAuthAuthorizer{
+			Enable: false,
+		},
+		NoopAuthorizer: config.NoopAuthorizer{
+			Enable: true,
+		},
+	}
+}
+
+// NewClusterMetadata returns cluster metdata from config
+func NewClusterMetadata(t *testing.T, options *TestClusterConfig) cluster.Metadata {
+	if options.ClusterGroupMetadata.PrimaryClusterName == "" {
+		return cluster.GetTestClusterMetadata(true)
+	}
+	return cluster.NewMetadata(
+		options.ClusterGroupMetadata,
+		func(domain string) bool { return false },
+		metrics.NewNoopMetricsClient(),
+		testlogger.New(t),
+	)
+}
+
+func NewTestPersistenceConfig(t *testing.T) config.Persistence {
+	var testDataStore persistencetests.DataStoreProvider
+	if TestFlags.PersistenceType == config.StoreTypeCassandra {
+		// TODO refactor to support other NoSQL
+		testflags.RequireCassandra(t)
+		testDataStore = public.NewTestConfigWithPublicCassandra
+	} else if TestFlags.PersistenceType == config.StoreTypeSQL {
+		switch TestFlags.SQLPluginName {
+		case mysql.PluginName:
+			testflags.RequireMySQL(t)
+			testDataStore = mysql.GetTestConfig
+		case postgres.PluginName:
+			testflags.RequirePostgres(t)
+			testDataStore = postgres.GetTestConfig
+		case sqlite.PluginName:
+			testDataStore = sqlite.GetTestConfig
+		default:
+			t.Fatal("not supported plugin " + TestFlags.SQLPluginName)
+		}
+	} else {
+		t.Fatal("not supported storage type" + TestFlags.PersistenceType)
+	}
+	return persistencetests.SimplePersistenceConfig(t, testDataStore)
+}
+
+func newNoopDomainAuditManager() persistence.DomainAuditManager {
+	return &noopDomainAuditManager{}
+}
+
+type noopDomainAuditManager struct{}
+
+func (n *noopDomainAuditManager) GetName() string {
+	return "noop"
+}
+
+func (n *noopDomainAuditManager) Close() {}
+
+func (n *noopDomainAuditManager) CreateDomainAuditLog(ctx context.Context, request *persistence.CreateDomainAuditLogRequest) (*persistence.CreateDomainAuditLogResponse, error) {
+	return &persistence.CreateDomainAuditLogResponse{}, nil
+}
+
+func (n *noopDomainAuditManager) GetDomainAuditLogs(ctx context.Context, request *persistence.GetDomainAuditLogsRequest) (*persistence.GetDomainAuditLogsResponse, error) {
+	return &persistence.GetDomainAuditLogsResponse{}, nil
+}
+
+func setupShards(testBase *persistencetests.TestBase, numHistoryShards int, logger log.Logger) {
 	// shard 0 is always created, we create additional shards if needed
 	for shardID := 1; shardID < numHistoryShards; shardID++ {
 		ctx, cancel := context.WithTimeout(context.Background(), defaultTestPersistenceTimeout)
@@ -223,8 +389,8 @@ func newArchiverBase(enabled bool, logger log.Logger) *ArchiverBase {
 	dcCollection := dynamicconfig.NewNopCollection()
 	if !enabled {
 		return &ArchiverBase{
-			metadata: archiver.NewArchivalMetadata(dcCollection, "", false, "", false, &config.ArchivalDomainDefaults{}),
-			provider: provider.NewArchiverProvider(nil, nil),
+			metadata: archiver.NewArchivalMetadata(dcCollection, "", false, "", false, &archiver.ArchivalDomainDefaults{}),
+			provider: provider.NewNoOpArchiverProvider(),
 		}
 	}
 
@@ -236,30 +402,31 @@ func newArchiverBase(enabled bool, logger log.Logger) *ArchiverBase {
 	if err != nil {
 		logger.Fatal("Failed to create temp dir for visibility archival", tag.Error(err))
 	}
-	cfg := &config.FilestoreArchiver{
+	cfg := &filestore.Config{
 		FileMode: "0666",
 		DirMode:  "0766",
 	}
-	provider := provider.NewArchiverProvider(
-		&config.HistoryArchiverProvider{
-			Filestore: cfg,
-		},
-		&config.VisibilityArchiverProvider{
-			Filestore: cfg,
-		},
+	node, err := yaml.ToNode(cfg)
+	if err != nil {
+		logger.Fatal("Should be impossible: failed to convert filestore archiver config to a yaml node")
+	}
+
+	archiverProvider := provider.NewArchiverProvider(
+		archiver.HistoryArchiverProvider{archiver.FilestoreConfig: node},
+		archiver.VisibilityArchiverProvider{archiver.FilestoreConfig: node},
 	)
 	return &ArchiverBase{
-		metadata: archiver.NewArchivalMetadata(dcCollection, "enabled", true, "enabled", true, &config.ArchivalDomainDefaults{
-			History: config.HistoryArchivalDomainDefaults{
+		metadata: archiver.NewArchivalMetadata(dcCollection, "enabled", true, "enabled", true, &archiver.ArchivalDomainDefaults{
+			History: archiver.HistoryArchivalDomainDefaults{
 				Status: "enabled",
 				URI:    "testScheme://test/history/archive/path",
 			},
-			Visibility: config.VisibilityArchivalDomainDefaults{
+			Visibility: archiver.VisibilityArchivalDomainDefaults{
 				Status: "enabled",
 				URI:    "testScheme://test/visibility/archive/path",
 			},
 		}),
-		provider:                 provider,
+		provider:                 archiverProvider,
 		historyStoreDirectory:    historyStoreDirectory,
 		visibilityStoreDirectory: visibilityStoreDirectory,
 		historyURI:               filestore.URIScheme + "://" + historyStoreDirectory,
@@ -272,13 +439,14 @@ func getMessagingClient(config *MessagingClientConfig, logger log.Logger) messag
 		return mocks.NewMockMessagingClient(&mocks.KafkaProducer{}, nil)
 	}
 	checkApp := len(config.KafkaConfig.Applications) != 0
-	return messaging.NewKafkaClient(config.KafkaConfig, nil, zap.NewNop(), logger, tally.NoopScope, checkApp)
+	return kafka.NewKafkaClient(config.KafkaConfig, metrics.NewNoopMetricsClient(), logger, tally.NoopScope, checkApp)
 }
 
 // TearDownCluster tears down the test cluster
 func (tc *TestCluster) TearDownCluster() {
 	tc.host.Stop()
 	tc.host = nil
+	close(tc.doneCh)
 	tc.testBase.TearDownWorkflowStore()
 	os.RemoveAll(tc.archiverBase.historyStoreDirectory)
 	os.RemoveAll(tc.archiverBase.visibilityStoreDirectory)
@@ -299,7 +467,21 @@ func (tc *TestCluster) GetHistoryClient() HistoryClient {
 	return tc.host.GetHistoryClient()
 }
 
-// GetExecutionManagerFactory returns an execution manager factory from the test cluster
-func (tc *TestCluster) GetExecutionManagerFactory() persistence.ExecutionManagerFactory {
-	return tc.host.GetExecutionManagerFactory()
+// GetMatchingClient returns a matching client from the test cluster
+func (tc *TestCluster) GetMatchingClient() MatchingClient {
+	return tc.host.GetMatchingClient()
+}
+
+func (tc *TestCluster) GetMatchingClients() []MatchingClient {
+	clients := tc.host.GetMatchingClients()
+	result := make([]MatchingClient, 0, len(clients))
+	for _, client := range clients {
+		result = append(result, client)
+	}
+	return result
+}
+
+// GetExecutionManager returns the execution manager from the test cluster
+func (tc *TestCluster) GetExecutionManager() persistence.ExecutionManager {
+	return tc.host.GetExecutionManager()
 }

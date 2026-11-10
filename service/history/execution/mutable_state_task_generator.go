@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-//go:generate mockgen -copyright_file ../../../LICENSE -package $GOPACKAGE -source $GOFILE -destination mutable_state_task_generator_mock.go -self_package github.com/uber/cadence/service/history/execution
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination mutable_state_task_generator_mock.go -self_package github.com/uber/cadence/service/history/execution
 
 package execution
 
@@ -28,77 +28,75 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common/cache"
-	"github.com/uber/cadence/common/clock"
+	"github.com/uber/cadence/common/cluster"
 	"github.com/uber/cadence/common/log"
+	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/types"
 )
 
 type (
 	// MutableStateTaskGenerator generates workflow transfer and timer tasks
 	MutableStateTaskGenerator interface {
+		// for workflow reset startTime should be the reset time instead of
+		// the startEvent time, so that workflow timeout timestamp can be
+		// re-calculated.
 		GenerateWorkflowStartTasks(
-			now time.Time,
-			startEvent *shared.HistoryEvent,
+			startTime time.Time,
+			startEvent *types.HistoryEvent,
 		) error
 		GenerateWorkflowCloseTasks(
-			now time.Time,
+			closeEvent *types.HistoryEvent,
+			workflowDeletionTaskJitterRange int,
 		) error
 		GenerateRecordWorkflowStartedTasks(
-			now time.Time,
-			startEvent *shared.HistoryEvent,
+			startEvent *types.HistoryEvent,
 		) error
 		GenerateDelayedDecisionTasks(
-			now time.Time,
-			startEvent *shared.HistoryEvent,
+			startEvent *types.HistoryEvent,
 		) error
 		GenerateDecisionScheduleTasks(
-			now time.Time,
 			decisionScheduleID int64,
 		) error
 		GenerateDecisionStartTasks(
-			now time.Time,
 			decisionScheduleID int64,
 		) error
 		GenerateActivityTransferTasks(
-			now time.Time,
-			event *shared.HistoryEvent,
+			event *types.HistoryEvent,
 		) error
 		GenerateActivityRetryTasks(
 			activityScheduleID int64,
 		) error
 		GenerateChildWorkflowTasks(
-			now time.Time,
-			event *shared.HistoryEvent,
+			event *types.HistoryEvent,
 		) error
 		GenerateRequestCancelExternalTasks(
-			now time.Time,
-			event *shared.HistoryEvent,
+			event *types.HistoryEvent,
 		) error
 		GenerateSignalExternalTasks(
-			now time.Time,
-			event *shared.HistoryEvent,
+			event *types.HistoryEvent,
 		) error
-		GenerateWorkflowSearchAttrTasks(
-			now time.Time,
+		GenerateAcquireSemaphoreTasks(
+			initiatedEventID int64,
 		) error
-		GenerateWorkflowResetTasks(
-			now time.Time,
+		GenerateSemaphoreAcquireTimeoutTasks(
+			initiatedEventID int64,
 		) error
-
+		GenerateReleaseSemaphoreTasks(
+			initiatedEventID int64,
+		) error
+		GenerateWorkflowSearchAttrTasks() error
+		GenerateWorkflowResetTasks() error
 		// these 2 APIs should only be called when mutable state transaction is being closed
-		GenerateActivityTimerTasks(
-			now time.Time,
-		) error
-		GenerateUserTimerTasks(
-			now time.Time,
-		) error
+		GenerateActivityTimerTasks() error
+		GenerateUserTimerTasks() error
 	}
 
 	mutableStateTaskGeneratorImpl struct {
-		domainCache cache.DomainCache
-		logger      log.Logger
+		logger          log.Logger
+		clusterMetadata cluster.Metadata
+		domainCache     cache.DomainCache
 
 		mutableState MutableState
 	}
@@ -115,56 +113,71 @@ var _ MutableStateTaskGenerator = (*mutableStateTaskGeneratorImpl)(nil)
 
 // NewMutableStateTaskGenerator creates a new task generator for mutable state
 func NewMutableStateTaskGenerator(
-	domainCache cache.DomainCache,
 	logger log.Logger,
+	clusterMetadata cluster.Metadata,
+	domainCache cache.DomainCache,
 	mutableState MutableState,
 ) MutableStateTaskGenerator {
 
 	return &mutableStateTaskGeneratorImpl{
-		domainCache: domainCache,
-		logger:      logger,
-
-		mutableState: mutableState,
+		logger:          logger,
+		clusterMetadata: clusterMetadata,
+		domainCache:     domainCache,
+		mutableState:    mutableState,
 	}
 }
 
 func (r *mutableStateTaskGeneratorImpl) GenerateWorkflowStartTasks(
-	now time.Time,
-	startEvent *shared.HistoryEvent,
+	startTime time.Time,
+	startEvent *types.HistoryEvent,
 ) error {
-
 	attr := startEvent.WorkflowExecutionStartedEventAttributes
 	firstDecisionDelayDuration := time.Duration(attr.GetFirstDecisionTaskBackoffSeconds()) * time.Second
 
 	executionInfo := r.mutableState.GetExecutionInfo()
-	startVersion := startEvent.GetVersion()
+	startVersion := startEvent.Version
 
 	workflowTimeoutDuration := time.Duration(executionInfo.WorkflowTimeout) * time.Second
-	workflowTimeoutDuration = workflowTimeoutDuration + firstDecisionDelayDuration
-	workflowTimeoutTimestamp := now.Add(workflowTimeoutDuration)
-	if !executionInfo.ExpirationTime.IsZero() && workflowTimeoutTimestamp.After(executionInfo.ExpirationTime) {
+	workflowTimeoutTimestamp := startTime.Add(workflowTimeoutDuration + firstDecisionDelayDuration)
+	// ensure that the first attempt does not time out early based on retry policy timeout
+	if attr.Attempt > 0 && !executionInfo.ExpirationTime.IsZero() && workflowTimeoutTimestamp.After(executionInfo.ExpirationTime) {
 		workflowTimeoutTimestamp = executionInfo.ExpirationTime
 	}
 	r.mutableState.AddTimerTasks(&persistence.WorkflowTimeoutTask{
-		// TaskID is set by shard
-		VisibilityTimestamp: workflowTimeoutTimestamp,
-		Version:             startVersion,
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   executionInfo.DomainID,
+			WorkflowID: executionInfo.WorkflowID,
+			RunID:      executionInfo.RunID,
+		},
+		TaskData: persistence.TaskData{
+			// TaskID is set by shard
+			VisibilityTimestamp: workflowTimeoutTimestamp,
+			Version:             startVersion,
+		},
+		TaskList: executionInfo.TaskList,
 	})
 
 	return nil
 }
 
 func (r *mutableStateTaskGeneratorImpl) GenerateWorkflowCloseTasks(
-	now time.Time,
+	closeEvent *types.HistoryEvent,
+	workflowDeletionTaskJitterRange int,
 ) error {
 
-	currentVersion := r.mutableState.GetCurrentVersion()
 	executionInfo := r.mutableState.GetExecutionInfo()
-
+	taskList := executionInfo.TaskList
 	r.mutableState.AddTransferTasks(&persistence.CloseExecutionTask{
-		// TaskID is set by shard
-		VisibilityTimestamp: now,
-		Version:             currentVersion,
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   executionInfo.DomainID,
+			WorkflowID: executionInfo.WorkflowID,
+			RunID:      executionInfo.RunID,
+		},
+		TaskData: persistence.TaskData{
+			// TaskID and VisibilityTimestamp are set by shard context
+			Version: closeEvent.Version,
+		},
+		TaskList: taskList,
 	})
 
 	retentionInDays := defaultWorkflowRetentionInDays
@@ -172,82 +185,114 @@ func (r *mutableStateTaskGeneratorImpl) GenerateWorkflowCloseTasks(
 	switch err.(type) {
 	case nil:
 		retentionInDays = domainEntry.GetRetentionDays(executionInfo.WorkflowID)
-	case *shared.EntityNotExistsError:
+	case *types.EntityNotExistsError:
 		// domain is not accessible, use default value above
 	default:
 		return err
 	}
 
-	retentionDuration := time.Duration(retentionInDays) * time.Hour * 24
+	closeTimestamp := time.Unix(0, closeEvent.GetTimestamp())
+	retentionDuration := (time.Duration(retentionInDays) * time.Hour * 24)
+	if workflowDeletionTaskJitterRange > 1 {
+		retentionDuration += time.Duration(rand.Intn(workflowDeletionTaskJitterRange*60)) * time.Second
+	}
+
+	r.logger.Debug("GenerateWorkflowCloseTasks",
+		tag.WorkflowID(executionInfo.WorkflowID),
+		tag.WorkflowRunID(executionInfo.RunID),
+		tag.WorkflowDomainID(executionInfo.DomainID),
+		tag.Timestamp(closeTimestamp),
+	)
 	r.mutableState.AddTimerTasks(&persistence.DeleteHistoryEventTask{
-		// TaskID is set by shard
-		VisibilityTimestamp: now.Add(retentionDuration),
-		Version:             currentVersion,
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   executionInfo.DomainID,
+			WorkflowID: executionInfo.WorkflowID,
+			RunID:      executionInfo.RunID,
+		},
+		TaskData: persistence.TaskData{
+			// TaskID is set by shard
+			VisibilityTimestamp: closeTimestamp.Add(retentionDuration),
+			Version:             closeEvent.Version,
+		},
+		TaskList: taskList,
 	})
 
 	return nil
 }
 
 func (r *mutableStateTaskGeneratorImpl) GenerateDelayedDecisionTasks(
-	now time.Time,
-	startEvent *shared.HistoryEvent,
+	startEvent *types.HistoryEvent,
 ) error {
 
-	startVersion := startEvent.GetVersion()
-
+	startVersion := startEvent.Version
+	startTimestamp := time.Unix(0, startEvent.GetTimestamp())
 	startAttr := startEvent.WorkflowExecutionStartedEventAttributes
 	decisionBackoffDuration := time.Duration(startAttr.GetFirstDecisionTaskBackoffSeconds()) * time.Second
-	executionTimestamp := now.Add(decisionBackoffDuration)
+	executionTimestamp := startTimestamp.Add(decisionBackoffDuration)
 
 	// noParentWorkflow case
 	firstDecisionDelayType := persistence.WorkflowBackoffTimeoutTypeCron
 	// continue as new case
 	if startAttr.Initiator != nil {
 		switch startAttr.GetInitiator() {
-		case shared.ContinueAsNewInitiatorRetryPolicy:
+		case types.ContinueAsNewInitiatorRetryPolicy:
 			firstDecisionDelayType = persistence.WorkflowBackoffTimeoutTypeRetry
-		case shared.ContinueAsNewInitiatorCronSchedule:
+		case types.ContinueAsNewInitiatorCronSchedule:
 			firstDecisionDelayType = persistence.WorkflowBackoffTimeoutTypeCron
-		case shared.ContinueAsNewInitiatorDecider:
-			return &shared.InternalServiceError{
+		case types.ContinueAsNewInitiatorDecider:
+			return &types.InternalServiceError{
 				Message: "encounter continue as new iterator & first decision delay not 0",
 			}
 		default:
-			return &shared.InternalServiceError{
+			return &types.InternalServiceError{
 				Message: fmt.Sprintf("unknown iterator retry policy: %v", startAttr.GetInitiator()),
 			}
 		}
 	}
 
+	executionInfo := r.mutableState.GetExecutionInfo()
 	r.mutableState.AddTimerTasks(&persistence.WorkflowBackoffTimerTask{
-		// TaskID is set by shard
-		// TODO EventID seems not used at all
-		VisibilityTimestamp: executionTimestamp,
-		TimeoutType:         firstDecisionDelayType,
-		Version:             startVersion,
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   executionInfo.DomainID,
+			WorkflowID: executionInfo.WorkflowID,
+			RunID:      executionInfo.RunID,
+		},
+		TaskData: persistence.TaskData{
+			// TaskID is set by shard
+			VisibilityTimestamp: executionTimestamp,
+			Version:             startVersion,
+		},
+		TimeoutType: firstDecisionDelayType,
+		TaskList:    executionInfo.TaskList,
 	})
 
 	return nil
 }
 
 func (r *mutableStateTaskGeneratorImpl) GenerateRecordWorkflowStartedTasks(
-	now time.Time,
-	startEvent *shared.HistoryEvent,
+	startEvent *types.HistoryEvent,
 ) error {
 
-	startVersion := startEvent.GetVersion()
+	startVersion := startEvent.Version
 
+	executionInfo := r.mutableState.GetExecutionInfo()
 	r.mutableState.AddTransferTasks(&persistence.RecordWorkflowStartedTask{
-		// TaskID is set by shard
-		VisibilityTimestamp: now,
-		Version:             startVersion,
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   executionInfo.DomainID,
+			WorkflowID: executionInfo.WorkflowID,
+			RunID:      executionInfo.RunID,
+		},
+		TaskData: persistence.TaskData{
+			// TaskID and VisibilityTimestamp are set by shard context
+			Version: startVersion,
+		},
+		TaskList: executionInfo.TaskList,
 	})
 
 	return nil
 }
 
 func (r *mutableStateTaskGeneratorImpl) GenerateDecisionScheduleTasks(
-	now time.Time,
 	decisionScheduleID int64,
 ) error {
 
@@ -256,33 +301,46 @@ func (r *mutableStateTaskGeneratorImpl) GenerateDecisionScheduleTasks(
 		decisionScheduleID,
 	)
 	if !ok {
-		return &shared.InternalServiceError{
+		return &types.InternalServiceError{
 			Message: fmt.Sprintf("it could be a bug, cannot get pending decision: %v", decisionScheduleID),
 		}
 	}
 
+	originalTaskList := executionInfo.TaskList
 	r.mutableState.AddTransferTasks(&persistence.DecisionTask{
-		// TaskID is set by shard
-		VisibilityTimestamp: now,
-		DomainID:            executionInfo.DomainID,
-		TaskList:            decision.TaskList,
-		ScheduleID:          decision.ScheduleID,
-		Version:             decision.Version,
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   executionInfo.DomainID,
+			WorkflowID: executionInfo.WorkflowID,
+			RunID:      executionInfo.RunID,
+		},
+		TaskData: persistence.TaskData{
+			// TaskID and VisibilityTimestamp are set by shard context
+			Version: decision.Version,
+		},
+		TargetDomainID:       executionInfo.DomainID,
+		TaskList:             decision.TaskList,
+		ScheduleID:           decision.ScheduleID,
+		OriginalTaskList:     originalTaskList,
+		OriginalTaskListKind: executionInfo.TaskListKind,
 	})
 
-	if r.mutableState.IsStickyTaskListEnabled() {
+	if scheduleToStartTimeout := r.mutableState.GetDecisionScheduleToStartTimeout(); scheduleToStartTimeout != 0 {
 		scheduledTime := time.Unix(0, decision.ScheduledTimestamp)
-		scheduleToStartTimeout := time.Duration(
-			r.mutableState.GetExecutionInfo().StickyScheduleToStartTimeout,
-		) * time.Second
-
 		r.mutableState.AddTimerTasks(&persistence.DecisionTimeoutTask{
-			// TaskID is set by shard
-			VisibilityTimestamp: scheduledTime.Add(scheduleToStartTimeout),
-			TimeoutType:         int(TimerTypeScheduleToStart),
-			EventID:             decision.ScheduleID,
-			ScheduleAttempt:     decision.Attempt,
-			Version:             decision.Version,
+			WorkflowIdentifier: persistence.WorkflowIdentifier{
+				DomainID:   executionInfo.DomainID,
+				WorkflowID: executionInfo.WorkflowID,
+				RunID:      executionInfo.RunID,
+			},
+			TaskData: persistence.TaskData{
+				// TaskID is set by shard
+				VisibilityTimestamp: scheduledTime.Add(scheduleToStartTimeout),
+				Version:             decision.Version,
+			},
+			TimeoutType:     int(TimerTypeScheduleToStart),
+			EventID:         decision.ScheduleID,
+			ScheduleAttempt: decision.Attempt,
+			TaskList:        originalTaskList,
 		})
 	}
 
@@ -290,7 +348,6 @@ func (r *mutableStateTaskGeneratorImpl) GenerateDecisionScheduleTasks(
 }
 
 func (r *mutableStateTaskGeneratorImpl) GenerateDecisionStartTasks(
-	now time.Time,
 	decisionScheduleID int64,
 ) error {
 
@@ -298,7 +355,7 @@ func (r *mutableStateTaskGeneratorImpl) GenerateDecisionStartTasks(
 		decisionScheduleID,
 	)
 	if !ok {
-		return &shared.InternalServiceError{
+		return &types.InternalServiceError{
 			Message: fmt.Sprintf("it could be a bug, cannot get pending decision: %v", decisionScheduleID),
 		}
 	}
@@ -308,37 +365,45 @@ func (r *mutableStateTaskGeneratorImpl) GenerateDecisionStartTasks(
 		decision.DecisionTimeout,
 	) * time.Second
 
+	executionInfo := r.mutableState.GetExecutionInfo()
 	// schedule timer exponentially if decision keeps failing
 	if decision.Attempt > 1 {
-		defaultStartToCloseTimeout := r.mutableState.GetExecutionInfo().DecisionStartToCloseTimeout
+		defaultStartToCloseTimeout := executionInfo.DecisionStartToCloseTimeout
 		startToCloseTimeout = getNextDecisionTimeout(decision.Attempt, time.Duration(defaultStartToCloseTimeout)*time.Second)
 		decision.DecisionTimeout = int32(startToCloseTimeout.Seconds()) // override decision timeout
 		r.mutableState.UpdateDecision(decision)
 	}
 
 	r.mutableState.AddTimerTasks(&persistence.DecisionTimeoutTask{
-		// TaskID is set by shard
-		VisibilityTimestamp: startedTime.Add(startToCloseTimeout),
-		TimeoutType:         int(TimerTypeStartToClose),
-		EventID:             decision.ScheduleID,
-		ScheduleAttempt:     decision.Attempt,
-		Version:             decision.Version,
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   executionInfo.DomainID,
+			WorkflowID: executionInfo.WorkflowID,
+			RunID:      executionInfo.RunID,
+		},
+		TaskData: persistence.TaskData{
+			// TaskID is set by shard
+			VisibilityTimestamp: startedTime.Add(startToCloseTimeout),
+			Version:             decision.Version,
+		},
+		TimeoutType:     int(TimerTypeStartToClose),
+		EventID:         decision.ScheduleID,
+		ScheduleAttempt: decision.Attempt,
+		TaskList:        executionInfo.TaskList,
 	})
 
 	return nil
 }
 
 func (r *mutableStateTaskGeneratorImpl) GenerateActivityTransferTasks(
-	now time.Time,
-	event *shared.HistoryEvent,
+	event *types.HistoryEvent,
 ) error {
 
 	attr := event.ActivityTaskScheduledEventAttributes
-	activityScheduleID := event.GetEventId()
+	activityScheduleID := event.ID
 
 	activityInfo, ok := r.mutableState.GetActivityInfo(activityScheduleID)
 	if !ok {
-		return &shared.InternalServiceError{
+		return &types.InternalServiceError{
 			Message: fmt.Sprintf("it could be a bug, cannot get pending activity: %v", activityScheduleID),
 		}
 	}
@@ -358,13 +423,20 @@ func (r *mutableStateTaskGeneratorImpl) GenerateActivityTransferTasks(
 		}
 	}
 
+	executionInfo := r.mutableState.GetExecutionInfo()
 	r.mutableState.AddTransferTasks(&persistence.ActivityTask{
-		// TaskID is set by shard
-		VisibilityTimestamp: now,
-		DomainID:            targetDomainID,
-		TaskList:            activityInfo.TaskList,
-		ScheduleID:          activityInfo.ScheduleID,
-		Version:             activityInfo.Version,
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   executionInfo.DomainID,
+			WorkflowID: executionInfo.WorkflowID,
+			RunID:      executionInfo.RunID,
+		},
+		TaskData: persistence.TaskData{
+			// TaskID and VisibilityTimestamp are set by shard context
+			Version: activityInfo.Version,
+		},
+		TargetDomainID: targetDomainID,
+		TaskList:       activityInfo.TaskList,
+		ScheduleID:     activityInfo.ScheduleID,
 	})
 
 	return nil
@@ -376,70 +448,183 @@ func (r *mutableStateTaskGeneratorImpl) GenerateActivityRetryTasks(
 
 	ai, ok := r.mutableState.GetActivityInfo(activityScheduleID)
 	if !ok {
-		return &shared.InternalServiceError{
+		return &types.InternalServiceError{
 			Message: fmt.Sprintf("it could be a bug, cannot get pending activity: %v", activityScheduleID),
 		}
 	}
 
+	executionInfo := r.mutableState.GetExecutionInfo()
 	r.mutableState.AddTimerTasks(&persistence.ActivityRetryTimerTask{
-		// TaskID is set by shard
-		Version:             ai.Version,
-		VisibilityTimestamp: ai.ScheduledTime,
-		EventID:             ai.ScheduleID,
-		Attempt:             ai.Attempt,
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   executionInfo.DomainID,
+			WorkflowID: executionInfo.WorkflowID,
+			RunID:      executionInfo.RunID,
+		},
+		TaskData: persistence.TaskData{
+			// TaskID is set by shard
+			Version:             ai.Version,
+			VisibilityTimestamp: ai.ScheduledTime,
+		},
+		EventID:  ai.ScheduleID,
+		Attempt:  int64(ai.Attempt),
+		TaskList: ai.TaskList,
+	})
+	return nil
+}
+
+// GenerateAcquireSemaphoreTasks adds the transfer task that asks Matching for a token for the
+// acquire started by initiatedEventID.
+func (r *mutableStateTaskGeneratorImpl) GenerateAcquireSemaphoreTasks(
+	initiatedEventID int64,
+) error {
+
+	semaphoreInfo, ok := r.mutableState.GetSemaphoreInfo(initiatedEventID)
+	if !ok {
+		return &types.InternalServiceError{
+			Message: fmt.Sprintf("it could be a bug, cannot get pending semaphore hold: %v", initiatedEventID),
+		}
+	}
+
+	executionInfo := r.mutableState.GetExecutionInfo()
+	r.mutableState.AddTransferTasks(&persistence.AcquireSemaphoreTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   executionInfo.DomainID,
+			WorkflowID: executionInfo.WorkflowID,
+			RunID:      executionInfo.RunID,
+		},
+		TaskData: persistence.TaskData{
+			// TaskID and VisibilityTimestamp are set by shard context
+			Version: semaphoreInfo.Version,
+		},
+		InitiatedID: semaphoreInfo.InitiatedID,
+		TaskList:    executionInfo.TaskList,
+	})
+	return nil
+}
+
+// GenerateSemaphoreAcquireTimeoutTasks adds the timer that ends the acquire started by
+// initiatedEventID at its deadline.
+func (r *mutableStateTaskGeneratorImpl) GenerateSemaphoreAcquireTimeoutTasks(
+	initiatedEventID int64,
+) error {
+
+	semaphoreInfo, ok := r.mutableState.GetSemaphoreInfo(initiatedEventID)
+	if !ok {
+		return &types.InternalServiceError{
+			Message: fmt.Sprintf("it could be a bug, cannot get pending semaphore hold: %v", initiatedEventID),
+		}
+	}
+
+	executionInfo := r.mutableState.GetExecutionInfo()
+	r.mutableState.AddTimerTasks(&persistence.SemaphoreAcquireTimeoutTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   executionInfo.DomainID,
+			WorkflowID: executionInfo.WorkflowID,
+			RunID:      executionInfo.RunID,
+		},
+		TaskData: persistence.TaskData{
+			// TaskID is set by shard
+			VisibilityTimestamp: semaphoreInfo.AcquireDeadline,
+			Version:             semaphoreInfo.Version,
+		},
+		EventID:  semaphoreInfo.InitiatedID,
+		TaskList: executionInfo.TaskList,
+	})
+	return nil
+}
+
+// GenerateReleaseSemaphoreTasks adds the transfer task that frees the hold's token in Matching.
+// The task keeps the semaphore name, since the hold is deleted before the task runs.
+func (r *mutableStateTaskGeneratorImpl) GenerateReleaseSemaphoreTasks(
+	initiatedEventID int64,
+) error {
+
+	semaphoreInfo, ok := r.mutableState.GetSemaphoreInfo(initiatedEventID)
+	if !ok {
+		return &types.InternalServiceError{
+			Message: fmt.Sprintf("it could be a bug, cannot get pending semaphore hold: %v", initiatedEventID),
+		}
+	}
+
+	executionInfo := r.mutableState.GetExecutionInfo()
+	r.mutableState.AddTransferTasks(&persistence.ReleaseSemaphoreTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   executionInfo.DomainID,
+			WorkflowID: executionInfo.WorkflowID,
+			RunID:      executionInfo.RunID,
+		},
+		TaskData: persistence.TaskData{
+			// TaskID and VisibilityTimestamp are set by shard context
+			Version: semaphoreInfo.Version,
+		},
+		InitiatedID:   semaphoreInfo.InitiatedID,
+		SemaphoreName: semaphoreInfo.SemaphoreName,
+		TaskList:      executionInfo.TaskList,
 	})
 	return nil
 }
 
 func (r *mutableStateTaskGeneratorImpl) GenerateChildWorkflowTasks(
-	now time.Time,
-	event *shared.HistoryEvent,
+	event *types.HistoryEvent,
 ) error {
 
-	attr := event.StartChildWorkflowExecutionInitiatedEventAttributes
-	childWorkflowScheduleID := event.GetEventId()
-	childWorkflowTargetDomain := attr.GetDomain()
+	childWorkflowScheduleID := event.ID
 
 	childWorkflowInfo, ok := r.mutableState.GetChildExecutionInfo(childWorkflowScheduleID)
 	if !ok {
-		return &shared.InternalServiceError{
+		return &types.InternalServiceError{
 			Message: fmt.Sprintf("it could be a bug, cannot get pending child workflow: %v", childWorkflowScheduleID),
 		}
 	}
 
-	targetDomainID, err := r.getTargetDomainID(childWorkflowTargetDomain)
+	msbDomainID := r.mutableState.GetDomainEntry().GetInfo().ID
+
+	targetDomainID := childWorkflowInfo.DomainID
+	if childWorkflowInfo.DomainID == "" {
+		targetDomainID = msbDomainID
+	}
+
+	err := r.validateChildWorkflowParameters(msbDomainID, targetDomainID)
 	if err != nil {
 		return err
 	}
 
-	r.mutableState.AddTransferTasks(&persistence.StartChildExecutionTask{
-		// TaskID is set by shard
-		VisibilityTimestamp: now,
-		TargetDomainID:      targetDomainID,
-		TargetWorkflowID:    childWorkflowInfo.StartedWorkflowID,
-		InitiatedID:         childWorkflowInfo.InitiatedID,
-		Version:             childWorkflowInfo.Version,
-	})
+	executionInfo := r.mutableState.GetExecutionInfo()
+	startChildExecutionTask := &persistence.StartChildExecutionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   executionInfo.DomainID,
+			WorkflowID: executionInfo.WorkflowID,
+			RunID:      executionInfo.RunID,
+		},
+		TaskData: persistence.TaskData{
+			// TaskID and VisibilityTimestamp are set by shard context
+			Version: childWorkflowInfo.Version,
+		},
+		TargetDomainID:   targetDomainID,
+		TargetWorkflowID: childWorkflowInfo.StartedWorkflowID,
+		InitiatedID:      childWorkflowInfo.InitiatedID,
+		TaskList:         executionInfo.TaskList,
+	}
 
+	r.mutableState.AddTransferTasks(startChildExecutionTask)
 	return nil
 }
 
 func (r *mutableStateTaskGeneratorImpl) GenerateRequestCancelExternalTasks(
-	now time.Time,
-	event *shared.HistoryEvent,
+	event *types.HistoryEvent,
 ) error {
 
 	attr := event.RequestCancelExternalWorkflowExecutionInitiatedEventAttributes
-	scheduleID := event.GetEventId()
-	version := event.GetVersion()
+	scheduleID := event.ID
+	version := event.Version
 	targetDomainName := attr.GetDomain()
-	targetWorkflowID := attr.GetWorkflowExecution().GetWorkflowId()
-	targetRunID := attr.GetWorkflowExecution().GetRunId()
+	targetWorkflowID := attr.GetWorkflowExecution().GetWorkflowID()
+	targetRunID := attr.GetWorkflowExecution().GetRunID()
 	targetChildOnly := attr.GetChildWorkflowOnly()
 
 	_, ok := r.mutableState.GetRequestCancelInfo(scheduleID)
 	if !ok {
-		return &shared.InternalServiceError{
+		return &types.InternalServiceError{
 			Message: fmt.Sprintf("it could be a bug, cannot get pending request cancel external workflow: %v", scheduleID),
 		}
 	}
@@ -449,36 +634,45 @@ func (r *mutableStateTaskGeneratorImpl) GenerateRequestCancelExternalTasks(
 		return err
 	}
 
-	r.mutableState.AddTransferTasks(&persistence.CancelExecutionTask{
-		// TaskID is set by shard
-		VisibilityTimestamp:     now,
+	executionInfo := r.mutableState.GetExecutionInfo()
+	cancelExecutionTask := &persistence.CancelExecutionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   executionInfo.DomainID,
+			WorkflowID: executionInfo.WorkflowID,
+			RunID:      executionInfo.RunID,
+		},
+		TaskData: persistence.TaskData{
+			// TaskID and VisibilityTimestamp are set by shard context
+			Version: version,
+		},
 		TargetDomainID:          targetDomainID,
 		TargetWorkflowID:        targetWorkflowID,
 		TargetRunID:             targetRunID,
 		TargetChildWorkflowOnly: targetChildOnly,
 		InitiatedID:             scheduleID,
-		Version:                 version,
-	})
+		TaskList:                executionInfo.TaskList,
+	}
+
+	r.mutableState.AddTransferTasks(cancelExecutionTask)
 
 	return nil
 }
 
 func (r *mutableStateTaskGeneratorImpl) GenerateSignalExternalTasks(
-	now time.Time,
-	event *shared.HistoryEvent,
+	event *types.HistoryEvent,
 ) error {
 
 	attr := event.SignalExternalWorkflowExecutionInitiatedEventAttributes
-	scheduleID := event.GetEventId()
-	version := event.GetVersion()
+	scheduleID := event.ID
+	version := event.Version
 	targetDomainName := attr.GetDomain()
-	targetWorkflowID := attr.GetWorkflowExecution().GetWorkflowId()
-	targetRunID := attr.GetWorkflowExecution().GetRunId()
+	targetWorkflowID := attr.GetWorkflowExecution().GetWorkflowID()
+	targetRunID := attr.GetWorkflowExecution().GetRunID()
 	targetChildOnly := attr.GetChildWorkflowOnly()
 
 	_, ok := r.mutableState.GetSignalInfo(scheduleID)
 	if !ok {
-		return &shared.InternalServiceError{
+		return &types.InternalServiceError{
 			Message: fmt.Sprintf("it could be a bug, cannot get pending signal external workflow: %v", scheduleID),
 		}
 	}
@@ -488,86 +682,121 @@ func (r *mutableStateTaskGeneratorImpl) GenerateSignalExternalTasks(
 		return err
 	}
 
-	r.mutableState.AddTransferTasks(&persistence.SignalExecutionTask{
-		// TaskID is set by shard
-		VisibilityTimestamp:     now,
+	executionInfo := r.mutableState.GetExecutionInfo()
+	signalExecutionTask := &persistence.SignalExecutionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   executionInfo.DomainID,
+			WorkflowID: executionInfo.WorkflowID,
+			RunID:      executionInfo.RunID,
+		},
+		TaskData: persistence.TaskData{
+			// TaskID and VisibilityTimestamp are set by shard context
+			Version: version,
+		},
 		TargetDomainID:          targetDomainID,
 		TargetWorkflowID:        targetWorkflowID,
 		TargetRunID:             targetRunID,
 		TargetChildWorkflowOnly: targetChildOnly,
 		InitiatedID:             scheduleID,
-		Version:                 version,
-	})
+		TaskList:                executionInfo.TaskList,
+	}
+
+	r.mutableState.AddTransferTasks(signalExecutionTask)
 
 	return nil
 }
 
-func (r *mutableStateTaskGeneratorImpl) GenerateWorkflowSearchAttrTasks(
-	now time.Time,
-) error {
+func (r *mutableStateTaskGeneratorImpl) GenerateWorkflowSearchAttrTasks() error {
 
 	currentVersion := r.mutableState.GetCurrentVersion()
 
+	executionInfo := r.mutableState.GetExecutionInfo()
 	r.mutableState.AddTransferTasks(&persistence.UpsertWorkflowSearchAttributesTask{
-		// TaskID is set by shard
-		VisibilityTimestamp: now,
-		Version:             currentVersion, // task processing does not check this version
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   executionInfo.DomainID,
+			WorkflowID: executionInfo.WorkflowID,
+			RunID:      executionInfo.RunID,
+		},
+		TaskData: persistence.TaskData{
+			// TaskID and VisibilityTimestamp are set by shard context
+			Version: currentVersion, // task processing does not check this version
+		},
+		TaskList: executionInfo.TaskList,
 	})
 
 	return nil
 }
 
-func (r *mutableStateTaskGeneratorImpl) GenerateWorkflowResetTasks(
-	now time.Time,
-) error {
+func (r *mutableStateTaskGeneratorImpl) GenerateWorkflowResetTasks() error {
 
 	currentVersion := r.mutableState.GetCurrentVersion()
 
+	executionInfo := r.mutableState.GetExecutionInfo()
 	r.mutableState.AddTransferTasks(&persistence.ResetWorkflowTask{
-		// TaskID is set by shard
-		VisibilityTimestamp: now,
-		Version:             currentVersion,
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   executionInfo.DomainID,
+			WorkflowID: executionInfo.WorkflowID,
+			RunID:      executionInfo.RunID,
+		},
+		TaskData: persistence.TaskData{
+			// TaskID and VisibilityTimestamp are set by shard context
+			Version: currentVersion,
+		},
+		TaskList: executionInfo.TaskList,
 	})
 
 	return nil
 }
 
-func (r *mutableStateTaskGeneratorImpl) GenerateActivityTimerTasks(
-	now time.Time,
-) error {
+func (r *mutableStateTaskGeneratorImpl) GenerateActivityTimerTasks() error {
 
-	_, err := r.getTimerSequence(now).CreateNextActivityTimer()
+	_, err := NewTimerSequence(r.mutableState).CreateNextActivityTimer()
 	return err
 }
 
-func (r *mutableStateTaskGeneratorImpl) GenerateUserTimerTasks(
-	now time.Time,
-) error {
+func (r *mutableStateTaskGeneratorImpl) GenerateUserTimerTasks() error {
 
-	_, err := r.getTimerSequence(now).CreateNextUserTimer()
+	_, err := NewTimerSequence(r.mutableState).CreateNextUserTimer()
 	return err
-}
-
-func (r *mutableStateTaskGeneratorImpl) getTimerSequence(now time.Time) TimerSequence {
-	timeSource := clock.NewEventTimeSource()
-	timeSource.Update(now)
-	return NewTimerSequence(timeSource, r.mutableState)
 }
 
 func (r *mutableStateTaskGeneratorImpl) getTargetDomainID(
 	targetDomainName string,
 ) (string, error) {
-
-	targetDomainID := r.mutableState.GetExecutionInfo().DomainID
 	if targetDomainName != "" {
-		targetDomainEntry, err := r.domainCache.GetDomain(targetDomainName)
-		if err != nil {
-			return "", err
-		}
-		targetDomainID = targetDomainEntry.GetInfo().ID
+		return r.domainCache.GetDomainID(targetDomainName)
 	}
 
-	return targetDomainID, nil
+	return r.mutableState.GetExecutionInfo().DomainID, nil
+}
+
+func (r *mutableStateTaskGeneratorImpl) validateChildWorkflowParameters(msbDomainID string, targetDomainID string) error {
+	// standard case
+	if msbDomainID == targetDomainID {
+		return nil
+	}
+
+	thisDomain := r.mutableState.GetDomainEntry()
+	targetDomain, err := r.domainCache.GetDomainByID(targetDomainID)
+	if err != nil {
+		return fmt.Errorf("cannot get target domain for child workflow: %w", err)
+	}
+
+	// Generally, cross-domain calls are not allowed for launching child workflows in global domains due to
+	// the fact that we have removed cross-cluster calls (due to their overhead and limited use).
+	//
+	// There is a limited exception for local domains, which do not suffer from this problem can be
+	// handled as an exception where the transfer task may be picked up by another domain in-cluster
+	// without risk of the child workflow may end up in a different cluster.
+	if thisDomain.IsGlobalDomain() || targetDomain.IsGlobalDomain() {
+		return &types.BadRequestError{
+			Message: fmt.Sprintf("The child workflow is "+
+				"trying to use domain %s but it's running in domain %s. "+
+				"Cross-cluster and cross domain child workflows are not supported for global domains",
+				targetDomainID, msbDomainID),
+		}
+	}
+	return nil
 }
 
 func getNextDecisionTimeout(attempt int64, defaultStartToCloseTimeout time.Duration) time.Duration {

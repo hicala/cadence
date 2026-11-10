@@ -23,10 +23,11 @@ package persistence
 import (
 	"testing"
 
-	"github.com/uber/cadence/.gen/go/shared"
-	"github.com/uber/cadence/common"
-
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
+
+	"github.com/uber/cadence/common/constants"
+	"github.com/uber/cadence/common/types"
 )
 
 type (
@@ -62,7 +63,7 @@ func (s *versionHistorySuite) TestConversion() {
 		Items:       Items,
 	}, history)
 
-	s.Equal(history, NewVersionHistoryFromThrift(history.ToThrift()))
+	s.Equal(history, NewVersionHistoryFromInternalType(history.ToInternalType()))
 }
 
 func (s *versionHistorySuite) TestDuplicateUntilLCAItem_Success() {
@@ -124,22 +125,22 @@ func (s *versionHistorySuite) TestDuplicateUntilLCAItem_Failure() {
 	history := NewVersionHistory(BranchToken, Items)
 
 	_, err := history.DuplicateUntilLCAItem(NewVersionHistoryItem(4, 0))
-	s.IsType(&shared.BadRequestError{}, err)
+	s.IsType(&types.BadRequestError{}, err)
 
 	_, err = history.DuplicateUntilLCAItem(NewVersionHistoryItem(2, 1))
-	s.IsType(&shared.BadRequestError{}, err)
+	s.IsType(&types.BadRequestError{}, err)
 
 	_, err = history.DuplicateUntilLCAItem(NewVersionHistoryItem(5, 3))
-	s.IsType(&shared.BadRequestError{}, err)
+	s.IsType(&types.BadRequestError{}, err)
 
 	_, err = history.DuplicateUntilLCAItem(NewVersionHistoryItem(7, 5))
-	s.IsType(&shared.BadRequestError{}, err)
+	s.IsType(&types.BadRequestError{}, err)
 
 	_, err = history.DuplicateUntilLCAItem(NewVersionHistoryItem(4, 0))
-	s.IsType(&shared.BadRequestError{}, err)
+	s.IsType(&types.BadRequestError{}, err)
 
 	_, err = history.DuplicateUntilLCAItem(NewVersionHistoryItem(7, 4))
-	s.IsType(&shared.BadRequestError{}, err)
+	s.IsType(&types.BadRequestError{}, err)
 }
 
 func (s *versionHistorySuite) TestSetBranchToken() {
@@ -256,12 +257,12 @@ func (s *versionHistoriesSuite) TestContainsItem_True() {
 	}
 	history := NewVersionHistory(BranchToken, Items)
 
-	prevEventID := common.FirstEventID - 1
+	prevEventID := constants.FirstEventID - 1
 	for _, item := range Items {
-		for EventID := prevEventID + 1; EventID <= item.GetEventID(); EventID++ {
-			s.True(history.ContainsItem(NewVersionHistoryItem(EventID, item.GetVersion())))
+		for EventID := prevEventID + 1; EventID <= item.EventID; EventID++ {
+			s.True(history.ContainsItem(NewVersionHistoryItem(EventID, item.Version)))
 		}
-		prevEventID = item.GetEventID()
+		prevEventID = item.EventID
 	}
 }
 
@@ -413,7 +414,7 @@ func (s *versionHistorySuite) TestGetFirstItem_Failure() {
 	history := NewVersionHistory(BranchToken, []*VersionHistoryItem{})
 
 	_, err := history.GetFirstItem()
-	s.IsType(&shared.BadRequestError{}, err)
+	s.IsType(&types.BadRequestError{}, err)
 }
 
 func (s *versionHistorySuite) TestGetLastItem_Success() {
@@ -447,7 +448,7 @@ func (s *versionHistorySuite) TestGetLastItem_Failure() {
 	history := NewVersionHistory(BranchToken, []*VersionHistoryItem{})
 
 	_, err := history.GetLastItem()
-	s.IsType(&shared.BadRequestError{}, err)
+	s.IsType(&types.BadRequestError{}, err)
 }
 
 func (s *versionHistoriesSuite) TestGetVersion_Success() {
@@ -459,30 +460,30 @@ func (s *versionHistoriesSuite) TestGetVersion_Success() {
 
 	Version, err := history.GetEventVersion(1)
 	s.NoError(err)
-	s.Equal(item1.GetVersion(), Version)
+	s.Equal(item1.Version, Version)
 	Version, err = history.GetEventVersion(2)
 	s.NoError(err)
-	s.Equal(item1.GetVersion(), Version)
+	s.Equal(item1.Version, Version)
 	Version, err = history.GetEventVersion(3)
 	s.NoError(err)
-	s.Equal(item1.GetVersion(), Version)
+	s.Equal(item1.Version, Version)
 
 	Version, err = history.GetEventVersion(4)
 	s.NoError(err)
-	s.Equal(item2.GetVersion(), Version)
+	s.Equal(item2.Version, Version)
 	Version, err = history.GetEventVersion(5)
 	s.NoError(err)
-	s.Equal(item2.GetVersion(), Version)
+	s.Equal(item2.Version, Version)
 	Version, err = history.GetEventVersion(6)
 	s.NoError(err)
-	s.Equal(item2.GetVersion(), Version)
+	s.Equal(item2.Version, Version)
 
 	Version, err = history.GetEventVersion(7)
 	s.NoError(err)
-	s.Equal(item3.GetVersion(), Version)
+	s.Equal(item3.Version, Version)
 	Version, err = history.GetEventVersion(8)
 	s.NoError(err)
-	s.Equal(item3.GetVersion(), Version)
+	s.Equal(item3.Version, Version)
 }
 
 func (s *versionHistoriesSuite) TestGetVersion_Failure() {
@@ -537,7 +538,7 @@ func (s *versionHistoriesSuite) TestConversion() {
 		Histories:                  []*VersionHistory{versionHistory},
 	}, histories)
 
-	s.Equal(histories, NewVersionHistoriesFromThrift(histories.ToThrift()))
+	s.Equal(histories, NewVersionHistoriesFromInternalType(histories.ToInternalType()))
 }
 
 func (s *versionHistoriesSuite) TestAddGetVersionHistory() {
@@ -633,7 +634,7 @@ func (s *versionHistoriesSuite) TestFindLCAVersionHistoryIndexAndItem_SameEventI
 	s.Equal(NewVersionHistoryItem(7, 6), item)
 }
 
-func (s *versionHistoriesSuite) TestFindFirstVersionHistoryIndexByItem() {
+func (s *versionHistoriesSuite) TestFindFirstVersionHistoryByItem() {
 	versionHistory1 := NewVersionHistory([]byte("branch token 1"), []*VersionHistoryItem{
 		{EventID: 3, Version: 0},
 		{EventID: 5, Version: 4},
@@ -650,15 +651,17 @@ func (s *versionHistoriesSuite) TestFindFirstVersionHistoryIndexByItem() {
 	_, _, err := histories.AddVersionHistory(versionHistory2)
 	s.Nil(err)
 
-	index, err := histories.FindFirstVersionHistoryIndexByItem(NewVersionHistoryItem(8, 10))
+	index, history, err := histories.FindFirstVersionHistoryByItem(NewVersionHistoryItem(8, 10))
 	s.NoError(err)
 	s.Equal(1, index)
+	s.Equal(versionHistory2, history)
 
-	index, err = histories.FindFirstVersionHistoryIndexByItem(NewVersionHistoryItem(4, 4))
+	index, history, err = histories.FindFirstVersionHistoryByItem(NewVersionHistoryItem(4, 4))
 	s.NoError(err)
 	s.Equal(0, index)
+	s.Equal(versionHistory1, history)
 
-	_, err = histories.FindFirstVersionHistoryIndexByItem(NewVersionHistoryItem(41, 4))
+	_, _, err = histories.FindFirstVersionHistoryByItem(NewVersionHistoryItem(41, 4))
 	s.Error(err)
 }
 
@@ -700,4 +703,13 @@ func (s *versionHistoriesSuite) TestCurrentVersionHistoryIndexIsInReplay() {
 	isInReplay, err = histories.IsRebuilt()
 	s.NoError(err)
 	s.False(isInReplay)
+}
+
+func TestNilHandling(t *testing.T) {
+	assert.Nil(t, NewVersionHistoriesFromInternalType(nil))
+	assert.Nil(t, NewVersionHistories(nil))
+	assert.Nil(t, NewVersionHistoryItemFromInternalType(nil))
+	assert.Nil(t, NewVersionHistoryFromInternalType(nil))
+	var vh *VersionHistory
+	assert.Nil(t, vh.ToInternalType())
 }

@@ -21,25 +21,30 @@
 package domain
 
 import (
+	"errors"
 	"log"
 	"os"
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
 	"github.com/pborman/uuid"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"github.com/uber-go/tally"
+	"go.uber.org/mock/gomock"
 
+	"github.com/uber/cadence/client/history"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/cache"
 	"github.com/uber/cadence/common/clock"
+	"github.com/uber/cadence/common/cluster"
+	"github.com/uber/cadence/common/dynamicconfig/dynamicproperties"
+	"github.com/uber/cadence/common/log/testlogger"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/mocks"
 	"github.com/uber/cadence/common/persistence"
-	"github.com/uber/cadence/common/resource"
-	"github.com/uber/cadence/common/service/dynamicconfig"
+	"github.com/uber/cadence/common/types"
 )
 
 type (
@@ -49,11 +54,11 @@ type (
 		*require.Assertions
 		controller *gomock.Controller
 
-		mockResource    *resource.Test
-		mockDomainCache *cache.MockDomainCache
-		timeSource      clock.TimeSource
-		mockMetadataMgr *mocks.MetadataManager
-		watcher         *failoverWatcherImpl
+		mockDomainCache   *cache.MockDomainCache
+		mockHistoryClient *history.MockClient
+		timeSource        clock.TimeSource
+		mockMetadataMgr   *mocks.MetadataManager
+		watcher           *failoverWatcherImpl
 	}
 )
 
@@ -75,29 +80,33 @@ func (s *failoverWatcherSuite) SetupTest() {
 	s.Assertions = require.New(s.T())
 	s.controller = gomock.NewController(s.T())
 
-	s.mockResource = resource.NewTest(s.controller, metrics.DomainFailoverScope)
-	s.mockDomainCache = s.mockResource.DomainCache
-	s.timeSource = s.mockResource.GetTimeSource()
-	s.mockMetadataMgr = s.mockResource.MetadataMgr
+	s.mockDomainCache = cache.NewMockDomainCache(s.controller)
+	s.mockHistoryClient = history.NewMockClient(s.controller)
+	s.timeSource = clock.NewMockedTimeSource()
+	s.mockMetadataMgr = &mocks.MetadataManager{}
 
 	s.mockMetadataMgr.On("GetMetadata", mock.Anything).Return(&persistence.GetMetadataResponse{
 		NotificationVersion: 1,
 	}, nil)
 
+	logger := testlogger.New(s.T())
+	scope := tally.NewTestScope("failover_test", nil)
+	metricsClient := metrics.NewClient(scope, metrics.Frontend, metrics.MigrationConfig{})
 	s.watcher = NewFailoverWatcher(
 		s.mockDomainCache,
 		s.mockMetadataMgr,
+		cluster.GetTestClusterMetadata(true),
+		s.mockHistoryClient,
 		s.timeSource,
-		dynamicconfig.GetDurationPropertyFn(10*time.Second),
-		dynamicconfig.GetFloatPropertyFn(0.2),
-		s.mockResource.GetMetricsClient(),
-		s.mockResource.GetLogger(),
+		dynamicproperties.GetDurationPropertyFn(10*time.Second),
+		dynamicproperties.GetFloatPropertyFn(0.2),
+		metricsClient,
+		logger,
 	).(*failoverWatcherImpl)
 }
 
 func (s *failoverWatcherSuite) TearDownTest() {
 	s.controller.Finish()
-	s.mockResource.Finish(s.T())
 	s.watcher.Stop()
 }
 
@@ -118,9 +127,7 @@ func (s *failoverWatcherSuite) TestCleanPendingActiveState() {
 	replicationConfig := &persistence.DomainReplicationConfig{
 		ActiveClusterName: "active",
 		Clusters: []*persistence.ClusterReplicationConfig{
-			{
-				"active",
-			},
+			{ClusterName: "active"},
 		},
 	}
 
@@ -139,8 +146,9 @@ func (s *failoverWatcherSuite) TestCleanPendingActiveState() {
 	}, nil).Times(1)
 
 	// does not have failover end time
-	err := CleanPendingActiveState(s.mockMetadataMgr, domainName, 1, s.watcher.retryPolicy)
+	updated, err := CleanPendingActiveState(s.mockMetadataMgr, domainName, 1, s.watcher.retryPolicy)
 	s.NoError(err)
+	s.False(updated, "no failover end time → no update")
 
 	s.mockMetadataMgr.On("GetDomain", mock.Anything, &persistence.GetDomainRequest{
 		ID: domainName,
@@ -157,8 +165,9 @@ func (s *failoverWatcherSuite) TestCleanPendingActiveState() {
 	}, nil).Times(1)
 
 	// does not match failover versions
-	err = CleanPendingActiveState(s.mockMetadataMgr, domainName, 5, s.watcher.retryPolicy)
+	updated, err = CleanPendingActiveState(s.mockMetadataMgr, domainName, 5, s.watcher.retryPolicy)
 	s.NoError(err)
+	s.False(updated, "failover version mismatch → no update")
 
 	s.mockMetadataMgr.On("UpdateDomain", mock.Anything, &persistence.UpdateDomainRequest{
 		Info:                        info,
@@ -184,8 +193,9 @@ func (s *failoverWatcherSuite) TestCleanPendingActiveState() {
 		NotificationVersion:         1,
 	}, nil).Times(1)
 
-	err = CleanPendingActiveState(s.mockMetadataMgr, domainName, 2, s.watcher.retryPolicy)
+	updated, err = CleanPendingActiveState(s.mockMetadataMgr, domainName, 2, s.watcher.retryPolicy)
 	s.NoError(err)
+	s.True(updated, "happy path actually updates the domain")
 }
 
 func (s *failoverWatcherSuite) TestHandleFailoverTimeout() {
@@ -205,9 +215,7 @@ func (s *failoverWatcherSuite) TestHandleFailoverTimeout() {
 	replicationConfig := &persistence.DomainReplicationConfig{
 		ActiveClusterName: "active",
 		Clusters: []*persistence.ClusterReplicationConfig{
-			{
-				"active",
-			},
+			{ClusterName: "active"},
 		},
 	}
 	endtime := common.Int64Ptr(s.timeSource.Now().UnixNano() - 1)
@@ -236,6 +244,13 @@ func (s *failoverWatcherSuite) TestHandleFailoverTimeout() {
 		NotificationVersion:         1,
 	}).Return(nil).Times(1)
 
+	s.mockHistoryClient.EXPECT().GetFailoverInfo(gomock.Any(), &types.GetFailoverInfoRequest{
+		DomainID: domainName,
+	}).Return(&types.GetFailoverInfoResponse{
+		CompletedShardCount: 1,
+		PendingShards:       []int32{1},
+	}, nil).Times(1)
+
 	domainEntry := cache.NewDomainCacheEntryForTest(
 		info,
 		domainConfig,
@@ -243,7 +258,86 @@ func (s *failoverWatcherSuite) TestHandleFailoverTimeout() {
 		replicationConfig,
 		1,
 		endtime,
-		nil,
+		0, 0, 0,
 	)
 	s.watcher.handleFailoverTimeout(domainEntry)
+}
+
+func (s *failoverWatcherSuite) TestStart() {
+	s.Assertions.Equal(common.DaemonStatusInitialized, s.watcher.status)
+	s.watcher.Start()
+	s.Assertions.Equal(common.DaemonStatusStarted, s.watcher.status)
+
+	// Verify that calling Start again does not change the status
+	s.watcher.Start()
+	s.Assertions.Equal(common.DaemonStatusStarted, s.watcher.status)
+	s.watcher.Stop()
+}
+
+func (s *failoverWatcherSuite) TestIsUpdateDomainRetryable() {
+	testCases := []struct {
+		name      string
+		inputErr  error
+		wantRetry bool
+	}{
+		{"nil error", nil, true},
+		{"non-nil error", errors.New("some error"), true},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			retry := isUpdateDomainRetryable(tc.inputErr)
+			s.Equal(tc.wantRetry, retry)
+		})
+	}
+}
+
+func (s *failoverWatcherSuite) TestRefreshDomainLoop() {
+
+	domainName := "testDomain"
+	domainID := uuid.New()
+	failoverEndTime := common.Int64Ptr(time.Now().Add(-time.Hour).UnixNano()) // 1 hour in the past
+	mockTimeSource, _ := s.timeSource.(clock.MockedTimeSource)
+
+	domainInfo := &persistence.DomainInfo{ID: domainID, Name: domainName}
+	domainConfig := &persistence.DomainConfig{Retention: 1, EmitMetric: true}
+	replicationConfig := &persistence.DomainReplicationConfig{ActiveClusterName: "active", Clusters: []*persistence.ClusterReplicationConfig{{ClusterName: "active"}}}
+	domainEntry := cache.NewDomainCacheEntryForTest(domainInfo, domainConfig, true, replicationConfig, 1, failoverEndTime, 0, 0, 0)
+
+	domainsMap := map[string]*cache.DomainCacheEntry{domainID: domainEntry}
+	s.mockDomainCache.EXPECT().GetAllDomain().Return(domainsMap).AnyTimes()
+
+	s.mockMetadataMgr.On("GetMetadata", mock.Anything).Return(&persistence.GetMetadataResponse{NotificationVersion: 1}, nil).Maybe()
+
+	s.mockMetadataMgr.On("GetDomain", mock.Anything, mock.AnythingOfType("*persistence.GetDomainRequest")).Return(&persistence.GetDomainResponse{
+		Info:                        domainInfo,
+		Config:                      domainConfig,
+		ReplicationConfig:           replicationConfig,
+		IsGlobalDomain:              true,
+		ConfigVersion:               1,
+		FailoverVersion:             1,
+		FailoverNotificationVersion: 1,
+		FailoverEndTime:             failoverEndTime,
+		NotificationVersion:         1,
+	}, nil).Once()
+
+	s.mockMetadataMgr.On("UpdateDomain", mock.Anything, mock.Anything).Return(nil).Once()
+
+	s.mockHistoryClient.EXPECT().GetFailoverInfo(gomock.Any(), gomock.Any()).Return(&types.GetFailoverInfoResponse{
+		CompletedShardCount: 0,
+		PendingShards:       []int32{0, 1},
+	}, nil).AnyTimes()
+
+	s.watcher.Start()
+
+	// Delay to allow loop to start
+	time.Sleep(1 * time.Second)
+	mockTimeSource.Advance(12 * time.Second)
+	// Now stop the watcher, which should trigger the shutdown case in refreshDomainLoop
+	s.watcher.Stop()
+
+	// Enough time for shutdown process to complete
+	time.Sleep(1 * time.Second)
+
+	s.mockMetadataMgr.AssertExpectations(s.T())
 }

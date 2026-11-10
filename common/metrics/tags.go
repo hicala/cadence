@@ -20,174 +20,191 @@
 
 package metrics
 
+import (
+	"regexp"
+	"strconv"
+)
+
 const (
-	revisionTag     = "revision"
-	branchTag       = "branch"
-	buildDateTag    = "build_date"
-	buildVersionTag = "build_version"
-	goVersionTag    = "go_version"
+	revisionTag       = "revision"
+	branchTag         = "branch"
+	buildDateTag      = "build_date"
+	buildVersionTag   = "build_version"
+	goVersionTag      = "go_version"
+	cadenceVersionTag = "cadence_version"
 
-	instance      = "instance"
-	domain        = "domain"
-	targetCluster = "target_cluster"
-	activeCluster = "active_cluster"
-	taskList      = "tasklist"
-	workflowType  = "workflowType"
-	activityType  = "activityType"
-	decisionType  = "decisionType"
-	invariantType = "invariantType"
+	instance                  = "instance"
+	domain                    = "domain"
+	domainType                = "domain_type"
+	clusterGroup              = "cluster_group"
+	sourceCluster             = "source_cluster"
+	targetCluster             = "target_cluster"
+	activeCluster             = "active_cluster"
+	isActiveActiveDomain      = "is_active_active_domain"
+	taskList                  = "tasklist"
+	taskListType              = "tasklistType"
+	taskListRootPartition     = "tasklist_root_partition"
+	semaphoreName             = "semaphore"
+	workflowType              = "workflowType"
+	activityType              = "activityType"
+	decisionType              = "decisionType"
+	invariantType             = "invariantType"
+	shardScannerScanResult    = "shardscanner_scan_result"
+	shardScannerFixResult     = "shardscanner_fix_result"
+	kafkaPartition            = "kafkaPartition"
+	transport                 = "transport"
+	caller                    = "caller"
+	service                   = "service"
+	destService               = "dest_service"
+	signalName                = "signalName"
+	workflowVersion           = "workflow_version"
+	shardID                   = "shard_id"
+	matchingHost              = "matching_host"
+	host                      = "host"
+	pollerIsolationGroup      = "poller_isolation_group"
+	asyncWFRequestType        = "async_wf_request_type"
+	workflowTerminationReason = "workflow_termination_reason"
+	workflowCloseStatus       = "workflow_close_status"
+	corruptionType            = "corruption_type"
+	isolationEnabled          = "isolation_enabled"
+	isolationGroup            = "isolation_group"
+	leakCause                 = "leak_cause"
+	topic                     = "topic"
+	mode                      = "mode"
+	isRetry                   = "is_retry"
+	queryConsistencyLevel     = "query_consistency_level"
+	budgetManagerName         = "budget_manager_name"
+	routingPath               = "routing_path"
 
-	domainAllValue = "all"
-	unknownValue   = "_unknown_"
+	// limiter-side tags
+	globalRatelimitKey            = "global_ratelimit_key"
+	globalRatelimitType           = "global_ratelimit_type"
+	globalRatelimitIsPrimary      = "is_primary"
+	globalRatelimitCollectionName = "global_ratelimit_collection"
+
+	// scheduler-specific tags
+	overlapPolicy = "overlap_policy"
+	triggerSource = "trigger_source"
+
+	allValue     = "all"
+	unknownValue = "_unknown_"
+)
+
+var (
+	safeAlphaNumericStringRE = regexp.MustCompile(`[^a-zA-Z0-9]`)
 )
 
 // Tag is an interface to define metrics tags
-type Tag interface {
-	Key() string
-	Value() string
-}
-
 type (
-	domainTag struct {
-		value string
+	Tag interface {
+		Key() string
+		Value() string
 	}
 
-	domainUnknownTag struct{}
-
-	taskListUnknownTag struct{}
-
-	instanceTag struct {
-		value string
-	}
-
-	targetClusterTag struct {
-		value string
-	}
-
-	activeClusterTag struct {
-		value string
-	}
-
-	taskListTag struct {
-		value string
-	}
-
-	workflowTypeTag struct {
-		value string
-	}
-
-	activityTypeTag struct {
-		value string
-	}
-
-	decisionTypeTag struct {
-		value string
-	}
-
-	invariantTypeTag struct {
+	simpleMetric struct {
+		key   string
 		value string
 	}
 )
+
+func (s simpleMetric) Key() string   { return s.key }
+func (s simpleMetric) Value() string { return s.value }
+
+func metricWithUnknown(key, value string) Tag {
+	if len(value) == 0 {
+		value = unknownValue
+	}
+	return simpleMetric{key: key, value: value}
+}
+
+func ShardIDTag(shardIDVal int) Tag {
+	return metricWithUnknown(shardID, strconv.Itoa(shardIDVal))
+}
+
+// NonShardTag is used for metrics that need a stable shard_id label but are not scoped to a real shard.
+func NonShardTag() Tag {
+	return ShardIDTag(-1)
+}
+
+// CacheTypeTag returns a tag for cache metric category.
+func CacheTypeTag(value string) Tag {
+	return metricWithUnknown(CacheTypeTagName, value)
+}
+
+// WithCacheScopeLabels returns a scope tagged with the cache metric labels required for consistent Prometheus registration.
+func WithCacheScopeLabels(scope Scope, shardTag Tag, sourceClusterVal string, cacheTypeVal string) Scope {
+	return scope.Tagged(
+		CacheTypeTag(cacheTypeVal),
+		SourceClusterTag(sourceClusterVal),
+		shardTag,
+	)
+}
 
 // DomainTag returns a new domain tag. For timers, this also ensures that we
 // dual emit the metric with the all tag. If a blank domain is provided then
 // this converts that to an unknown domain.
 func DomainTag(value string) Tag {
-	if len(value) == 0 {
-		value = unknownValue
+	return metricWithUnknown(domain, value)
+}
+
+// NonDomainTag is used for metrics that need a stable domain label but are not scoped to a real domain.
+func NonDomainTag() Tag {
+	return DomainTag("-1")
+}
+
+// DomainTypeTag returns a tag for domain type.
+// This allows differentiating between global/local domains.
+func DomainTypeTag(isGlobal bool) Tag {
+	var value string
+	if isGlobal {
+		value = "global"
+	} else {
+		value = "local"
 	}
-	return domainTag{value}
-}
-
-// Key returns the key of the domain tag
-func (d domainTag) Key() string {
-	return domain
-}
-
-// Value returns the value of a domain tag
-func (d domainTag) Value() string {
-	return d.value
+	return simpleMetric{key: domainType, value: value}
 }
 
 // DomainUnknownTag returns a new domain:unknown tag-value
 func DomainUnknownTag() Tag {
-	return domainUnknownTag{}
+	return DomainTag("")
 }
 
-// Key returns the key of the domain unknown tag
-func (d taskListUnknownTag) Key() string {
-	return domain
-}
-
-// Value returns the value of the domain unknown tag
-func (d taskListUnknownTag) Value() string {
-	return unknownValue
-}
-
-// TaskListUnknownTag returns a new tasklist:unknown tag-value
-func TaskListUnknownTag() Tag {
-	return taskListUnknownTag{}
-}
-
-// Key returns the key of the domain unknown tag
-func (d domainUnknownTag) Key() string {
-	return domain
-}
-
-// Value returns the value of the domain unknown tag
-func (d domainUnknownTag) Value() string {
-	return unknownValue
+// ClusterGroupTag return a new cluster group tag
+func ClusterGroupTag(value string) Tag {
+	return simpleMetric{key: clusterGroup, value: value}
 }
 
 // InstanceTag returns a new instance tag
 func InstanceTag(value string) Tag {
-	return instanceTag{value}
+	return simpleMetric{key: instance, value: value}
 }
 
-// Key returns the key of the instance tag
-func (i instanceTag) Key() string {
-	return instance
-}
-
-// Value returns the value of a instance tag
-func (i instanceTag) Value() string {
-	return i.value
+// SourceClusterTag returns a new source cluster tag.
+func SourceClusterTag(value string) Tag {
+	return metricWithUnknown(sourceCluster, value)
 }
 
 // TargetClusterTag returns a new target cluster tag.
 func TargetClusterTag(value string) Tag {
-	if len(value) == 0 {
-		value = unknownValue
-	}
-	return targetClusterTag{value}
-}
-
-// Key returns the key of the target cluster tag
-func (d targetClusterTag) Key() string {
-	return targetCluster
-}
-
-// Key returns the key of the active cluster tag
-func (ac activeClusterTag) Key() string {
-	return activeCluster
-}
-
-// Value returns the value of the active cluster tag
-func (ac activeClusterTag) Value() string {
-	return ac.value
+	return metricWithUnknown(targetCluster, value)
 }
 
 // ActiveClusterTag returns a new active cluster type tag.
 func ActiveClusterTag(value string) Tag {
+	return metricWithUnknown(activeCluster, value)
+}
+
+// IsActiveActiveDomainTag returns a new is active active domain tag.
+func IsActiveActiveDomainTag(value bool) Tag {
+	return simpleMetric{key: isActiveActiveDomain, value: strconv.FormatBool(value)}
+}
+
+// SemaphoreNameTag returns a new semaphore tag.
+func SemaphoreNameTag(value string) Tag {
 	if len(value) == 0 {
 		value = unknownValue
 	}
-	return activeClusterTag{value}
-}
-
-// Value returns the value of a target cluster tag
-func (d targetClusterTag) Value() string {
-	return d.value
+	return simpleMetric{key: semaphoreName, value: sanitizer.Value(value)}
 }
 
 // TaskListTag returns a new task list tag.
@@ -195,87 +212,232 @@ func TaskListTag(value string) Tag {
 	if len(value) == 0 {
 		value = unknownValue
 	}
-	return taskListTag{sanitizer.Value(value)}
+	return simpleMetric{key: taskList, value: sanitizer.Value(value)}
 }
 
-// Key returns the key of the task list tag
-func (d taskListTag) Key() string {
-	return taskList
+// TaskListUnknownTag returns a new tasklist:unknown tag-value
+func TaskListUnknownTag() Tag {
+	return simpleMetric{key: taskList, value: unknownValue}
 }
 
-// Value returns the value of the task list tag
-func (d taskListTag) Value() string {
-	return d.value
+// TaskListTypeTag returns a new task list type tag.
+func TaskListTypeTag(value string) Tag {
+	return metricWithUnknown(taskListType, value)
+}
+
+// TaskListRootPartition returns a new task list root partition tag.
+func TaskListRootPartitionTag(value string) Tag {
+	if len(value) == 0 {
+		value = unknownValue
+	}
+	return simpleMetric{key: taskListRootPartition, value: sanitizer.Value(value)}
 }
 
 // WorkflowTypeTag returns a new workflow type tag.
 func WorkflowTypeTag(value string) Tag {
-	if len(value) == 0 {
-		value = unknownValue
-	}
-	return workflowTypeTag{value}
-}
-
-// Key returns the key of the workflow type tag
-func (d workflowTypeTag) Key() string {
-	return workflowType
-}
-
-// Value returns the value of the workflow type tag
-func (d workflowTypeTag) Value() string {
-	return d.value
+	return metricWithUnknown(workflowType, value)
 }
 
 // ActivityTypeTag returns a new activity type tag.
 func ActivityTypeTag(value string) Tag {
-	if len(value) == 0 {
-		value = unknownValue
-	}
-	return activityTypeTag{value}
-}
-
-// Key returns the key of the activity type tag
-func (d activityTypeTag) Key() string {
-	return activityType
-}
-
-// Value returns the value of the activity type tag
-func (d activityTypeTag) Value() string {
-	return d.value
+	return metricWithUnknown(activityType, value)
 }
 
 // DecisionTypeTag returns a new decision type tag.
 func DecisionTypeTag(value string) Tag {
-	if len(value) == 0 {
-		value = unknownValue
-	}
-	return decisionTypeTag{value}
+	return metricWithUnknown(decisionType, value)
 }
 
-// Key returns the key of the decision type tag
-func (d decisionTypeTag) Key() string {
-	return decisionType
+// ShardScannerScanResult returns a new shardscanner scan result type tag.
+func ShardScannerScanResult(value string) Tag {
+	return metricWithUnknown(shardScannerScanResult, value)
 }
 
-// Value returns the value of the decision type tag
-func (d decisionTypeTag) Value() string {
-	return d.value
+// ShardScannerFixResult returns a new shardscanner fix result type tag.
+func ShardScannerFixResult(value string) Tag {
+	return metricWithUnknown(shardScannerFixResult, value)
 }
 
 // InvariantTypeTag returns a new invariant type tag.
 func InvariantTypeTag(value string) Tag {
-	if len(value) == 0 {
-		value = unknownValue
-	}
-	return invariantTypeTag{value}
+	return metricWithUnknown(invariantType, value)
 }
 
-// Key returns the key of invariant type tag
-func (d invariantTypeTag) Key() string {
-	return invariantType
+// KafkaPartitionTag returns a new KafkaPartition type tag.
+func KafkaPartitionTag(value int32) Tag {
+	return simpleMetric{key: kafkaPartition, value: strconv.Itoa(int(value))}
 }
 
-// Value returns the value of invariant type tag
-func (d invariantTypeTag) Value() string {
-	return d.value
+// TransportTag returns a new RPC Transport type tag.
+func TransportTag(value string) Tag {
+	return simpleMetric{key: transport, value: value}
+}
+
+// CallerTag returns a new RPC Caller type tag.
+func CallerTag(value string) Tag {
+	return simpleMetric{key: caller, value: value}
+}
+
+// ServiceTag returns a new service tag.
+func ServiceTag(value string) Tag {
+	return simpleMetric{key: service, value: value}
+}
+
+// DestServiceTag returns a new destination service tag.
+func DestServiceTag(value string) Tag {
+	return simpleMetric{key: destService, value: value}
+}
+
+// Hosttag emits the host identifier
+func HostTag(value string) Tag {
+	return metricWithUnknown(host, value)
+}
+
+// SignalNameTag returns a new SignalName tag
+func SignalNameTag(value string) Tag {
+	return metricWithUnknown(signalName, value)
+}
+
+// SignalNameAllTag returns a new SignalName tag with all value
+func SignalNameAllTag() Tag {
+	return metricWithUnknown(signalName, allValue)
+}
+
+// WorkflowVersionTag returns a new WorkflowVersion tag
+func WorkflowVersionTag(value string) Tag {
+	return metricWithUnknown(workflowVersion, value)
+}
+
+func MatchingHostTag(value string) Tag {
+	return metricWithUnknown(matchingHost, value)
+}
+
+// PollerIsolationGroupTag returns a new PollerIsolationGroup tag
+func PollerIsolationGroupTag(value string) Tag {
+	return metricWithUnknown(pollerIsolationGroup, value)
+}
+
+// AsyncWFRequestTypeTag returns a new AsyncWFRequestTypeTag tag
+func AsyncWFRequestTypeTag(value string) Tag {
+	return metricWithUnknown(asyncWFRequestType, value)
+}
+
+// GlobalRatelimiterKeyTag reports the local ratelimit key being used, e.g. "domain-x".
+// This will likely be ambiguous if it is not combined with the collection name,
+// but keeping this untouched helps keep the values template-friendly and correlate-able
+// in metrics dashboards and queries.
+func GlobalRatelimiterKeyTag(value string) Tag {
+	return simpleMetric{key: globalRatelimitKey, value: value}
+}
+
+// GlobalRatelimiterTypeTag reports the "limit usage type" being reported, e.g. global vs local
+func GlobalRatelimiterTypeTag(value string) Tag {
+	return simpleMetric{key: globalRatelimitType, value: value}
+}
+
+func GlobalRatelimiterIsPrimary(isPrimary bool) Tag {
+	return simpleMetric{key: globalRatelimitIsPrimary, value: strconv.FormatBool(isPrimary)}
+}
+
+// GlobalRatelimiterCollectionName is a namespacing tag to uniquely identify metrics
+// coming from the different ratelimiter collections (user, worker, visibility, async).
+func GlobalRatelimiterCollectionName(value string) Tag {
+	return simpleMetric{key: globalRatelimitCollectionName, value: value}
+}
+
+// WorkflowTerminationReasonTag reports the reason for workflow termination
+func WorkflowTerminationReasonTag(value string) Tag {
+	value = safeAlphaNumericStringRE.ReplaceAllString(value, "_")
+	return simpleMetric{key: workflowTerminationReason, value: value}
+}
+
+// WorkflowCloseStatusTag is a stringified workflow status
+func WorkflowCloseStatusTag(value string) Tag {
+	value = safeAlphaNumericStringRE.ReplaceAllString(value, "_")
+	return simpleMetric{key: workflowCloseStatus, value: value}
+}
+
+// CorruptionTypeTag reports the type of corruption detected
+func CorruptionTypeTag(value string) Tag {
+	return simpleMetric{key: corruptionType, value: value}
+}
+
+func IsolationGroupTag(group string) Tag {
+	return simpleMetric{key: isolationGroup, value: sanitizer.Value(group)}
+}
+
+func IsolationLeakCause(cause string) Tag {
+	return simpleMetric{key: leakCause, value: sanitizer.Value(cause)}
+}
+
+// IsolationEnabledTag returns whether isolation is enabled
+func IsolationEnabledTag(enabled bool) Tag {
+	return simpleMetric{key: isolationEnabled, value: strconv.FormatBool(enabled)}
+}
+
+func TopicTag(value string) Tag {
+	return metricWithUnknown(topic, value)
+}
+
+func ModeTag(value string) Tag {
+	return metricWithUnknown(mode, value)
+}
+
+// IsRetryTag returns a new is_retry tag.
+func IsRetryTag(retry bool) Tag {
+	return simpleMetric{key: isRetry, value: strconv.FormatBool(retry)}
+}
+
+func TaskCategoryTag(category string) Tag {
+	return metricWithUnknown("task_category", category)
+}
+
+// ReasonTag returns a new reason tag
+func ReasonTag(reason string) Tag {
+	return metricWithUnknown("reason", reason)
+}
+
+// Range returns a tag for a generic named range/bucket category.
+func Range(value string) Tag {
+	return metricWithUnknown("range", value)
+}
+
+// StatusTag returns a new status tag.
+func StatusTag(value string) Tag {
+	return metricWithUnknown("status", value)
+}
+
+// DecisionTag returns a new decision tag
+func DecisionTag(decision string) Tag {
+	return metricWithUnknown("decision", decision)
+}
+
+// ActiveClusterLookupFnTag returns a new active cluster lookup function tag.
+func ActiveClusterLookupFnTag(fn string) Tag {
+	return metricWithUnknown("fn", fn)
+}
+
+// OverlapPolicyTag returns a new overlap_policy tag for scheduler metrics.
+func OverlapPolicyTag(value string) Tag {
+	return metricWithUnknown(overlapPolicy, value)
+}
+
+// TriggerSourceTag returns a new trigger_source tag for scheduler metrics.
+func TriggerSourceTag(value string) Tag {
+	return metricWithUnknown(triggerSource, value)
+}
+
+// RoutingPathTag returns a tag identifying the backend selected for routing.
+func RoutingPathTag(value string) Tag {
+	return metricWithUnknown(routingPath, value)
+}
+
+// QueryConsistencyLevelTag returns a new query consistency level tag.
+func QueryConsistencyLevelTag(level string) Tag {
+	return metricWithUnknown(queryConsistencyLevel, level)
+}
+
+// BudgetManagerNameTag returns a new budget manager name tag.
+func BudgetManagerNameTag(name string) Tag {
+	return metricWithUnknown(budgetManagerName, name)
 }

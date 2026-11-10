@@ -29,6 +29,8 @@ import (
 	"github.com/uber/cadence/common/metrics"
 )
 
+//go:generate mockgen -package=$GOPACKAGE -destination=pump_mock.go -self_package=github.com/uber/cadence/service/worker/archiver github.com/uber/cadence/service/worker/archiver Pump
+
 type (
 	// Pump pumps archival requests into request channel
 	Pump interface {
@@ -82,7 +84,13 @@ func NewPump(
 // Returns a PumpResult which contains a summary of what was pumped.
 // Upon returning request channel is closed.
 func (p *pump) Run() PumpResult {
-	sw := p.metricsClient.StartTimer(metrics.ArchiverPumpScope, metrics.CadenceLatency)
+	pumpLatencyStart := workflow.Now(p.ctx)
+	pumpScope := p.metricsClient.Scope(metrics.ArchiverPumpScope, metrics.NonDomainTag())
+	sw := pumpScope.StartTimer(metrics.CadenceLatency)
+	stopTimers := func() {
+		sw.Stop()
+		pumpScope.ExponentialHistogram(metrics.CadenceLatencyHistogram, workflow.Now(p.ctx).Sub(pumpLatencyStart))
+	}
 
 	carryoverBoundIndex := len(p.carryover)
 	if carryoverBoundIndex > p.requestLimit {
@@ -102,7 +110,7 @@ func (p *pump) Run() PumpResult {
 		pumpResult.PumpedHashes = append(pumpResult.PumpedHashes, hash(request))
 	}
 	if len(pumpResult.PumpedHashes) == p.requestLimit {
-		sw.Stop()
+		stopTimers()
 		p.requestCh.Close()
 		return pumpResult
 	}
@@ -135,7 +143,7 @@ func (p *pump) Run() PumpResult {
 	for !finished {
 		selector.Select(p.ctx)
 	}
-	sw.Stop()
+	stopTimers()
 	p.requestCh.Close()
 	return pumpResult
 }

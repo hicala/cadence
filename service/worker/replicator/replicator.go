@@ -23,28 +23,32 @@
 package replicator
 
 import (
+	"time"
+
 	"github.com/uber/cadence/client"
+	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/cluster"
 	"github.com/uber/cadence/common/domain"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/membership"
 	"github.com/uber/cadence/common/metrics"
-	"github.com/uber/cadence/common/persistence"
 )
 
 type (
 	// Replicator is the processor for replication tasks
 	Replicator struct {
-		clusterMetadata               cluster.Metadata
-		domainReplicationTaskExecutor domain.ReplicationTaskExecutor
-		clientBean                    client.Bean
-		domainProcessors              []*domainReplicationProcessor
-		logger                        log.Logger
-		metricsClient                 metrics.Client
-		hostInfo                      *membership.HostInfo
-		serviceResolver               membership.ServiceResolver
-		domainReplicationQueue        persistence.DomainReplicationQueue
+		clusterMetadata                  cluster.Metadata
+		domainReplicationTaskExecutor    domain.ReplicationTaskExecutor
+		semaphoreReplicationTaskExecutor domain.SemaphoreReplicationTaskExecutor
+		clientBean                       client.Bean
+		domainProcessors                 []*domainReplicationProcessor
+		logger                           log.Logger
+		metricsClient                    metrics.Client
+		hostInfo                         membership.HostInfo
+		membershipResolver               membership.Resolver
+		domainReplicationQueue           domain.ReplicationQueue
+		replicationMaxRetry              time.Duration
 	}
 )
 
@@ -54,46 +58,52 @@ func NewReplicator(
 	clientBean client.Bean,
 	logger log.Logger,
 	metricsClient metrics.Client,
-	hostInfo *membership.HostInfo,
-	serviceResolver membership.ServiceResolver,
-	domainReplicationQueue persistence.DomainReplicationQueue,
+	hostInfo membership.HostInfo,
+	membership membership.Resolver,
+	domainReplicationQueue domain.ReplicationQueue,
 	domainReplicationTaskExecutor domain.ReplicationTaskExecutor,
+	semaphoreReplicationTaskExecutor domain.SemaphoreReplicationTaskExecutor,
+	replicationMaxRetry time.Duration,
 ) *Replicator {
 
 	logger = logger.WithTags(tag.ComponentReplicator)
 	return &Replicator{
-		hostInfo:                      hostInfo,
-		serviceResolver:               serviceResolver,
-		clusterMetadata:               clusterMetadata,
-		domainReplicationTaskExecutor: domainReplicationTaskExecutor,
-		clientBean:                    clientBean,
-		logger:                        logger,
-		metricsClient:                 metricsClient,
-		domainReplicationQueue:        domainReplicationQueue,
+		hostInfo:                         hostInfo,
+		membershipResolver:               membership,
+		clusterMetadata:                  clusterMetadata,
+		domainReplicationTaskExecutor:    domainReplicationTaskExecutor,
+		semaphoreReplicationTaskExecutor: semaphoreReplicationTaskExecutor,
+		clientBean:                       clientBean,
+		logger:                           logger,
+		metricsClient:                    metricsClient,
+		domainReplicationQueue:           domainReplicationQueue,
+		replicationMaxRetry:              replicationMaxRetry,
 	}
 }
 
 // Start is called to start replicator
 func (r *Replicator) Start() error {
 	currentClusterName := r.clusterMetadata.GetCurrentClusterName()
-	for clusterName, info := range r.clusterMetadata.GetAllClusterInfo() {
-		if !info.Enabled {
-			continue
+	for clusterName := range r.clusterMetadata.GetRemoteClusterInfo() {
+		adminClient, err := r.clientBean.GetRemoteAdminClient(clusterName)
+		if err != nil {
+			return err
 		}
-
-		if clusterName != currentClusterName {
-			processor := newDomainReplicationProcessor(
-				clusterName,
-				r.logger.WithTags(tag.ComponentReplicationTaskProcessor, tag.SourceCluster(clusterName)),
-				r.clientBean.GetRemoteAdminClient(clusterName),
-				r.metricsClient,
-				r.domainReplicationTaskExecutor,
-				r.hostInfo,
-				r.serviceResolver,
-				r.domainReplicationQueue,
-			)
-			r.domainProcessors = append(r.domainProcessors, processor)
-		}
+		processor := newDomainReplicationProcessor(
+			clusterName,
+			currentClusterName,
+			r.logger.WithTags(tag.ComponentReplicationTaskProcessor, tag.SourceCluster(clusterName)),
+			adminClient,
+			r.metricsClient,
+			r.domainReplicationTaskExecutor,
+			r.semaphoreReplicationTaskExecutor,
+			r.hostInfo,
+			r.membershipResolver,
+			r.domainReplicationQueue,
+			r.replicationMaxRetry,
+			clock.NewRealTimeSource(),
+		)
+		r.domainProcessors = append(r.domainProcessors, processor)
 	}
 
 	for _, domainProcessor := range r.domainProcessors {

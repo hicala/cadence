@@ -21,52 +21,118 @@
 package thrift
 
 import (
-	"github.com/uber/cadence/common/types"
-
 	"github.com/uber/cadence/.gen/go/history"
+	"github.com/uber/cadence/common/types"
 )
 
-// FromDescribeMutableStateRequest converts internal DescribeMutableStateRequest type to thrift
-func FromDescribeMutableStateRequest(t *types.DescribeMutableStateRequest) *history.DescribeMutableStateRequest {
+var (
+	FromHistoryDescribeHistoryHostRequest                = FromAdminDescribeHistoryHostRequest
+	ToHistoryDescribeHistoryHostRequest                  = ToAdminDescribeHistoryHostRequest
+	FromHistoryDescribeHistoryHostResponse               = FromAdminDescribeHistoryHostResponse
+	ToHistoryDescribeHistoryHostResponse                 = ToAdminDescribeHistoryHostResponse
+	FromHistoryCloseShardRequest                         = FromAdminCloseShardRequest
+	ToHistoryCloseShardRequest                           = ToAdminCloseShardRequest
+	FromHistoryDescribeQueueRequest                      = FromAdminDescribeQueueRequest
+	ToHistoryDescribeQueueRequest                        = ToAdminDescribeQueueRequest
+	FromHistoryDescribeQueueResponse                     = FromAdminDescribeQueueResponse
+	ToHistoryDescribeQueueResponse                       = ToAdminDescribeQueueResponse
+	FromHistoryDescribeWorkflowExecutionResponse         = FromDescribeWorkflowExecutionResponse
+	ToHistoryDescribeWorkflowExecutionResponse           = ToDescribeWorkflowExecutionResponse
+	FromHistoryGetCrossClusterTasksRequest               = FromAdminGetCrossClusterTasksRequest
+	ToHistoryGetCrossClusterTasksRequest                 = ToAdminGetCrossClusterTasksRequest
+	FromHistoryGetCrossClusterTasksResponse              = FromAdminGetCrossClusterTasksResponse
+	ToHistoryGetCrossClusterTasksResponse                = ToAdminGetCrossClusterTasksResponse
+	FromHistoryGetDLQReplicationMessagesRequest          = FromAdminGetDLQReplicationMessagesRequest
+	ToHistoryGetDLQReplicationMessagesRequest            = ToAdminGetDLQReplicationMessagesRequest
+	FromHistoryGetDLQReplicationMessagesResponse         = FromAdminGetDLQReplicationMessagesResponse
+	ToHistoryGetDLQReplicationMessagesResponse           = ToAdminGetDLQReplicationMessagesResponse
+	FromHistoryGetFailoverInfoRequest                    = FromGetFailoverInfoRequest
+	ToHistoryGetFailoverInfoRequest                      = ToGetFailoverInfoRequest
+	FromHistoryGetFailoverInfoResponse                   = FromGetFailoverInfoResponse
+	ToHistoryGetFailoverInfoResponse                     = ToGetFailoverInfoResponse
+	FromHistoryGetReplicationMessagesRequest             = FromAdminGetReplicationMessagesRequest
+	ToHistoryGetReplicationMessagesRequest               = ToAdminGetReplicationMessagesRequest
+	FromHistoryGetReplicationMessagesResponse            = FromAdminGetReplicationMessagesResponse
+	ToHistoryGetReplicationMessagesResponse              = ToAdminGetReplicationMessagesResponse
+	FromHistoryMergeDLQMessagesRequest                   = FromAdminMergeDLQMessagesRequest
+	ToHistoryMergeDLQMessagesRequest                     = ToAdminMergeDLQMessagesRequest
+	FromHistoryMergeDLQMessagesResponse                  = FromAdminMergeDLQMessagesResponse
+	ToHistoryMergeDLQMessagesResponse                    = ToAdminMergeDLQMessagesResponse
+	FromHistoryPurgeDLQMessagesRequest                   = FromAdminPurgeDLQMessagesRequest
+	ToHistoryPurgeDLQMessagesRequest                     = ToAdminPurgeDLQMessagesRequest
+	FromHistoryReadDLQMessagesRequest                    = FromAdminReadDLQMessagesRequest
+	ToHistoryReadDLQMessagesRequest                      = ToAdminReadDLQMessagesRequest
+	FromHistoryReadDLQMessagesResponse                   = FromAdminReadDLQMessagesResponse
+	ToHistoryReadDLQMessagesResponse                     = ToAdminReadDLQMessagesResponse
+	FromHistoryRecordActivityTaskHeartbeatResponse       = FromRecordActivityTaskHeartbeatResponse
+	ToHistoryRecordActivityTaskHeartbeatResponse         = ToRecordActivityTaskHeartbeatResponse
+	FromHistoryRecordActivityTaskStartedRequest          = FromRecordActivityTaskStartedRequest
+	ToHistoryRecordActivityTaskStartedRequest            = ToRecordActivityTaskStartedRequest
+	FromHistoryRecordActivityTaskStartedResponse         = FromRecordActivityTaskStartedResponse
+	ToHistoryRecordActivityTaskStartedResponse           = ToRecordActivityTaskStartedResponse
+	FromHistoryRecordChildExecutionCompletedRequest      = FromRecordChildExecutionCompletedRequest
+	ToHistoryRecordChildExecutionCompletedRequest        = ToRecordChildExecutionCompletedRequest
+	FromHistoryRecordDecisionTaskStartedRequest          = FromRecordDecisionTaskStartedRequest
+	ToHistoryRecordDecisionTaskStartedRequest            = ToRecordDecisionTaskStartedRequest
+	FromHistoryRecordDecisionTaskStartedResponse         = FromRecordDecisionTaskStartedResponse
+	ToHistoryRecordDecisionTaskStartedResponse           = ToRecordDecisionTaskStartedResponse
+	FromHistoryRemoveTaskRequest                         = FromAdminRemoveTaskRequest
+	ToHistoryRemoveTaskRequest                           = ToAdminRemoveTaskRequest
+	FromHistoryResetQueueRequest                         = FromAdminResetQueueRequest
+	ToHistoryResetQueueRequest                           = ToAdminResetQueueRequest
+	FromHistoryResetWorkflowExecutionResponse            = FromResetWorkflowExecutionResponse
+	ToHistoryResetWorkflowExecutionResponse              = ToResetWorkflowExecutionResponse
+	FromHistoryRespondCrossClusterTasksCompletedRequest  = FromAdminRespondCrossClusterTasksCompletedRequest
+	ToHistoryRespondCrossClusterTasksCompletedRequest    = ToAdminRespondCrossClusterTasksCompletedRequest
+	FromHistoryRespondCrossClusterTasksCompletedResponse = FromAdminRespondCrossClusterTasksCompletedResponse
+	ToHistoryRespondCrossClusterTasksCompletedResponse   = ToAdminRespondCrossClusterTasksCompletedResponse
+	FromHistorySignalWithStartWorkflowExecutionResponse  = FromStartWorkflowExecutionResponse
+	ToHistorySignalWithStartWorkflowExecutionResponse    = ToStartWorkflowExecutionResponse
+	FromHistoryStartWorkflowExecutionResponse            = FromStartWorkflowExecutionResponse
+	ToHistoryStartWorkflowExecutionResponse              = ToStartWorkflowExecutionResponse
+)
+
+// FromHistoryDescribeMutableStateRequest converts internal DescribeMutableStateRequest type to thrift
+func FromHistoryDescribeMutableStateRequest(t *types.DescribeMutableStateRequest) *history.DescribeMutableStateRequest {
 	if t == nil {
 		return nil
 	}
 	return &history.DescribeMutableStateRequest{
-		DomainUUID: t.DomainUUID,
+		DomainUUID: &t.DomainUUID,
 		Execution:  FromWorkflowExecution(t.Execution),
 	}
 }
 
-// ToDescribeMutableStateRequest converts thrift DescribeMutableStateRequest type to internal
-func ToDescribeMutableStateRequest(t *history.DescribeMutableStateRequest) *types.DescribeMutableStateRequest {
+// ToHistoryDescribeMutableStateRequest converts thrift DescribeMutableStateRequest type to internal
+func ToHistoryDescribeMutableStateRequest(t *history.DescribeMutableStateRequest) *types.DescribeMutableStateRequest {
 	if t == nil {
 		return nil
 	}
 	return &types.DescribeMutableStateRequest{
-		DomainUUID: t.DomainUUID,
+		DomainUUID: t.GetDomainUUID(),
 		Execution:  ToWorkflowExecution(t.Execution),
 	}
 }
 
-// FromDescribeMutableStateResponse converts internal DescribeMutableStateResponse type to thrift
-func FromDescribeMutableStateResponse(t *types.DescribeMutableStateResponse) *history.DescribeMutableStateResponse {
+// FromHistoryDescribeMutableStateResponse converts internal DescribeMutableStateResponse type to thrift
+func FromHistoryDescribeMutableStateResponse(t *types.DescribeMutableStateResponse) *history.DescribeMutableStateResponse {
 	if t == nil {
 		return nil
 	}
 	return &history.DescribeMutableStateResponse{
-		MutableStateInCache:    t.MutableStateInCache,
-		MutableStateInDatabase: t.MutableStateInDatabase,
+		MutableStateInCache:    &t.MutableStateInCache,
+		MutableStateInDatabase: &t.MutableStateInDatabase,
 	}
 }
 
-// ToDescribeMutableStateResponse converts thrift DescribeMutableStateResponse type to internal
-func ToDescribeMutableStateResponse(t *history.DescribeMutableStateResponse) *types.DescribeMutableStateResponse {
+// ToHistoryDescribeMutableStateResponse converts thrift DescribeMutableStateResponse type to internal
+func ToHistoryDescribeMutableStateResponse(t *history.DescribeMutableStateResponse) *types.DescribeMutableStateResponse {
 	if t == nil {
 		return nil
 	}
 	return &types.DescribeMutableStateResponse{
-		MutableStateInCache:    t.MutableStateInCache,
-		MutableStateInDatabase: t.MutableStateInDatabase,
+		MutableStateInCache:    t.GetMutableStateInCache(),
+		MutableStateInDatabase: t.GetMutableStateInDatabase(),
 	}
 }
 
@@ -76,7 +142,7 @@ func FromHistoryDescribeWorkflowExecutionRequest(t *types.HistoryDescribeWorkflo
 		return nil
 	}
 	return &history.DescribeWorkflowExecutionRequest{
-		DomainUUID: t.DomainUUID,
+		DomainUUID: &t.DomainUUID,
 		Request:    FromDescribeWorkflowExecutionRequest(t.Request),
 	}
 }
@@ -87,7 +153,7 @@ func ToHistoryDescribeWorkflowExecutionRequest(t *history.DescribeWorkflowExecut
 		return nil
 	}
 	return &types.HistoryDescribeWorkflowExecutionRequest{
-		DomainUUID: t.DomainUUID,
+		DomainUUID: t.GetDomainUUID(),
 		Request:    ToDescribeWorkflowExecutionRequest(t.Request),
 	}
 }
@@ -99,7 +165,7 @@ func FromDomainFilter(t *types.DomainFilter) *history.DomainFilter {
 	}
 	return &history.DomainFilter{
 		DomainIDs:    t.DomainIDs,
-		ReverseMatch: t.ReverseMatch,
+		ReverseMatch: &t.ReverseMatch,
 	}
 }
 
@@ -110,7 +176,7 @@ func ToDomainFilter(t *history.DomainFilter) *types.DomainFilter {
 	}
 	return &types.DomainFilter{
 		DomainIDs:    t.DomainIDs,
-		ReverseMatch: t.ReverseMatch,
+		ReverseMatch: t.GetReverseMatch(),
 	}
 }
 
@@ -156,2076 +222,92 @@ func ToFailoverMarkerToken(t *history.FailoverMarkerToken) *types.FailoverMarker
 	}
 }
 
-// FromGetMutableStateRequest converts internal GetMutableStateRequest type to thrift
-func FromGetMutableStateRequest(t *types.GetMutableStateRequest) *history.GetMutableStateRequest {
+// FromHistoryGetMutableStateRequest converts internal GetMutableStateRequest type to thrift
+func FromHistoryGetMutableStateRequest(t *types.GetMutableStateRequest) *history.GetMutableStateRequest {
 	if t == nil {
 		return nil
 	}
 	return &history.GetMutableStateRequest{
-		DomainUUID:          t.DomainUUID,
+		DomainUUID:          &t.DomainUUID,
 		Execution:           FromWorkflowExecution(t.Execution),
-		ExpectedNextEventId: t.ExpectedNextEventID,
+		ExpectedNextEventId: &t.ExpectedNextEventID,
 		CurrentBranchToken:  t.CurrentBranchToken,
+		VersionHistoryItem:  FromVersionHistoryItem(t.VersionHistoryItem),
 	}
 }
 
-// ToGetMutableStateRequest converts thrift GetMutableStateRequest type to internal
-func ToGetMutableStateRequest(t *history.GetMutableStateRequest) *types.GetMutableStateRequest {
+// ToHistoryGetMutableStateRequest converts thrift GetMutableStateRequest type to internal
+func ToHistoryGetMutableStateRequest(t *history.GetMutableStateRequest) *types.GetMutableStateRequest {
 	if t == nil {
 		return nil
 	}
 	return &types.GetMutableStateRequest{
-		DomainUUID:          t.DomainUUID,
+		DomainUUID:          t.GetDomainUUID(),
 		Execution:           ToWorkflowExecution(t.Execution),
-		ExpectedNextEventID: t.ExpectedNextEventId,
+		ExpectedNextEventID: t.GetExpectedNextEventId(),
 		CurrentBranchToken:  t.CurrentBranchToken,
+		VersionHistoryItem:  ToVersionHistoryItem(t.VersionHistoryItem),
 	}
 }
 
-// FromGetMutableStateResponse converts internal GetMutableStateResponse type to thrift
-func FromGetMutableStateResponse(t *types.GetMutableStateResponse) *history.GetMutableStateResponse {
+// FromHistoryGetMutableStateResponse converts internal GetMutableStateResponse type to thrift
+func FromHistoryGetMutableStateResponse(t *types.GetMutableStateResponse) *history.GetMutableStateResponse {
 	if t == nil {
 		return nil
 	}
 	return &history.GetMutableStateResponse{
 		Execution:                            FromWorkflowExecution(t.Execution),
 		WorkflowType:                         FromWorkflowType(t.WorkflowType),
-		NextEventId:                          t.NextEventID,
+		NextEventId:                          &t.NextEventID,
 		PreviousStartedEventId:               t.PreviousStartedEventID,
-		LastFirstEventId:                     t.LastFirstEventID,
+		LastFirstEventId:                     &t.LastFirstEventID,
 		TaskList:                             FromTaskList(t.TaskList),
 		StickyTaskList:                       FromTaskList(t.StickyTaskList),
-		ClientLibraryVersion:                 t.ClientLibraryVersion,
-		ClientFeatureVersion:                 t.ClientFeatureVersion,
-		ClientImpl:                           t.ClientImpl,
-		IsWorkflowRunning:                    t.IsWorkflowRunning,
+		ClientLibraryVersion:                 &t.ClientLibraryVersion,
+		ClientFeatureVersion:                 &t.ClientFeatureVersion,
+		ClientImpl:                           &t.ClientImpl,
+		IsWorkflowRunning:                    &t.IsWorkflowRunning,
 		StickyTaskListScheduleToStartTimeout: t.StickyTaskListScheduleToStartTimeout,
-		EventStoreVersion:                    t.EventStoreVersion,
+		EventStoreVersion:                    &t.EventStoreVersion,
 		CurrentBranchToken:                   t.CurrentBranchToken,
 		WorkflowState:                        t.WorkflowState,
 		WorkflowCloseState:                   t.WorkflowCloseState,
 		VersionHistories:                     FromVersionHistories(t.VersionHistories),
-		IsStickyTaskListEnabled:              t.IsStickyTaskListEnabled,
+		IsStickyTaskListEnabled:              &t.IsStickyTaskListEnabled,
+		HistorySize:                          &t.HistorySize,
 	}
 }
 
-// ToGetMutableStateResponse converts thrift GetMutableStateResponse type to internal
-func ToGetMutableStateResponse(t *history.GetMutableStateResponse) *types.GetMutableStateResponse {
+// ToHistoryGetMutableStateResponse converts thrift GetMutableStateResponse type to internal
+func ToHistoryGetMutableStateResponse(t *history.GetMutableStateResponse) *types.GetMutableStateResponse {
 	if t == nil {
 		return nil
 	}
 	return &types.GetMutableStateResponse{
 		Execution:                            ToWorkflowExecution(t.Execution),
 		WorkflowType:                         ToWorkflowType(t.WorkflowType),
-		NextEventID:                          t.NextEventId,
+		NextEventID:                          t.GetNextEventId(),
 		PreviousStartedEventID:               t.PreviousStartedEventId,
-		LastFirstEventID:                     t.LastFirstEventId,
+		LastFirstEventID:                     t.GetLastFirstEventId(),
 		TaskList:                             ToTaskList(t.TaskList),
 		StickyTaskList:                       ToTaskList(t.StickyTaskList),
-		ClientLibraryVersion:                 t.ClientLibraryVersion,
-		ClientFeatureVersion:                 t.ClientFeatureVersion,
-		ClientImpl:                           t.ClientImpl,
-		IsWorkflowRunning:                    t.IsWorkflowRunning,
+		ClientLibraryVersion:                 t.GetClientLibraryVersion(),
+		ClientFeatureVersion:                 t.GetClientFeatureVersion(),
+		ClientImpl:                           t.GetClientImpl(),
+		IsWorkflowRunning:                    t.GetIsWorkflowRunning(),
 		StickyTaskListScheduleToStartTimeout: t.StickyTaskListScheduleToStartTimeout,
-		EventStoreVersion:                    t.EventStoreVersion,
+		EventStoreVersion:                    t.GetEventStoreVersion(),
 		CurrentBranchToken:                   t.CurrentBranchToken,
 		WorkflowState:                        t.WorkflowState,
 		WorkflowCloseState:                   t.WorkflowCloseState,
 		VersionHistories:                     ToVersionHistories(t.VersionHistories),
-		IsStickyTaskListEnabled:              t.IsStickyTaskListEnabled,
+		IsStickyTaskListEnabled:              t.GetIsStickyTaskListEnabled(),
+		HistorySize:                          t.GetHistorySize(),
 	}
 }
 
-// FromHistoryService_CloseShard_Args converts internal HistoryService_CloseShard_Args type to thrift
-func FromHistoryService_CloseShard_Args(t *types.HistoryService_CloseShard_Args) *history.HistoryService_CloseShard_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_CloseShard_Args{
-		Request: FromCloseShardRequest(t.Request),
-	}
-}
-
-// ToHistoryService_CloseShard_Args converts thrift HistoryService_CloseShard_Args type to internal
-func ToHistoryService_CloseShard_Args(t *history.HistoryService_CloseShard_Args) *types.HistoryService_CloseShard_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_CloseShard_Args{
-		Request: ToCloseShardRequest(t.Request),
-	}
-}
-
-// FromHistoryService_CloseShard_Result converts internal HistoryService_CloseShard_Result type to thrift
-func FromHistoryService_CloseShard_Result(t *types.HistoryService_CloseShard_Result) *history.HistoryService_CloseShard_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_CloseShard_Result{
-		BadRequestError:      FromBadRequestError(t.BadRequestError),
-		InternalServiceError: FromInternalServiceError(t.InternalServiceError),
-		AccessDeniedError:    FromAccessDeniedError(t.AccessDeniedError),
-	}
-}
-
-// ToHistoryService_CloseShard_Result converts thrift HistoryService_CloseShard_Result type to internal
-func ToHistoryService_CloseShard_Result(t *history.HistoryService_CloseShard_Result) *types.HistoryService_CloseShard_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_CloseShard_Result{
-		BadRequestError:      ToBadRequestError(t.BadRequestError),
-		InternalServiceError: ToInternalServiceError(t.InternalServiceError),
-		AccessDeniedError:    ToAccessDeniedError(t.AccessDeniedError),
-	}
-}
-
-// FromHistoryService_DescribeHistoryHost_Args converts internal HistoryService_DescribeHistoryHost_Args type to thrift
-func FromHistoryService_DescribeHistoryHost_Args(t *types.HistoryService_DescribeHistoryHost_Args) *history.HistoryService_DescribeHistoryHost_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_DescribeHistoryHost_Args{
-		Request: FromDescribeHistoryHostRequest(t.Request),
-	}
-}
-
-// ToHistoryService_DescribeHistoryHost_Args converts thrift HistoryService_DescribeHistoryHost_Args type to internal
-func ToHistoryService_DescribeHistoryHost_Args(t *history.HistoryService_DescribeHistoryHost_Args) *types.HistoryService_DescribeHistoryHost_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_DescribeHistoryHost_Args{
-		Request: ToDescribeHistoryHostRequest(t.Request),
-	}
-}
-
-// FromHistoryService_DescribeHistoryHost_Result converts internal HistoryService_DescribeHistoryHost_Result type to thrift
-func FromHistoryService_DescribeHistoryHost_Result(t *types.HistoryService_DescribeHistoryHost_Result) *history.HistoryService_DescribeHistoryHost_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_DescribeHistoryHost_Result{
-		Success:              FromDescribeHistoryHostResponse(t.Success),
-		BadRequestError:      FromBadRequestError(t.BadRequestError),
-		InternalServiceError: FromInternalServiceError(t.InternalServiceError),
-		AccessDeniedError:    FromAccessDeniedError(t.AccessDeniedError),
-	}
-}
-
-// ToHistoryService_DescribeHistoryHost_Result converts thrift HistoryService_DescribeHistoryHost_Result type to internal
-func ToHistoryService_DescribeHistoryHost_Result(t *history.HistoryService_DescribeHistoryHost_Result) *types.HistoryService_DescribeHistoryHost_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_DescribeHistoryHost_Result{
-		Success:              ToDescribeHistoryHostResponse(t.Success),
-		BadRequestError:      ToBadRequestError(t.BadRequestError),
-		InternalServiceError: ToInternalServiceError(t.InternalServiceError),
-		AccessDeniedError:    ToAccessDeniedError(t.AccessDeniedError),
-	}
-}
-
-// FromHistoryService_DescribeMutableState_Args converts internal HistoryService_DescribeMutableState_Args type to thrift
-func FromHistoryService_DescribeMutableState_Args(t *types.HistoryService_DescribeMutableState_Args) *history.HistoryService_DescribeMutableState_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_DescribeMutableState_Args{
-		Request: FromDescribeMutableStateRequest(t.Request),
-	}
-}
-
-// ToHistoryService_DescribeMutableState_Args converts thrift HistoryService_DescribeMutableState_Args type to internal
-func ToHistoryService_DescribeMutableState_Args(t *history.HistoryService_DescribeMutableState_Args) *types.HistoryService_DescribeMutableState_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_DescribeMutableState_Args{
-		Request: ToDescribeMutableStateRequest(t.Request),
-	}
-}
-
-// FromHistoryService_DescribeMutableState_Result converts internal HistoryService_DescribeMutableState_Result type to thrift
-func FromHistoryService_DescribeMutableState_Result(t *types.HistoryService_DescribeMutableState_Result) *history.HistoryService_DescribeMutableState_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_DescribeMutableState_Result{
-		Success:                 FromDescribeMutableStateResponse(t.Success),
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-		AccessDeniedError:       FromAccessDeniedError(t.AccessDeniedError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		LimitExceededError:      FromLimitExceededError(t.LimitExceededError),
-	}
-}
-
-// ToHistoryService_DescribeMutableState_Result converts thrift HistoryService_DescribeMutableState_Result type to internal
-func ToHistoryService_DescribeMutableState_Result(t *history.HistoryService_DescribeMutableState_Result) *types.HistoryService_DescribeMutableState_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_DescribeMutableState_Result{
-		Success:                 ToDescribeMutableStateResponse(t.Success),
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-		AccessDeniedError:       ToAccessDeniedError(t.AccessDeniedError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		LimitExceededError:      ToLimitExceededError(t.LimitExceededError),
-	}
-}
-
-// FromHistoryService_DescribeQueue_Args converts internal HistoryService_DescribeQueue_Args type to thrift
-func FromHistoryService_DescribeQueue_Args(t *types.HistoryService_DescribeQueue_Args) *history.HistoryService_DescribeQueue_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_DescribeQueue_Args{
-		Request: FromDescribeQueueRequest(t.Request),
-	}
-}
-
-// ToHistoryService_DescribeQueue_Args converts thrift HistoryService_DescribeQueue_Args type to internal
-func ToHistoryService_DescribeQueue_Args(t *history.HistoryService_DescribeQueue_Args) *types.HistoryService_DescribeQueue_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_DescribeQueue_Args{
-		Request: ToDescribeQueueRequest(t.Request),
-	}
-}
-
-// FromHistoryService_DescribeQueue_Result converts internal HistoryService_DescribeQueue_Result type to thrift
-func FromHistoryService_DescribeQueue_Result(t *types.HistoryService_DescribeQueue_Result) *history.HistoryService_DescribeQueue_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_DescribeQueue_Result{
-		Success:              FromDescribeQueueResponse(t.Success),
-		BadRequestError:      FromBadRequestError(t.BadRequestError),
-		InternalServiceError: FromInternalServiceError(t.InternalServiceError),
-		AccessDeniedError:    FromAccessDeniedError(t.AccessDeniedError),
-	}
-}
-
-// ToHistoryService_DescribeQueue_Result converts thrift HistoryService_DescribeQueue_Result type to internal
-func ToHistoryService_DescribeQueue_Result(t *history.HistoryService_DescribeQueue_Result) *types.HistoryService_DescribeQueue_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_DescribeQueue_Result{
-		Success:              ToDescribeQueueResponse(t.Success),
-		BadRequestError:      ToBadRequestError(t.BadRequestError),
-		InternalServiceError: ToInternalServiceError(t.InternalServiceError),
-		AccessDeniedError:    ToAccessDeniedError(t.AccessDeniedError),
-	}
-}
-
-// FromHistoryService_DescribeWorkflowExecution_Args converts internal HistoryService_DescribeWorkflowExecution_Args type to thrift
-func FromHistoryService_DescribeWorkflowExecution_Args(t *types.HistoryService_DescribeWorkflowExecution_Args) *history.HistoryService_DescribeWorkflowExecution_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_DescribeWorkflowExecution_Args{
-		DescribeRequest: FromHistoryDescribeWorkflowExecutionRequest(t.DescribeRequest),
-	}
-}
-
-// ToHistoryService_DescribeWorkflowExecution_Args converts thrift HistoryService_DescribeWorkflowExecution_Args type to internal
-func ToHistoryService_DescribeWorkflowExecution_Args(t *history.HistoryService_DescribeWorkflowExecution_Args) *types.HistoryService_DescribeWorkflowExecution_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_DescribeWorkflowExecution_Args{
-		DescribeRequest: ToHistoryDescribeWorkflowExecutionRequest(t.DescribeRequest),
-	}
-}
-
-// FromHistoryService_DescribeWorkflowExecution_Result converts internal HistoryService_DescribeWorkflowExecution_Result type to thrift
-func FromHistoryService_DescribeWorkflowExecution_Result(t *types.HistoryService_DescribeWorkflowExecution_Result) *history.HistoryService_DescribeWorkflowExecution_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_DescribeWorkflowExecution_Result{
-		Success:                 FromDescribeWorkflowExecutionResponse(t.Success),
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		LimitExceededError:      FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// ToHistoryService_DescribeWorkflowExecution_Result converts thrift HistoryService_DescribeWorkflowExecution_Result type to internal
-func ToHistoryService_DescribeWorkflowExecution_Result(t *history.HistoryService_DescribeWorkflowExecution_Result) *types.HistoryService_DescribeWorkflowExecution_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_DescribeWorkflowExecution_Result{
-		Success:                 ToDescribeWorkflowExecutionResponse(t.Success),
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		LimitExceededError:      ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// FromHistoryService_GetDLQReplicationMessages_Args converts internal HistoryService_GetDLQReplicationMessages_Args type to thrift
-func FromHistoryService_GetDLQReplicationMessages_Args(t *types.HistoryService_GetDLQReplicationMessages_Args) *history.HistoryService_GetDLQReplicationMessages_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_GetDLQReplicationMessages_Args{
-		Request: FromGetDLQReplicationMessagesRequest(t.Request),
-	}
-}
-
-// ToHistoryService_GetDLQReplicationMessages_Args converts thrift HistoryService_GetDLQReplicationMessages_Args type to internal
-func ToHistoryService_GetDLQReplicationMessages_Args(t *history.HistoryService_GetDLQReplicationMessages_Args) *types.HistoryService_GetDLQReplicationMessages_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_GetDLQReplicationMessages_Args{
-		Request: ToGetDLQReplicationMessagesRequest(t.Request),
-	}
-}
-
-// FromHistoryService_GetDLQReplicationMessages_Result converts internal HistoryService_GetDLQReplicationMessages_Result type to thrift
-func FromHistoryService_GetDLQReplicationMessages_Result(t *types.HistoryService_GetDLQReplicationMessages_Result) *history.HistoryService_GetDLQReplicationMessages_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_GetDLQReplicationMessages_Result{
-		Success:              FromGetDLQReplicationMessagesResponse(t.Success),
-		BadRequestError:      FromBadRequestError(t.BadRequestError),
-		InternalServiceError: FromInternalServiceError(t.InternalServiceError),
-		ServiceBusyError:     FromServiceBusyError(t.ServiceBusyError),
-		EntityNotExistError:  FromEntityNotExistsError(t.EntityNotExistError),
-	}
-}
-
-// ToHistoryService_GetDLQReplicationMessages_Result converts thrift HistoryService_GetDLQReplicationMessages_Result type to internal
-func ToHistoryService_GetDLQReplicationMessages_Result(t *history.HistoryService_GetDLQReplicationMessages_Result) *types.HistoryService_GetDLQReplicationMessages_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_GetDLQReplicationMessages_Result{
-		Success:              ToGetDLQReplicationMessagesResponse(t.Success),
-		BadRequestError:      ToBadRequestError(t.BadRequestError),
-		InternalServiceError: ToInternalServiceError(t.InternalServiceError),
-		ServiceBusyError:     ToServiceBusyError(t.ServiceBusyError),
-		EntityNotExistError:  ToEntityNotExistsError(t.EntityNotExistError),
-	}
-}
-
-// FromHistoryService_GetMutableState_Args converts internal HistoryService_GetMutableState_Args type to thrift
-func FromHistoryService_GetMutableState_Args(t *types.HistoryService_GetMutableState_Args) *history.HistoryService_GetMutableState_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_GetMutableState_Args{
-		GetRequest: FromGetMutableStateRequest(t.GetRequest),
-	}
-}
-
-// ToHistoryService_GetMutableState_Args converts thrift HistoryService_GetMutableState_Args type to internal
-func ToHistoryService_GetMutableState_Args(t *history.HistoryService_GetMutableState_Args) *types.HistoryService_GetMutableState_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_GetMutableState_Args{
-		GetRequest: ToGetMutableStateRequest(t.GetRequest),
-	}
-}
-
-// FromHistoryService_GetMutableState_Result converts internal HistoryService_GetMutableState_Result type to thrift
-func FromHistoryService_GetMutableState_Result(t *types.HistoryService_GetMutableState_Result) *history.HistoryService_GetMutableState_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_GetMutableState_Result{
-		Success:                   FromGetMutableStateResponse(t.Success),
-		BadRequestError:           FromBadRequestError(t.BadRequestError),
-		InternalServiceError:      FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:       FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError:   FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		LimitExceededError:        FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:          FromServiceBusyError(t.ServiceBusyError),
-		CurrentBranchChangedError: FromCurrentBranchChangedError(t.CurrentBranchChangedError),
-	}
-}
-
-// ToHistoryService_GetMutableState_Result converts thrift HistoryService_GetMutableState_Result type to internal
-func ToHistoryService_GetMutableState_Result(t *history.HistoryService_GetMutableState_Result) *types.HistoryService_GetMutableState_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_GetMutableState_Result{
-		Success:                   ToGetMutableStateResponse(t.Success),
-		BadRequestError:           ToBadRequestError(t.BadRequestError),
-		InternalServiceError:      ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:       ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError:   ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		LimitExceededError:        ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:          ToServiceBusyError(t.ServiceBusyError),
-		CurrentBranchChangedError: ToCurrentBranchChangedError(t.CurrentBranchChangedError),
-	}
-}
-
-// FromHistoryService_GetReplicationMessages_Args converts internal HistoryService_GetReplicationMessages_Args type to thrift
-func FromHistoryService_GetReplicationMessages_Args(t *types.HistoryService_GetReplicationMessages_Args) *history.HistoryService_GetReplicationMessages_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_GetReplicationMessages_Args{
-		Request: FromGetReplicationMessagesRequest(t.Request),
-	}
-}
-
-// ToHistoryService_GetReplicationMessages_Args converts thrift HistoryService_GetReplicationMessages_Args type to internal
-func ToHistoryService_GetReplicationMessages_Args(t *history.HistoryService_GetReplicationMessages_Args) *types.HistoryService_GetReplicationMessages_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_GetReplicationMessages_Args{
-		Request: ToGetReplicationMessagesRequest(t.Request),
-	}
-}
-
-// FromHistoryService_GetReplicationMessages_Result converts internal HistoryService_GetReplicationMessages_Result type to thrift
-func FromHistoryService_GetReplicationMessages_Result(t *types.HistoryService_GetReplicationMessages_Result) *history.HistoryService_GetReplicationMessages_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_GetReplicationMessages_Result{
-		Success:                        FromGetReplicationMessagesResponse(t.Success),
-		BadRequestError:                FromBadRequestError(t.BadRequestError),
-		InternalServiceError:           FromInternalServiceError(t.InternalServiceError),
-		LimitExceededError:             FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:               FromServiceBusyError(t.ServiceBusyError),
-		ClientVersionNotSupportedError: FromClientVersionNotSupportedError(t.ClientVersionNotSupportedError),
-	}
-}
-
-// ToHistoryService_GetReplicationMessages_Result converts thrift HistoryService_GetReplicationMessages_Result type to internal
-func ToHistoryService_GetReplicationMessages_Result(t *history.HistoryService_GetReplicationMessages_Result) *types.HistoryService_GetReplicationMessages_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_GetReplicationMessages_Result{
-		Success:                        ToGetReplicationMessagesResponse(t.Success),
-		BadRequestError:                ToBadRequestError(t.BadRequestError),
-		InternalServiceError:           ToInternalServiceError(t.InternalServiceError),
-		LimitExceededError:             ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:               ToServiceBusyError(t.ServiceBusyError),
-		ClientVersionNotSupportedError: ToClientVersionNotSupportedError(t.ClientVersionNotSupportedError),
-	}
-}
-
-// FromHistoryService_MergeDLQMessages_Args converts internal HistoryService_MergeDLQMessages_Args type to thrift
-func FromHistoryService_MergeDLQMessages_Args(t *types.HistoryService_MergeDLQMessages_Args) *history.HistoryService_MergeDLQMessages_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_MergeDLQMessages_Args{
-		Request: FromMergeDLQMessagesRequest(t.Request),
-	}
-}
-
-// ToHistoryService_MergeDLQMessages_Args converts thrift HistoryService_MergeDLQMessages_Args type to internal
-func ToHistoryService_MergeDLQMessages_Args(t *history.HistoryService_MergeDLQMessages_Args) *types.HistoryService_MergeDLQMessages_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_MergeDLQMessages_Args{
-		Request: ToMergeDLQMessagesRequest(t.Request),
-	}
-}
-
-// FromHistoryService_MergeDLQMessages_Result converts internal HistoryService_MergeDLQMessages_Result type to thrift
-func FromHistoryService_MergeDLQMessages_Result(t *types.HistoryService_MergeDLQMessages_Result) *history.HistoryService_MergeDLQMessages_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_MergeDLQMessages_Result{
-		Success:                 FromMergeDLQMessagesResponse(t.Success),
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-	}
-}
-
-// ToHistoryService_MergeDLQMessages_Result converts thrift HistoryService_MergeDLQMessages_Result type to internal
-func ToHistoryService_MergeDLQMessages_Result(t *history.HistoryService_MergeDLQMessages_Result) *types.HistoryService_MergeDLQMessages_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_MergeDLQMessages_Result{
-		Success:                 ToMergeDLQMessagesResponse(t.Success),
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-	}
-}
-
-// FromHistoryService_NotifyFailoverMarkers_Args converts internal HistoryService_NotifyFailoverMarkers_Args type to thrift
-func FromHistoryService_NotifyFailoverMarkers_Args(t *types.HistoryService_NotifyFailoverMarkers_Args) *history.HistoryService_NotifyFailoverMarkers_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_NotifyFailoverMarkers_Args{
-		Request: FromNotifyFailoverMarkersRequest(t.Request),
-	}
-}
-
-// ToHistoryService_NotifyFailoverMarkers_Args converts thrift HistoryService_NotifyFailoverMarkers_Args type to internal
-func ToHistoryService_NotifyFailoverMarkers_Args(t *history.HistoryService_NotifyFailoverMarkers_Args) *types.HistoryService_NotifyFailoverMarkers_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_NotifyFailoverMarkers_Args{
-		Request: ToNotifyFailoverMarkersRequest(t.Request),
-	}
-}
-
-// FromHistoryService_NotifyFailoverMarkers_Result converts internal HistoryService_NotifyFailoverMarkers_Result type to thrift
-func FromHistoryService_NotifyFailoverMarkers_Result(t *types.HistoryService_NotifyFailoverMarkers_Result) *history.HistoryService_NotifyFailoverMarkers_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_NotifyFailoverMarkers_Result{
-		BadRequestError:      FromBadRequestError(t.BadRequestError),
-		InternalServiceError: FromInternalServiceError(t.InternalServiceError),
-		ServiceBusyError:     FromServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// ToHistoryService_NotifyFailoverMarkers_Result converts thrift HistoryService_NotifyFailoverMarkers_Result type to internal
-func ToHistoryService_NotifyFailoverMarkers_Result(t *history.HistoryService_NotifyFailoverMarkers_Result) *types.HistoryService_NotifyFailoverMarkers_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_NotifyFailoverMarkers_Result{
-		BadRequestError:      ToBadRequestError(t.BadRequestError),
-		InternalServiceError: ToInternalServiceError(t.InternalServiceError),
-		ServiceBusyError:     ToServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// FromHistoryService_PollMutableState_Args converts internal HistoryService_PollMutableState_Args type to thrift
-func FromHistoryService_PollMutableState_Args(t *types.HistoryService_PollMutableState_Args) *history.HistoryService_PollMutableState_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_PollMutableState_Args{
-		PollRequest: FromPollMutableStateRequest(t.PollRequest),
-	}
-}
-
-// ToHistoryService_PollMutableState_Args converts thrift HistoryService_PollMutableState_Args type to internal
-func ToHistoryService_PollMutableState_Args(t *history.HistoryService_PollMutableState_Args) *types.HistoryService_PollMutableState_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_PollMutableState_Args{
-		PollRequest: ToPollMutableStateRequest(t.PollRequest),
-	}
-}
-
-// FromHistoryService_PollMutableState_Result converts internal HistoryService_PollMutableState_Result type to thrift
-func FromHistoryService_PollMutableState_Result(t *types.HistoryService_PollMutableState_Result) *history.HistoryService_PollMutableState_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_PollMutableState_Result{
-		Success:                   FromPollMutableStateResponse(t.Success),
-		BadRequestError:           FromBadRequestError(t.BadRequestError),
-		InternalServiceError:      FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:       FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError:   FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		LimitExceededError:        FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:          FromServiceBusyError(t.ServiceBusyError),
-		CurrentBranchChangedError: FromCurrentBranchChangedError(t.CurrentBranchChangedError),
-	}
-}
-
-// ToHistoryService_PollMutableState_Result converts thrift HistoryService_PollMutableState_Result type to internal
-func ToHistoryService_PollMutableState_Result(t *history.HistoryService_PollMutableState_Result) *types.HistoryService_PollMutableState_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_PollMutableState_Result{
-		Success:                   ToPollMutableStateResponse(t.Success),
-		BadRequestError:           ToBadRequestError(t.BadRequestError),
-		InternalServiceError:      ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:       ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError:   ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		LimitExceededError:        ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:          ToServiceBusyError(t.ServiceBusyError),
-		CurrentBranchChangedError: ToCurrentBranchChangedError(t.CurrentBranchChangedError),
-	}
-}
-
-// FromHistoryService_PurgeDLQMessages_Args converts internal HistoryService_PurgeDLQMessages_Args type to thrift
-func FromHistoryService_PurgeDLQMessages_Args(t *types.HistoryService_PurgeDLQMessages_Args) *history.HistoryService_PurgeDLQMessages_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_PurgeDLQMessages_Args{
-		Request: FromPurgeDLQMessagesRequest(t.Request),
-	}
-}
-
-// ToHistoryService_PurgeDLQMessages_Args converts thrift HistoryService_PurgeDLQMessages_Args type to internal
-func ToHistoryService_PurgeDLQMessages_Args(t *history.HistoryService_PurgeDLQMessages_Args) *types.HistoryService_PurgeDLQMessages_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_PurgeDLQMessages_Args{
-		Request: ToPurgeDLQMessagesRequest(t.Request),
-	}
-}
-
-// FromHistoryService_PurgeDLQMessages_Result converts internal HistoryService_PurgeDLQMessages_Result type to thrift
-func FromHistoryService_PurgeDLQMessages_Result(t *types.HistoryService_PurgeDLQMessages_Result) *history.HistoryService_PurgeDLQMessages_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_PurgeDLQMessages_Result{
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-	}
-}
-
-// ToHistoryService_PurgeDLQMessages_Result converts thrift HistoryService_PurgeDLQMessages_Result type to internal
-func ToHistoryService_PurgeDLQMessages_Result(t *history.HistoryService_PurgeDLQMessages_Result) *types.HistoryService_PurgeDLQMessages_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_PurgeDLQMessages_Result{
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-	}
-}
-
-// FromHistoryService_QueryWorkflow_Args converts internal HistoryService_QueryWorkflow_Args type to thrift
-func FromHistoryService_QueryWorkflow_Args(t *types.HistoryService_QueryWorkflow_Args) *history.HistoryService_QueryWorkflow_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_QueryWorkflow_Args{
-		QueryRequest: FromHistoryQueryWorkflowRequest(t.QueryRequest),
-	}
-}
-
-// ToHistoryService_QueryWorkflow_Args converts thrift HistoryService_QueryWorkflow_Args type to internal
-func ToHistoryService_QueryWorkflow_Args(t *history.HistoryService_QueryWorkflow_Args) *types.HistoryService_QueryWorkflow_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_QueryWorkflow_Args{
-		QueryRequest: ToHistoryQueryWorkflowRequest(t.QueryRequest),
-	}
-}
-
-// FromHistoryService_QueryWorkflow_Result converts internal HistoryService_QueryWorkflow_Result type to thrift
-func FromHistoryService_QueryWorkflow_Result(t *types.HistoryService_QueryWorkflow_Result) *history.HistoryService_QueryWorkflow_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_QueryWorkflow_Result{
-		Success:                        FromHistoryQueryWorkflowResponse(t.Success),
-		BadRequestError:                FromBadRequestError(t.BadRequestError),
-		InternalServiceError:           FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:            FromEntityNotExistsError(t.EntityNotExistError),
-		QueryFailedError:               FromQueryFailedError(t.QueryFailedError),
-		LimitExceededError:             FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:               FromServiceBusyError(t.ServiceBusyError),
-		ClientVersionNotSupportedError: FromClientVersionNotSupportedError(t.ClientVersionNotSupportedError),
-	}
-}
-
-// ToHistoryService_QueryWorkflow_Result converts thrift HistoryService_QueryWorkflow_Result type to internal
-func ToHistoryService_QueryWorkflow_Result(t *history.HistoryService_QueryWorkflow_Result) *types.HistoryService_QueryWorkflow_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_QueryWorkflow_Result{
-		Success:                        ToHistoryQueryWorkflowResponse(t.Success),
-		BadRequestError:                ToBadRequestError(t.BadRequestError),
-		InternalServiceError:           ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:            ToEntityNotExistsError(t.EntityNotExistError),
-		QueryFailedError:               ToQueryFailedError(t.QueryFailedError),
-		LimitExceededError:             ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:               ToServiceBusyError(t.ServiceBusyError),
-		ClientVersionNotSupportedError: ToClientVersionNotSupportedError(t.ClientVersionNotSupportedError),
-	}
-}
-
-// FromHistoryService_ReadDLQMessages_Args converts internal HistoryService_ReadDLQMessages_Args type to thrift
-func FromHistoryService_ReadDLQMessages_Args(t *types.HistoryService_ReadDLQMessages_Args) *history.HistoryService_ReadDLQMessages_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_ReadDLQMessages_Args{
-		Request: FromReadDLQMessagesRequest(t.Request),
-	}
-}
-
-// ToHistoryService_ReadDLQMessages_Args converts thrift HistoryService_ReadDLQMessages_Args type to internal
-func ToHistoryService_ReadDLQMessages_Args(t *history.HistoryService_ReadDLQMessages_Args) *types.HistoryService_ReadDLQMessages_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_ReadDLQMessages_Args{
-		Request: ToReadDLQMessagesRequest(t.Request),
-	}
-}
-
-// FromHistoryService_ReadDLQMessages_Result converts internal HistoryService_ReadDLQMessages_Result type to thrift
-func FromHistoryService_ReadDLQMessages_Result(t *types.HistoryService_ReadDLQMessages_Result) *history.HistoryService_ReadDLQMessages_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_ReadDLQMessages_Result{
-		Success:                 FromReadDLQMessagesResponse(t.Success),
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-	}
-}
-
-// ToHistoryService_ReadDLQMessages_Result converts thrift HistoryService_ReadDLQMessages_Result type to internal
-func ToHistoryService_ReadDLQMessages_Result(t *history.HistoryService_ReadDLQMessages_Result) *types.HistoryService_ReadDLQMessages_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_ReadDLQMessages_Result{
-		Success:                 ToReadDLQMessagesResponse(t.Success),
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-	}
-}
-
-// FromHistoryService_ReapplyEvents_Args converts internal HistoryService_ReapplyEvents_Args type to thrift
-func FromHistoryService_ReapplyEvents_Args(t *types.HistoryService_ReapplyEvents_Args) *history.HistoryService_ReapplyEvents_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_ReapplyEvents_Args{
-		ReapplyEventsRequest: FromHistoryReapplyEventsRequest(t.ReapplyEventsRequest),
-	}
-}
-
-// ToHistoryService_ReapplyEvents_Args converts thrift HistoryService_ReapplyEvents_Args type to internal
-func ToHistoryService_ReapplyEvents_Args(t *history.HistoryService_ReapplyEvents_Args) *types.HistoryService_ReapplyEvents_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_ReapplyEvents_Args{
-		ReapplyEventsRequest: ToHistoryReapplyEventsRequest(t.ReapplyEventsRequest),
-	}
-}
-
-// FromHistoryService_ReapplyEvents_Result converts internal HistoryService_ReapplyEvents_Result type to thrift
-func FromHistoryService_ReapplyEvents_Result(t *types.HistoryService_ReapplyEvents_Result) *history.HistoryService_ReapplyEvents_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_ReapplyEvents_Result{
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		DomainNotActiveError:    FromDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-	}
-}
-
-// ToHistoryService_ReapplyEvents_Result converts thrift HistoryService_ReapplyEvents_Result type to internal
-func ToHistoryService_ReapplyEvents_Result(t *history.HistoryService_ReapplyEvents_Result) *types.HistoryService_ReapplyEvents_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_ReapplyEvents_Result{
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		DomainNotActiveError:    ToDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-	}
-}
-
-// FromHistoryService_RecordActivityTaskHeartbeat_Args converts internal HistoryService_RecordActivityTaskHeartbeat_Args type to thrift
-func FromHistoryService_RecordActivityTaskHeartbeat_Args(t *types.HistoryService_RecordActivityTaskHeartbeat_Args) *history.HistoryService_RecordActivityTaskHeartbeat_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RecordActivityTaskHeartbeat_Args{
-		HeartbeatRequest: FromHistoryRecordActivityTaskHeartbeatRequest(t.HeartbeatRequest),
-	}
-}
-
-// ToHistoryService_RecordActivityTaskHeartbeat_Args converts thrift HistoryService_RecordActivityTaskHeartbeat_Args type to internal
-func ToHistoryService_RecordActivityTaskHeartbeat_Args(t *history.HistoryService_RecordActivityTaskHeartbeat_Args) *types.HistoryService_RecordActivityTaskHeartbeat_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RecordActivityTaskHeartbeat_Args{
-		HeartbeatRequest: ToHistoryRecordActivityTaskHeartbeatRequest(t.HeartbeatRequest),
-	}
-}
-
-// FromHistoryService_RecordActivityTaskHeartbeat_Result converts internal HistoryService_RecordActivityTaskHeartbeat_Result type to thrift
-func FromHistoryService_RecordActivityTaskHeartbeat_Result(t *types.HistoryService_RecordActivityTaskHeartbeat_Result) *history.HistoryService_RecordActivityTaskHeartbeat_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RecordActivityTaskHeartbeat_Result{
-		Success:                 FromRecordActivityTaskHeartbeatResponse(t.Success),
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    FromDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// ToHistoryService_RecordActivityTaskHeartbeat_Result converts thrift HistoryService_RecordActivityTaskHeartbeat_Result type to internal
-func ToHistoryService_RecordActivityTaskHeartbeat_Result(t *history.HistoryService_RecordActivityTaskHeartbeat_Result) *types.HistoryService_RecordActivityTaskHeartbeat_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RecordActivityTaskHeartbeat_Result{
-		Success:                 ToRecordActivityTaskHeartbeatResponse(t.Success),
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    ToDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// FromHistoryService_RecordActivityTaskStarted_Args converts internal HistoryService_RecordActivityTaskStarted_Args type to thrift
-func FromHistoryService_RecordActivityTaskStarted_Args(t *types.HistoryService_RecordActivityTaskStarted_Args) *history.HistoryService_RecordActivityTaskStarted_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RecordActivityTaskStarted_Args{
-		AddRequest: FromRecordActivityTaskStartedRequest(t.AddRequest),
-	}
-}
-
-// ToHistoryService_RecordActivityTaskStarted_Args converts thrift HistoryService_RecordActivityTaskStarted_Args type to internal
-func ToHistoryService_RecordActivityTaskStarted_Args(t *history.HistoryService_RecordActivityTaskStarted_Args) *types.HistoryService_RecordActivityTaskStarted_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RecordActivityTaskStarted_Args{
-		AddRequest: ToRecordActivityTaskStartedRequest(t.AddRequest),
-	}
-}
-
-// FromHistoryService_RecordActivityTaskStarted_Result converts internal HistoryService_RecordActivityTaskStarted_Result type to thrift
-func FromHistoryService_RecordActivityTaskStarted_Result(t *types.HistoryService_RecordActivityTaskStarted_Result) *history.HistoryService_RecordActivityTaskStarted_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RecordActivityTaskStarted_Result{
-		Success:                  FromRecordActivityTaskStartedResponse(t.Success),
-		BadRequestError:          FromBadRequestError(t.BadRequestError),
-		InternalServiceError:     FromInternalServiceError(t.InternalServiceError),
-		EventAlreadyStartedError: FromEventAlreadyStartedError(t.EventAlreadyStartedError),
-		EntityNotExistError:      FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError:  FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:     FromDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:       FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:         FromServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// ToHistoryService_RecordActivityTaskStarted_Result converts thrift HistoryService_RecordActivityTaskStarted_Result type to internal
-func ToHistoryService_RecordActivityTaskStarted_Result(t *history.HistoryService_RecordActivityTaskStarted_Result) *types.HistoryService_RecordActivityTaskStarted_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RecordActivityTaskStarted_Result{
-		Success:                  ToRecordActivityTaskStartedResponse(t.Success),
-		BadRequestError:          ToBadRequestError(t.BadRequestError),
-		InternalServiceError:     ToInternalServiceError(t.InternalServiceError),
-		EventAlreadyStartedError: ToEventAlreadyStartedError(t.EventAlreadyStartedError),
-		EntityNotExistError:      ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError:  ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:     ToDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:       ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:         ToServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// FromHistoryService_RecordChildExecutionCompleted_Args converts internal HistoryService_RecordChildExecutionCompleted_Args type to thrift
-func FromHistoryService_RecordChildExecutionCompleted_Args(t *types.HistoryService_RecordChildExecutionCompleted_Args) *history.HistoryService_RecordChildExecutionCompleted_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RecordChildExecutionCompleted_Args{
-		CompletionRequest: FromRecordChildExecutionCompletedRequest(t.CompletionRequest),
-	}
-}
-
-// ToHistoryService_RecordChildExecutionCompleted_Args converts thrift HistoryService_RecordChildExecutionCompleted_Args type to internal
-func ToHistoryService_RecordChildExecutionCompleted_Args(t *history.HistoryService_RecordChildExecutionCompleted_Args) *types.HistoryService_RecordChildExecutionCompleted_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RecordChildExecutionCompleted_Args{
-		CompletionRequest: ToRecordChildExecutionCompletedRequest(t.CompletionRequest),
-	}
-}
-
-// FromHistoryService_RecordChildExecutionCompleted_Result converts internal HistoryService_RecordChildExecutionCompleted_Result type to thrift
-func FromHistoryService_RecordChildExecutionCompleted_Result(t *types.HistoryService_RecordChildExecutionCompleted_Result) *history.HistoryService_RecordChildExecutionCompleted_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RecordChildExecutionCompleted_Result{
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    FromDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// ToHistoryService_RecordChildExecutionCompleted_Result converts thrift HistoryService_RecordChildExecutionCompleted_Result type to internal
-func ToHistoryService_RecordChildExecutionCompleted_Result(t *history.HistoryService_RecordChildExecutionCompleted_Result) *types.HistoryService_RecordChildExecutionCompleted_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RecordChildExecutionCompleted_Result{
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    ToDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// FromHistoryService_RecordDecisionTaskStarted_Args converts internal HistoryService_RecordDecisionTaskStarted_Args type to thrift
-func FromHistoryService_RecordDecisionTaskStarted_Args(t *types.HistoryService_RecordDecisionTaskStarted_Args) *history.HistoryService_RecordDecisionTaskStarted_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RecordDecisionTaskStarted_Args{
-		AddRequest: FromRecordDecisionTaskStartedRequest(t.AddRequest),
-	}
-}
-
-// ToHistoryService_RecordDecisionTaskStarted_Args converts thrift HistoryService_RecordDecisionTaskStarted_Args type to internal
-func ToHistoryService_RecordDecisionTaskStarted_Args(t *history.HistoryService_RecordDecisionTaskStarted_Args) *types.HistoryService_RecordDecisionTaskStarted_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RecordDecisionTaskStarted_Args{
-		AddRequest: ToRecordDecisionTaskStartedRequest(t.AddRequest),
-	}
-}
-
-// FromHistoryService_RecordDecisionTaskStarted_Result converts internal HistoryService_RecordDecisionTaskStarted_Result type to thrift
-func FromHistoryService_RecordDecisionTaskStarted_Result(t *types.HistoryService_RecordDecisionTaskStarted_Result) *history.HistoryService_RecordDecisionTaskStarted_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RecordDecisionTaskStarted_Result{
-		Success:                  FromRecordDecisionTaskStartedResponse(t.Success),
-		BadRequestError:          FromBadRequestError(t.BadRequestError),
-		InternalServiceError:     FromInternalServiceError(t.InternalServiceError),
-		EventAlreadyStartedError: FromEventAlreadyStartedError(t.EventAlreadyStartedError),
-		EntityNotExistError:      FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError:  FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:     FromDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:       FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:         FromServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// ToHistoryService_RecordDecisionTaskStarted_Result converts thrift HistoryService_RecordDecisionTaskStarted_Result type to internal
-func ToHistoryService_RecordDecisionTaskStarted_Result(t *history.HistoryService_RecordDecisionTaskStarted_Result) *types.HistoryService_RecordDecisionTaskStarted_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RecordDecisionTaskStarted_Result{
-		Success:                  ToRecordDecisionTaskStartedResponse(t.Success),
-		BadRequestError:          ToBadRequestError(t.BadRequestError),
-		InternalServiceError:     ToInternalServiceError(t.InternalServiceError),
-		EventAlreadyStartedError: ToEventAlreadyStartedError(t.EventAlreadyStartedError),
-		EntityNotExistError:      ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError:  ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:     ToDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:       ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:         ToServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// FromHistoryService_RefreshWorkflowTasks_Args converts internal HistoryService_RefreshWorkflowTasks_Args type to thrift
-func FromHistoryService_RefreshWorkflowTasks_Args(t *types.HistoryService_RefreshWorkflowTasks_Args) *history.HistoryService_RefreshWorkflowTasks_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RefreshWorkflowTasks_Args{
-		Request: FromHistoryRefreshWorkflowTasksRequest(t.Request),
-	}
-}
-
-// ToHistoryService_RefreshWorkflowTasks_Args converts thrift HistoryService_RefreshWorkflowTasks_Args type to internal
-func ToHistoryService_RefreshWorkflowTasks_Args(t *history.HistoryService_RefreshWorkflowTasks_Args) *types.HistoryService_RefreshWorkflowTasks_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RefreshWorkflowTasks_Args{
-		Request: ToHistoryRefreshWorkflowTasksRequest(t.Request),
-	}
-}
-
-// FromHistoryService_RefreshWorkflowTasks_Result converts internal HistoryService_RefreshWorkflowTasks_Result type to thrift
-func FromHistoryService_RefreshWorkflowTasks_Result(t *types.HistoryService_RefreshWorkflowTasks_Result) *history.HistoryService_RefreshWorkflowTasks_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RefreshWorkflowTasks_Result{
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		DomainNotActiveError:    FromDomainNotActiveError(t.DomainNotActiveError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-	}
-}
-
-// ToHistoryService_RefreshWorkflowTasks_Result converts thrift HistoryService_RefreshWorkflowTasks_Result type to internal
-func ToHistoryService_RefreshWorkflowTasks_Result(t *history.HistoryService_RefreshWorkflowTasks_Result) *types.HistoryService_RefreshWorkflowTasks_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RefreshWorkflowTasks_Result{
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		DomainNotActiveError:    ToDomainNotActiveError(t.DomainNotActiveError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-	}
-}
-
-// FromHistoryService_RemoveSignalMutableState_Args converts internal HistoryService_RemoveSignalMutableState_Args type to thrift
-func FromHistoryService_RemoveSignalMutableState_Args(t *types.HistoryService_RemoveSignalMutableState_Args) *history.HistoryService_RemoveSignalMutableState_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RemoveSignalMutableState_Args{
-		RemoveRequest: FromRemoveSignalMutableStateRequest(t.RemoveRequest),
-	}
-}
-
-// ToHistoryService_RemoveSignalMutableState_Args converts thrift HistoryService_RemoveSignalMutableState_Args type to internal
-func ToHistoryService_RemoveSignalMutableState_Args(t *history.HistoryService_RemoveSignalMutableState_Args) *types.HistoryService_RemoveSignalMutableState_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RemoveSignalMutableState_Args{
-		RemoveRequest: ToRemoveSignalMutableStateRequest(t.RemoveRequest),
-	}
-}
-
-// FromHistoryService_RemoveSignalMutableState_Result converts internal HistoryService_RemoveSignalMutableState_Result type to thrift
-func FromHistoryService_RemoveSignalMutableState_Result(t *types.HistoryService_RemoveSignalMutableState_Result) *history.HistoryService_RemoveSignalMutableState_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RemoveSignalMutableState_Result{
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    FromDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// ToHistoryService_RemoveSignalMutableState_Result converts thrift HistoryService_RemoveSignalMutableState_Result type to internal
-func ToHistoryService_RemoveSignalMutableState_Result(t *history.HistoryService_RemoveSignalMutableState_Result) *types.HistoryService_RemoveSignalMutableState_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RemoveSignalMutableState_Result{
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    ToDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// FromHistoryService_RemoveTask_Args converts internal HistoryService_RemoveTask_Args type to thrift
-func FromHistoryService_RemoveTask_Args(t *types.HistoryService_RemoveTask_Args) *history.HistoryService_RemoveTask_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RemoveTask_Args{
-		Request: FromRemoveTaskRequest(t.Request),
-	}
-}
-
-// ToHistoryService_RemoveTask_Args converts thrift HistoryService_RemoveTask_Args type to internal
-func ToHistoryService_RemoveTask_Args(t *history.HistoryService_RemoveTask_Args) *types.HistoryService_RemoveTask_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RemoveTask_Args{
-		Request: ToRemoveTaskRequest(t.Request),
-	}
-}
-
-// FromHistoryService_RemoveTask_Result converts internal HistoryService_RemoveTask_Result type to thrift
-func FromHistoryService_RemoveTask_Result(t *types.HistoryService_RemoveTask_Result) *history.HistoryService_RemoveTask_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RemoveTask_Result{
-		BadRequestError:      FromBadRequestError(t.BadRequestError),
-		InternalServiceError: FromInternalServiceError(t.InternalServiceError),
-		AccessDeniedError:    FromAccessDeniedError(t.AccessDeniedError),
-	}
-}
-
-// ToHistoryService_RemoveTask_Result converts thrift HistoryService_RemoveTask_Result type to internal
-func ToHistoryService_RemoveTask_Result(t *history.HistoryService_RemoveTask_Result) *types.HistoryService_RemoveTask_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RemoveTask_Result{
-		BadRequestError:      ToBadRequestError(t.BadRequestError),
-		InternalServiceError: ToInternalServiceError(t.InternalServiceError),
-		AccessDeniedError:    ToAccessDeniedError(t.AccessDeniedError),
-	}
-}
-
-// FromHistoryService_ReplicateEventsV2_Args converts internal HistoryService_ReplicateEventsV2_Args type to thrift
-func FromHistoryService_ReplicateEventsV2_Args(t *types.HistoryService_ReplicateEventsV2_Args) *history.HistoryService_ReplicateEventsV2_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_ReplicateEventsV2_Args{
-		ReplicateV2Request: FromReplicateEventsV2Request(t.ReplicateV2Request),
-	}
-}
-
-// ToHistoryService_ReplicateEventsV2_Args converts thrift HistoryService_ReplicateEventsV2_Args type to internal
-func ToHistoryService_ReplicateEventsV2_Args(t *history.HistoryService_ReplicateEventsV2_Args) *types.HistoryService_ReplicateEventsV2_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_ReplicateEventsV2_Args{
-		ReplicateV2Request: ToReplicateEventsV2Request(t.ReplicateV2Request),
-	}
-}
-
-// FromHistoryService_ReplicateEventsV2_Result converts internal HistoryService_ReplicateEventsV2_Result type to thrift
-func FromHistoryService_ReplicateEventsV2_Result(t *types.HistoryService_ReplicateEventsV2_Result) *history.HistoryService_ReplicateEventsV2_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_ReplicateEventsV2_Result{
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		LimitExceededError:      FromLimitExceededError(t.LimitExceededError),
-		RetryTaskError:          FromRetryTaskV2Error(t.RetryTaskError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// ToHistoryService_ReplicateEventsV2_Result converts thrift HistoryService_ReplicateEventsV2_Result type to internal
-func ToHistoryService_ReplicateEventsV2_Result(t *history.HistoryService_ReplicateEventsV2_Result) *types.HistoryService_ReplicateEventsV2_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_ReplicateEventsV2_Result{
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		LimitExceededError:      ToLimitExceededError(t.LimitExceededError),
-		RetryTaskError:          ToRetryTaskV2Error(t.RetryTaskError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// FromHistoryService_RequestCancelWorkflowExecution_Args converts internal HistoryService_RequestCancelWorkflowExecution_Args type to thrift
-func FromHistoryService_RequestCancelWorkflowExecution_Args(t *types.HistoryService_RequestCancelWorkflowExecution_Args) *history.HistoryService_RequestCancelWorkflowExecution_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RequestCancelWorkflowExecution_Args{
-		CancelRequest: FromHistoryRequestCancelWorkflowExecutionRequest(t.CancelRequest),
-	}
-}
-
-// ToHistoryService_RequestCancelWorkflowExecution_Args converts thrift HistoryService_RequestCancelWorkflowExecution_Args type to internal
-func ToHistoryService_RequestCancelWorkflowExecution_Args(t *history.HistoryService_RequestCancelWorkflowExecution_Args) *types.HistoryService_RequestCancelWorkflowExecution_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RequestCancelWorkflowExecution_Args{
-		CancelRequest: ToHistoryRequestCancelWorkflowExecutionRequest(t.CancelRequest),
-	}
-}
-
-// FromHistoryService_RequestCancelWorkflowExecution_Result converts internal HistoryService_RequestCancelWorkflowExecution_Result type to thrift
-func FromHistoryService_RequestCancelWorkflowExecution_Result(t *types.HistoryService_RequestCancelWorkflowExecution_Result) *history.HistoryService_RequestCancelWorkflowExecution_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RequestCancelWorkflowExecution_Result{
-		BadRequestError:                   FromBadRequestError(t.BadRequestError),
-		InternalServiceError:              FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:               FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError:           FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		CancellationAlreadyRequestedError: FromCancellationAlreadyRequestedError(t.CancellationAlreadyRequestedError),
-		DomainNotActiveError:              FromDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:                FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:                  FromServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// ToHistoryService_RequestCancelWorkflowExecution_Result converts thrift HistoryService_RequestCancelWorkflowExecution_Result type to internal
-func ToHistoryService_RequestCancelWorkflowExecution_Result(t *history.HistoryService_RequestCancelWorkflowExecution_Result) *types.HistoryService_RequestCancelWorkflowExecution_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RequestCancelWorkflowExecution_Result{
-		BadRequestError:                   ToBadRequestError(t.BadRequestError),
-		InternalServiceError:              ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:               ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError:           ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		CancellationAlreadyRequestedError: ToCancellationAlreadyRequestedError(t.CancellationAlreadyRequestedError),
-		DomainNotActiveError:              ToDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:                ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:                  ToServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// FromHistoryService_ResetQueue_Args converts internal HistoryService_ResetQueue_Args type to thrift
-func FromHistoryService_ResetQueue_Args(t *types.HistoryService_ResetQueue_Args) *history.HistoryService_ResetQueue_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_ResetQueue_Args{
-		Request: FromResetQueueRequest(t.Request),
-	}
-}
-
-// ToHistoryService_ResetQueue_Args converts thrift HistoryService_ResetQueue_Args type to internal
-func ToHistoryService_ResetQueue_Args(t *history.HistoryService_ResetQueue_Args) *types.HistoryService_ResetQueue_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_ResetQueue_Args{
-		Request: ToResetQueueRequest(t.Request),
-	}
-}
-
-// FromHistoryService_ResetQueue_Result converts internal HistoryService_ResetQueue_Result type to thrift
-func FromHistoryService_ResetQueue_Result(t *types.HistoryService_ResetQueue_Result) *history.HistoryService_ResetQueue_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_ResetQueue_Result{
-		BadRequestError:      FromBadRequestError(t.BadRequestError),
-		InternalServiceError: FromInternalServiceError(t.InternalServiceError),
-		AccessDeniedError:    FromAccessDeniedError(t.AccessDeniedError),
-	}
-}
-
-// ToHistoryService_ResetQueue_Result converts thrift HistoryService_ResetQueue_Result type to internal
-func ToHistoryService_ResetQueue_Result(t *history.HistoryService_ResetQueue_Result) *types.HistoryService_ResetQueue_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_ResetQueue_Result{
-		BadRequestError:      ToBadRequestError(t.BadRequestError),
-		InternalServiceError: ToInternalServiceError(t.InternalServiceError),
-		AccessDeniedError:    ToAccessDeniedError(t.AccessDeniedError),
-	}
-}
-
-// FromHistoryService_ResetStickyTaskList_Args converts internal HistoryService_ResetStickyTaskList_Args type to thrift
-func FromHistoryService_ResetStickyTaskList_Args(t *types.HistoryService_ResetStickyTaskList_Args) *history.HistoryService_ResetStickyTaskList_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_ResetStickyTaskList_Args{
-		ResetRequest: FromHistoryResetStickyTaskListRequest(t.ResetRequest),
-	}
-}
-
-// ToHistoryService_ResetStickyTaskList_Args converts thrift HistoryService_ResetStickyTaskList_Args type to internal
-func ToHistoryService_ResetStickyTaskList_Args(t *history.HistoryService_ResetStickyTaskList_Args) *types.HistoryService_ResetStickyTaskList_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_ResetStickyTaskList_Args{
-		ResetRequest: ToHistoryResetStickyTaskListRequest(t.ResetRequest),
-	}
-}
-
-// FromHistoryService_ResetStickyTaskList_Result converts internal HistoryService_ResetStickyTaskList_Result type to thrift
-func FromHistoryService_ResetStickyTaskList_Result(t *types.HistoryService_ResetStickyTaskList_Result) *history.HistoryService_ResetStickyTaskList_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_ResetStickyTaskList_Result{
-		Success:                 FromHistoryResetStickyTaskListResponse(t.Success),
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		LimitExceededError:      FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// ToHistoryService_ResetStickyTaskList_Result converts thrift HistoryService_ResetStickyTaskList_Result type to internal
-func ToHistoryService_ResetStickyTaskList_Result(t *history.HistoryService_ResetStickyTaskList_Result) *types.HistoryService_ResetStickyTaskList_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_ResetStickyTaskList_Result{
-		Success:                 ToHistoryResetStickyTaskListResponse(t.Success),
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		LimitExceededError:      ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// FromHistoryService_ResetWorkflowExecution_Args converts internal HistoryService_ResetWorkflowExecution_Args type to thrift
-func FromHistoryService_ResetWorkflowExecution_Args(t *types.HistoryService_ResetWorkflowExecution_Args) *history.HistoryService_ResetWorkflowExecution_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_ResetWorkflowExecution_Args{
-		ResetRequest: FromHistoryResetWorkflowExecutionRequest(t.ResetRequest),
-	}
-}
-
-// ToHistoryService_ResetWorkflowExecution_Args converts thrift HistoryService_ResetWorkflowExecution_Args type to internal
-func ToHistoryService_ResetWorkflowExecution_Args(t *history.HistoryService_ResetWorkflowExecution_Args) *types.HistoryService_ResetWorkflowExecution_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_ResetWorkflowExecution_Args{
-		ResetRequest: ToHistoryResetWorkflowExecutionRequest(t.ResetRequest),
-	}
-}
-
-// FromHistoryService_ResetWorkflowExecution_Result converts internal HistoryService_ResetWorkflowExecution_Result type to thrift
-func FromHistoryService_ResetWorkflowExecution_Result(t *types.HistoryService_ResetWorkflowExecution_Result) *history.HistoryService_ResetWorkflowExecution_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_ResetWorkflowExecution_Result{
-		Success:                 FromResetWorkflowExecutionResponse(t.Success),
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    FromDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// ToHistoryService_ResetWorkflowExecution_Result converts thrift HistoryService_ResetWorkflowExecution_Result type to internal
-func ToHistoryService_ResetWorkflowExecution_Result(t *history.HistoryService_ResetWorkflowExecution_Result) *types.HistoryService_ResetWorkflowExecution_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_ResetWorkflowExecution_Result{
-		Success:                 ToResetWorkflowExecutionResponse(t.Success),
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    ToDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// FromHistoryService_RespondActivityTaskCanceled_Args converts internal HistoryService_RespondActivityTaskCanceled_Args type to thrift
-func FromHistoryService_RespondActivityTaskCanceled_Args(t *types.HistoryService_RespondActivityTaskCanceled_Args) *history.HistoryService_RespondActivityTaskCanceled_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RespondActivityTaskCanceled_Args{
-		CanceledRequest: FromHistoryRespondActivityTaskCanceledRequest(t.CanceledRequest),
-	}
-}
-
-// ToHistoryService_RespondActivityTaskCanceled_Args converts thrift HistoryService_RespondActivityTaskCanceled_Args type to internal
-func ToHistoryService_RespondActivityTaskCanceled_Args(t *history.HistoryService_RespondActivityTaskCanceled_Args) *types.HistoryService_RespondActivityTaskCanceled_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RespondActivityTaskCanceled_Args{
-		CanceledRequest: ToHistoryRespondActivityTaskCanceledRequest(t.CanceledRequest),
-	}
-}
-
-// FromHistoryService_RespondActivityTaskCanceled_Result converts internal HistoryService_RespondActivityTaskCanceled_Result type to thrift
-func FromHistoryService_RespondActivityTaskCanceled_Result(t *types.HistoryService_RespondActivityTaskCanceled_Result) *history.HistoryService_RespondActivityTaskCanceled_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RespondActivityTaskCanceled_Result{
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    FromDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// ToHistoryService_RespondActivityTaskCanceled_Result converts thrift HistoryService_RespondActivityTaskCanceled_Result type to internal
-func ToHistoryService_RespondActivityTaskCanceled_Result(t *history.HistoryService_RespondActivityTaskCanceled_Result) *types.HistoryService_RespondActivityTaskCanceled_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RespondActivityTaskCanceled_Result{
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    ToDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// FromHistoryService_RespondActivityTaskCompleted_Args converts internal HistoryService_RespondActivityTaskCompleted_Args type to thrift
-func FromHistoryService_RespondActivityTaskCompleted_Args(t *types.HistoryService_RespondActivityTaskCompleted_Args) *history.HistoryService_RespondActivityTaskCompleted_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RespondActivityTaskCompleted_Args{
-		CompleteRequest: FromHistoryRespondActivityTaskCompletedRequest(t.CompleteRequest),
-	}
-}
-
-// ToHistoryService_RespondActivityTaskCompleted_Args converts thrift HistoryService_RespondActivityTaskCompleted_Args type to internal
-func ToHistoryService_RespondActivityTaskCompleted_Args(t *history.HistoryService_RespondActivityTaskCompleted_Args) *types.HistoryService_RespondActivityTaskCompleted_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RespondActivityTaskCompleted_Args{
-		CompleteRequest: ToHistoryRespondActivityTaskCompletedRequest(t.CompleteRequest),
-	}
-}
-
-// FromHistoryService_RespondActivityTaskCompleted_Result converts internal HistoryService_RespondActivityTaskCompleted_Result type to thrift
-func FromHistoryService_RespondActivityTaskCompleted_Result(t *types.HistoryService_RespondActivityTaskCompleted_Result) *history.HistoryService_RespondActivityTaskCompleted_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RespondActivityTaskCompleted_Result{
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    FromDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// ToHistoryService_RespondActivityTaskCompleted_Result converts thrift HistoryService_RespondActivityTaskCompleted_Result type to internal
-func ToHistoryService_RespondActivityTaskCompleted_Result(t *history.HistoryService_RespondActivityTaskCompleted_Result) *types.HistoryService_RespondActivityTaskCompleted_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RespondActivityTaskCompleted_Result{
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    ToDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// FromHistoryService_RespondActivityTaskFailed_Args converts internal HistoryService_RespondActivityTaskFailed_Args type to thrift
-func FromHistoryService_RespondActivityTaskFailed_Args(t *types.HistoryService_RespondActivityTaskFailed_Args) *history.HistoryService_RespondActivityTaskFailed_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RespondActivityTaskFailed_Args{
-		FailRequest: FromHistoryRespondActivityTaskFailedRequest(t.FailRequest),
-	}
-}
-
-// ToHistoryService_RespondActivityTaskFailed_Args converts thrift HistoryService_RespondActivityTaskFailed_Args type to internal
-func ToHistoryService_RespondActivityTaskFailed_Args(t *history.HistoryService_RespondActivityTaskFailed_Args) *types.HistoryService_RespondActivityTaskFailed_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RespondActivityTaskFailed_Args{
-		FailRequest: ToHistoryRespondActivityTaskFailedRequest(t.FailRequest),
-	}
-}
-
-// FromHistoryService_RespondActivityTaskFailed_Result converts internal HistoryService_RespondActivityTaskFailed_Result type to thrift
-func FromHistoryService_RespondActivityTaskFailed_Result(t *types.HistoryService_RespondActivityTaskFailed_Result) *history.HistoryService_RespondActivityTaskFailed_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RespondActivityTaskFailed_Result{
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    FromDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// ToHistoryService_RespondActivityTaskFailed_Result converts thrift HistoryService_RespondActivityTaskFailed_Result type to internal
-func ToHistoryService_RespondActivityTaskFailed_Result(t *history.HistoryService_RespondActivityTaskFailed_Result) *types.HistoryService_RespondActivityTaskFailed_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RespondActivityTaskFailed_Result{
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    ToDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// FromHistoryService_RespondDecisionTaskCompleted_Args converts internal HistoryService_RespondDecisionTaskCompleted_Args type to thrift
-func FromHistoryService_RespondDecisionTaskCompleted_Args(t *types.HistoryService_RespondDecisionTaskCompleted_Args) *history.HistoryService_RespondDecisionTaskCompleted_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RespondDecisionTaskCompleted_Args{
-		CompleteRequest: FromHistoryRespondDecisionTaskCompletedRequest(t.CompleteRequest),
-	}
-}
-
-// ToHistoryService_RespondDecisionTaskCompleted_Args converts thrift HistoryService_RespondDecisionTaskCompleted_Args type to internal
-func ToHistoryService_RespondDecisionTaskCompleted_Args(t *history.HistoryService_RespondDecisionTaskCompleted_Args) *types.HistoryService_RespondDecisionTaskCompleted_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RespondDecisionTaskCompleted_Args{
-		CompleteRequest: ToHistoryRespondDecisionTaskCompletedRequest(t.CompleteRequest),
-	}
-}
-
-// FromHistoryService_RespondDecisionTaskCompleted_Result converts internal HistoryService_RespondDecisionTaskCompleted_Result type to thrift
-func FromHistoryService_RespondDecisionTaskCompleted_Result(t *types.HistoryService_RespondDecisionTaskCompleted_Result) *history.HistoryService_RespondDecisionTaskCompleted_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RespondDecisionTaskCompleted_Result{
-		Success:                 FromHistoryRespondDecisionTaskCompletedResponse(t.Success),
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    FromDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// ToHistoryService_RespondDecisionTaskCompleted_Result converts thrift HistoryService_RespondDecisionTaskCompleted_Result type to internal
-func ToHistoryService_RespondDecisionTaskCompleted_Result(t *history.HistoryService_RespondDecisionTaskCompleted_Result) *types.HistoryService_RespondDecisionTaskCompleted_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RespondDecisionTaskCompleted_Result{
-		Success:                 ToHistoryRespondDecisionTaskCompletedResponse(t.Success),
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    ToDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// FromHistoryService_RespondDecisionTaskFailed_Args converts internal HistoryService_RespondDecisionTaskFailed_Args type to thrift
-func FromHistoryService_RespondDecisionTaskFailed_Args(t *types.HistoryService_RespondDecisionTaskFailed_Args) *history.HistoryService_RespondDecisionTaskFailed_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RespondDecisionTaskFailed_Args{
-		FailedRequest: FromHistoryRespondDecisionTaskFailedRequest(t.FailedRequest),
-	}
-}
-
-// ToHistoryService_RespondDecisionTaskFailed_Args converts thrift HistoryService_RespondDecisionTaskFailed_Args type to internal
-func ToHistoryService_RespondDecisionTaskFailed_Args(t *history.HistoryService_RespondDecisionTaskFailed_Args) *types.HistoryService_RespondDecisionTaskFailed_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RespondDecisionTaskFailed_Args{
-		FailedRequest: ToHistoryRespondDecisionTaskFailedRequest(t.FailedRequest),
-	}
-}
-
-// FromHistoryService_RespondDecisionTaskFailed_Result converts internal HistoryService_RespondDecisionTaskFailed_Result type to thrift
-func FromHistoryService_RespondDecisionTaskFailed_Result(t *types.HistoryService_RespondDecisionTaskFailed_Result) *history.HistoryService_RespondDecisionTaskFailed_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_RespondDecisionTaskFailed_Result{
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    FromDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// ToHistoryService_RespondDecisionTaskFailed_Result converts thrift HistoryService_RespondDecisionTaskFailed_Result type to internal
-func ToHistoryService_RespondDecisionTaskFailed_Result(t *history.HistoryService_RespondDecisionTaskFailed_Result) *types.HistoryService_RespondDecisionTaskFailed_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_RespondDecisionTaskFailed_Result{
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    ToDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// FromHistoryService_ScheduleDecisionTask_Args converts internal HistoryService_ScheduleDecisionTask_Args type to thrift
-func FromHistoryService_ScheduleDecisionTask_Args(t *types.HistoryService_ScheduleDecisionTask_Args) *history.HistoryService_ScheduleDecisionTask_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_ScheduleDecisionTask_Args{
-		ScheduleRequest: FromScheduleDecisionTaskRequest(t.ScheduleRequest),
-	}
-}
-
-// ToHistoryService_ScheduleDecisionTask_Args converts thrift HistoryService_ScheduleDecisionTask_Args type to internal
-func ToHistoryService_ScheduleDecisionTask_Args(t *history.HistoryService_ScheduleDecisionTask_Args) *types.HistoryService_ScheduleDecisionTask_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_ScheduleDecisionTask_Args{
-		ScheduleRequest: ToScheduleDecisionTaskRequest(t.ScheduleRequest),
-	}
-}
-
-// FromHistoryService_ScheduleDecisionTask_Result converts internal HistoryService_ScheduleDecisionTask_Result type to thrift
-func FromHistoryService_ScheduleDecisionTask_Result(t *types.HistoryService_ScheduleDecisionTask_Result) *history.HistoryService_ScheduleDecisionTask_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_ScheduleDecisionTask_Result{
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    FromDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// ToHistoryService_ScheduleDecisionTask_Result converts thrift HistoryService_ScheduleDecisionTask_Result type to internal
-func ToHistoryService_ScheduleDecisionTask_Result(t *history.HistoryService_ScheduleDecisionTask_Result) *types.HistoryService_ScheduleDecisionTask_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_ScheduleDecisionTask_Result{
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    ToDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// FromHistoryService_SignalWithStartWorkflowExecution_Args converts internal HistoryService_SignalWithStartWorkflowExecution_Args type to thrift
-func FromHistoryService_SignalWithStartWorkflowExecution_Args(t *types.HistoryService_SignalWithStartWorkflowExecution_Args) *history.HistoryService_SignalWithStartWorkflowExecution_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_SignalWithStartWorkflowExecution_Args{
-		SignalWithStartRequest: FromHistorySignalWithStartWorkflowExecutionRequest(t.SignalWithStartRequest),
-	}
-}
-
-// ToHistoryService_SignalWithStartWorkflowExecution_Args converts thrift HistoryService_SignalWithStartWorkflowExecution_Args type to internal
-func ToHistoryService_SignalWithStartWorkflowExecution_Args(t *history.HistoryService_SignalWithStartWorkflowExecution_Args) *types.HistoryService_SignalWithStartWorkflowExecution_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_SignalWithStartWorkflowExecution_Args{
-		SignalWithStartRequest: ToHistorySignalWithStartWorkflowExecutionRequest(t.SignalWithStartRequest),
-	}
-}
-
-// FromHistoryService_SignalWithStartWorkflowExecution_Result converts internal HistoryService_SignalWithStartWorkflowExecution_Result type to thrift
-func FromHistoryService_SignalWithStartWorkflowExecution_Result(t *types.HistoryService_SignalWithStartWorkflowExecution_Result) *history.HistoryService_SignalWithStartWorkflowExecution_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_SignalWithStartWorkflowExecution_Result{
-		Success:                     FromStartWorkflowExecutionResponse(t.Success),
-		BadRequestError:             FromBadRequestError(t.BadRequestError),
-		InternalServiceError:        FromInternalServiceError(t.InternalServiceError),
-		ShardOwnershipLostError:     FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:        FromDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:          FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:            FromServiceBusyError(t.ServiceBusyError),
-		WorkflowAlreadyStartedError: FromWorkflowExecutionAlreadyStartedError(t.WorkflowAlreadyStartedError),
-	}
-}
-
-// ToHistoryService_SignalWithStartWorkflowExecution_Result converts thrift HistoryService_SignalWithStartWorkflowExecution_Result type to internal
-func ToHistoryService_SignalWithStartWorkflowExecution_Result(t *history.HistoryService_SignalWithStartWorkflowExecution_Result) *types.HistoryService_SignalWithStartWorkflowExecution_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_SignalWithStartWorkflowExecution_Result{
-		Success:                     ToStartWorkflowExecutionResponse(t.Success),
-		BadRequestError:             ToBadRequestError(t.BadRequestError),
-		InternalServiceError:        ToInternalServiceError(t.InternalServiceError),
-		ShardOwnershipLostError:     ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:        ToDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:          ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:            ToServiceBusyError(t.ServiceBusyError),
-		WorkflowAlreadyStartedError: ToWorkflowExecutionAlreadyStartedError(t.WorkflowAlreadyStartedError),
-	}
-}
-
-// FromHistoryService_SignalWorkflowExecution_Args converts internal HistoryService_SignalWorkflowExecution_Args type to thrift
-func FromHistoryService_SignalWorkflowExecution_Args(t *types.HistoryService_SignalWorkflowExecution_Args) *history.HistoryService_SignalWorkflowExecution_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_SignalWorkflowExecution_Args{
-		SignalRequest: FromHistorySignalWorkflowExecutionRequest(t.SignalRequest),
-	}
-}
-
-// ToHistoryService_SignalWorkflowExecution_Args converts thrift HistoryService_SignalWorkflowExecution_Args type to internal
-func ToHistoryService_SignalWorkflowExecution_Args(t *history.HistoryService_SignalWorkflowExecution_Args) *types.HistoryService_SignalWorkflowExecution_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_SignalWorkflowExecution_Args{
-		SignalRequest: ToHistorySignalWorkflowExecutionRequest(t.SignalRequest),
-	}
-}
-
-// FromHistoryService_SignalWorkflowExecution_Result converts internal HistoryService_SignalWorkflowExecution_Result type to thrift
-func FromHistoryService_SignalWorkflowExecution_Result(t *types.HistoryService_SignalWorkflowExecution_Result) *history.HistoryService_SignalWorkflowExecution_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_SignalWorkflowExecution_Result{
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    FromDomainNotActiveError(t.DomainNotActiveError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-		LimitExceededError:      FromLimitExceededError(t.LimitExceededError),
-	}
-}
-
-// ToHistoryService_SignalWorkflowExecution_Result converts thrift HistoryService_SignalWorkflowExecution_Result type to internal
-func ToHistoryService_SignalWorkflowExecution_Result(t *history.HistoryService_SignalWorkflowExecution_Result) *types.HistoryService_SignalWorkflowExecution_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_SignalWorkflowExecution_Result{
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    ToDomainNotActiveError(t.DomainNotActiveError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-		LimitExceededError:      ToLimitExceededError(t.LimitExceededError),
-	}
-}
-
-// FromHistoryService_StartWorkflowExecution_Args converts internal HistoryService_StartWorkflowExecution_Args type to thrift
-func FromHistoryService_StartWorkflowExecution_Args(t *types.HistoryService_StartWorkflowExecution_Args) *history.HistoryService_StartWorkflowExecution_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_StartWorkflowExecution_Args{
-		StartRequest: FromHistoryStartWorkflowExecutionRequest(t.StartRequest),
-	}
-}
-
-// ToHistoryService_StartWorkflowExecution_Args converts thrift HistoryService_StartWorkflowExecution_Args type to internal
-func ToHistoryService_StartWorkflowExecution_Args(t *history.HistoryService_StartWorkflowExecution_Args) *types.HistoryService_StartWorkflowExecution_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_StartWorkflowExecution_Args{
-		StartRequest: ToHistoryStartWorkflowExecutionRequest(t.StartRequest),
-	}
-}
-
-// FromHistoryService_StartWorkflowExecution_Result converts internal HistoryService_StartWorkflowExecution_Result type to thrift
-func FromHistoryService_StartWorkflowExecution_Result(t *types.HistoryService_StartWorkflowExecution_Result) *history.HistoryService_StartWorkflowExecution_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_StartWorkflowExecution_Result{
-		Success:                  FromStartWorkflowExecutionResponse(t.Success),
-		BadRequestError:          FromBadRequestError(t.BadRequestError),
-		InternalServiceError:     FromInternalServiceError(t.InternalServiceError),
-		SessionAlreadyExistError: FromWorkflowExecutionAlreadyStartedError(t.SessionAlreadyExistError),
-		ShardOwnershipLostError:  FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:     FromDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:       FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:         FromServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// ToHistoryService_StartWorkflowExecution_Result converts thrift HistoryService_StartWorkflowExecution_Result type to internal
-func ToHistoryService_StartWorkflowExecution_Result(t *history.HistoryService_StartWorkflowExecution_Result) *types.HistoryService_StartWorkflowExecution_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_StartWorkflowExecution_Result{
-		Success:                  ToStartWorkflowExecutionResponse(t.Success),
-		BadRequestError:          ToBadRequestError(t.BadRequestError),
-		InternalServiceError:     ToInternalServiceError(t.InternalServiceError),
-		SessionAlreadyExistError: ToWorkflowExecutionAlreadyStartedError(t.SessionAlreadyExistError),
-		ShardOwnershipLostError:  ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:     ToDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:       ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:         ToServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// FromHistoryService_SyncActivity_Args converts internal HistoryService_SyncActivity_Args type to thrift
-func FromHistoryService_SyncActivity_Args(t *types.HistoryService_SyncActivity_Args) *history.HistoryService_SyncActivity_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_SyncActivity_Args{
-		SyncActivityRequest: FromSyncActivityRequest(t.SyncActivityRequest),
-	}
-}
-
-// ToHistoryService_SyncActivity_Args converts thrift HistoryService_SyncActivity_Args type to internal
-func ToHistoryService_SyncActivity_Args(t *history.HistoryService_SyncActivity_Args) *types.HistoryService_SyncActivity_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_SyncActivity_Args{
-		SyncActivityRequest: ToSyncActivityRequest(t.SyncActivityRequest),
-	}
-}
-
-// FromHistoryService_SyncActivity_Result converts internal HistoryService_SyncActivity_Result type to thrift
-func FromHistoryService_SyncActivity_Result(t *types.HistoryService_SyncActivity_Result) *history.HistoryService_SyncActivity_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_SyncActivity_Result{
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-		RetryTaskV2Error:        FromRetryTaskV2Error(t.RetryTaskV2Error),
-	}
-}
-
-// ToHistoryService_SyncActivity_Result converts thrift HistoryService_SyncActivity_Result type to internal
-func ToHistoryService_SyncActivity_Result(t *history.HistoryService_SyncActivity_Result) *types.HistoryService_SyncActivity_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_SyncActivity_Result{
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-		RetryTaskV2Error:        ToRetryTaskV2Error(t.RetryTaskV2Error),
-	}
-}
-
-// FromHistoryService_SyncShardStatus_Args converts internal HistoryService_SyncShardStatus_Args type to thrift
-func FromHistoryService_SyncShardStatus_Args(t *types.HistoryService_SyncShardStatus_Args) *history.HistoryService_SyncShardStatus_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_SyncShardStatus_Args{
-		SyncShardStatusRequest: FromSyncShardStatusRequest(t.SyncShardStatusRequest),
-	}
-}
-
-// ToHistoryService_SyncShardStatus_Args converts thrift HistoryService_SyncShardStatus_Args type to internal
-func ToHistoryService_SyncShardStatus_Args(t *history.HistoryService_SyncShardStatus_Args) *types.HistoryService_SyncShardStatus_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_SyncShardStatus_Args{
-		SyncShardStatusRequest: ToSyncShardStatusRequest(t.SyncShardStatusRequest),
-	}
-}
-
-// FromHistoryService_SyncShardStatus_Result converts internal HistoryService_SyncShardStatus_Result type to thrift
-func FromHistoryService_SyncShardStatus_Result(t *types.HistoryService_SyncShardStatus_Result) *history.HistoryService_SyncShardStatus_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_SyncShardStatus_Result{
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		LimitExceededError:      FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// ToHistoryService_SyncShardStatus_Result converts thrift HistoryService_SyncShardStatus_Result type to internal
-func ToHistoryService_SyncShardStatus_Result(t *history.HistoryService_SyncShardStatus_Result) *types.HistoryService_SyncShardStatus_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_SyncShardStatus_Result{
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		LimitExceededError:      ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// FromHistoryService_TerminateWorkflowExecution_Args converts internal HistoryService_TerminateWorkflowExecution_Args type to thrift
-func FromHistoryService_TerminateWorkflowExecution_Args(t *types.HistoryService_TerminateWorkflowExecution_Args) *history.HistoryService_TerminateWorkflowExecution_Args {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_TerminateWorkflowExecution_Args{
-		TerminateRequest: FromHistoryTerminateWorkflowExecutionRequest(t.TerminateRequest),
-	}
-}
-
-// ToHistoryService_TerminateWorkflowExecution_Args converts thrift HistoryService_TerminateWorkflowExecution_Args type to internal
-func ToHistoryService_TerminateWorkflowExecution_Args(t *history.HistoryService_TerminateWorkflowExecution_Args) *types.HistoryService_TerminateWorkflowExecution_Args {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_TerminateWorkflowExecution_Args{
-		TerminateRequest: ToHistoryTerminateWorkflowExecutionRequest(t.TerminateRequest),
-	}
-}
-
-// FromHistoryService_TerminateWorkflowExecution_Result converts internal HistoryService_TerminateWorkflowExecution_Result type to thrift
-func FromHistoryService_TerminateWorkflowExecution_Result(t *types.HistoryService_TerminateWorkflowExecution_Result) *history.HistoryService_TerminateWorkflowExecution_Result {
-	if t == nil {
-		return nil
-	}
-	return &history.HistoryService_TerminateWorkflowExecution_Result{
-		BadRequestError:         FromBadRequestError(t.BadRequestError),
-		InternalServiceError:    FromInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     FromEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: FromShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    FromDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      FromLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        FromServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// ToHistoryService_TerminateWorkflowExecution_Result converts thrift HistoryService_TerminateWorkflowExecution_Result type to internal
-func ToHistoryService_TerminateWorkflowExecution_Result(t *history.HistoryService_TerminateWorkflowExecution_Result) *types.HistoryService_TerminateWorkflowExecution_Result {
-	if t == nil {
-		return nil
-	}
-	return &types.HistoryService_TerminateWorkflowExecution_Result{
-		BadRequestError:         ToBadRequestError(t.BadRequestError),
-		InternalServiceError:    ToInternalServiceError(t.InternalServiceError),
-		EntityNotExistError:     ToEntityNotExistsError(t.EntityNotExistError),
-		ShardOwnershipLostError: ToShardOwnershipLostError(t.ShardOwnershipLostError),
-		DomainNotActiveError:    ToDomainNotActiveError(t.DomainNotActiveError),
-		LimitExceededError:      ToLimitExceededError(t.LimitExceededError),
-		ServiceBusyError:        ToServiceBusyError(t.ServiceBusyError),
-	}
-}
-
-// FromNotifyFailoverMarkersRequest converts internal NotifyFailoverMarkersRequest type to thrift
-func FromNotifyFailoverMarkersRequest(t *types.NotifyFailoverMarkersRequest) *history.NotifyFailoverMarkersRequest {
+// FromHistoryNotifyFailoverMarkersRequest converts internal NotifyFailoverMarkersRequest type to thrift
+func FromHistoryNotifyFailoverMarkersRequest(t *types.NotifyFailoverMarkersRequest) *history.NotifyFailoverMarkersRequest {
 	if t == nil {
 		return nil
 	}
@@ -2234,8 +316,8 @@ func FromNotifyFailoverMarkersRequest(t *types.NotifyFailoverMarkersRequest) *hi
 	}
 }
 
-// ToNotifyFailoverMarkersRequest converts thrift NotifyFailoverMarkersRequest type to internal
-func ToNotifyFailoverMarkersRequest(t *history.NotifyFailoverMarkersRequest) *types.NotifyFailoverMarkersRequest {
+// ToHistoryNotifyFailoverMarkersRequest converts thrift NotifyFailoverMarkersRequest type to internal
+func ToHistoryNotifyFailoverMarkersRequest(t *history.NotifyFailoverMarkersRequest) *types.NotifyFailoverMarkersRequest {
 	if t == nil {
 		return nil
 	}
@@ -2244,16 +326,16 @@ func ToNotifyFailoverMarkersRequest(t *history.NotifyFailoverMarkersRequest) *ty
 	}
 }
 
-// FromParentExecutionInfo converts internal ParentExecutionInfo type to thrift
+// FromHistoryParentExecutionInfo converts internal ParentExecutionInfo type to thrift
 func FromParentExecutionInfo(t *types.ParentExecutionInfo) *history.ParentExecutionInfo {
 	if t == nil {
 		return nil
 	}
 	return &history.ParentExecutionInfo{
-		DomainUUID:  t.DomainUUID,
-		Domain:      t.Domain,
+		DomainUUID:  &t.DomainUUID,
+		Domain:      &t.Domain,
 		Execution:   FromWorkflowExecution(t.Execution),
-		InitiatedId: t.InitiatedID,
+		InitiatedId: &t.InitiatedID,
 	}
 }
 
@@ -2263,55 +345,55 @@ func ToParentExecutionInfo(t *history.ParentExecutionInfo) *types.ParentExecutio
 		return nil
 	}
 	return &types.ParentExecutionInfo{
-		DomainUUID:  t.DomainUUID,
-		Domain:      t.Domain,
+		DomainUUID:  t.GetDomainUUID(),
+		Domain:      t.GetDomain(),
 		Execution:   ToWorkflowExecution(t.Execution),
-		InitiatedID: t.InitiatedId,
+		InitiatedID: t.GetInitiatedId(),
 	}
 }
 
-// FromPollMutableStateRequest converts internal PollMutableStateRequest type to thrift
-func FromPollMutableStateRequest(t *types.PollMutableStateRequest) *history.PollMutableStateRequest {
+// FromHistoryPollMutableStateRequest converts internal PollMutableStateRequest type to thrift
+func FromHistoryPollMutableStateRequest(t *types.PollMutableStateRequest) *history.PollMutableStateRequest {
 	if t == nil {
 		return nil
 	}
 	return &history.PollMutableStateRequest{
-		DomainUUID:          t.DomainUUID,
+		DomainUUID:          &t.DomainUUID,
 		Execution:           FromWorkflowExecution(t.Execution),
-		ExpectedNextEventId: t.ExpectedNextEventID,
+		ExpectedNextEventId: &t.ExpectedNextEventID,
 		CurrentBranchToken:  t.CurrentBranchToken,
 	}
 }
 
-// ToPollMutableStateRequest converts thrift PollMutableStateRequest type to internal
-func ToPollMutableStateRequest(t *history.PollMutableStateRequest) *types.PollMutableStateRequest {
+// ToHistoryPollMutableStateRequest converts thrift PollMutableStateRequest type to internal
+func ToHistoryPollMutableStateRequest(t *history.PollMutableStateRequest) *types.PollMutableStateRequest {
 	if t == nil {
 		return nil
 	}
 	return &types.PollMutableStateRequest{
-		DomainUUID:          t.DomainUUID,
+		DomainUUID:          t.GetDomainUUID(),
 		Execution:           ToWorkflowExecution(t.Execution),
-		ExpectedNextEventID: t.ExpectedNextEventId,
+		ExpectedNextEventID: t.GetExpectedNextEventId(),
 		CurrentBranchToken:  t.CurrentBranchToken,
 	}
 }
 
-// FromPollMutableStateResponse converts internal PollMutableStateResponse type to thrift
-func FromPollMutableStateResponse(t *types.PollMutableStateResponse) *history.PollMutableStateResponse {
+// FromHistoryPollMutableStateResponse converts internal PollMutableStateResponse type to thrift
+func FromHistoryPollMutableStateResponse(t *types.PollMutableStateResponse) *history.PollMutableStateResponse {
 	if t == nil {
 		return nil
 	}
 	return &history.PollMutableStateResponse{
 		Execution:                            FromWorkflowExecution(t.Execution),
 		WorkflowType:                         FromWorkflowType(t.WorkflowType),
-		NextEventId:                          t.NextEventID,
+		NextEventId:                          &t.NextEventID,
 		PreviousStartedEventId:               t.PreviousStartedEventID,
-		LastFirstEventId:                     t.LastFirstEventID,
+		LastFirstEventId:                     &t.LastFirstEventID,
 		TaskList:                             FromTaskList(t.TaskList),
 		StickyTaskList:                       FromTaskList(t.StickyTaskList),
-		ClientLibraryVersion:                 t.ClientLibraryVersion,
-		ClientFeatureVersion:                 t.ClientFeatureVersion,
-		ClientImpl:                           t.ClientImpl,
+		ClientLibraryVersion:                 &t.ClientLibraryVersion,
+		ClientFeatureVersion:                 &t.ClientFeatureVersion,
+		ClientImpl:                           &t.ClientImpl,
 		StickyTaskListScheduleToStartTimeout: t.StickyTaskListScheduleToStartTimeout,
 		CurrentBranchToken:                   t.CurrentBranchToken,
 		VersionHistories:                     FromVersionHistories(t.VersionHistories),
@@ -2320,22 +402,22 @@ func FromPollMutableStateResponse(t *types.PollMutableStateResponse) *history.Po
 	}
 }
 
-// ToPollMutableStateResponse converts thrift PollMutableStateResponse type to internal
-func ToPollMutableStateResponse(t *history.PollMutableStateResponse) *types.PollMutableStateResponse {
+// ToHistoryPollMutableStateResponse converts thrift PollMutableStateResponse type to internal
+func ToHistoryPollMutableStateResponse(t *history.PollMutableStateResponse) *types.PollMutableStateResponse {
 	if t == nil {
 		return nil
 	}
 	return &types.PollMutableStateResponse{
 		Execution:                            ToWorkflowExecution(t.Execution),
 		WorkflowType:                         ToWorkflowType(t.WorkflowType),
-		NextEventID:                          t.NextEventId,
+		NextEventID:                          t.GetNextEventId(),
 		PreviousStartedEventID:               t.PreviousStartedEventId,
-		LastFirstEventID:                     t.LastFirstEventId,
+		LastFirstEventID:                     t.GetLastFirstEventId(),
 		TaskList:                             ToTaskList(t.TaskList),
 		StickyTaskList:                       ToTaskList(t.StickyTaskList),
-		ClientLibraryVersion:                 t.ClientLibraryVersion,
-		ClientFeatureVersion:                 t.ClientFeatureVersion,
-		ClientImpl:                           t.ClientImpl,
+		ClientLibraryVersion:                 t.GetClientLibraryVersion(),
+		ClientFeatureVersion:                 t.GetClientFeatureVersion(),
+		ClientImpl:                           t.GetClientImpl(),
 		StickyTaskListScheduleToStartTimeout: t.StickyTaskListScheduleToStartTimeout,
 		CurrentBranchToken:                   t.CurrentBranchToken,
 		VersionHistories:                     ToVersionHistories(t.VersionHistories),
@@ -2396,7 +478,7 @@ func FromHistoryQueryWorkflowRequest(t *types.HistoryQueryWorkflowRequest) *hist
 		return nil
 	}
 	return &history.QueryWorkflowRequest{
-		DomainUUID: t.DomainUUID,
+		DomainUUID: &t.DomainUUID,
 		Request:    FromQueryWorkflowRequest(t.Request),
 	}
 }
@@ -2407,7 +489,7 @@ func ToHistoryQueryWorkflowRequest(t *history.QueryWorkflowRequest) *types.Histo
 		return nil
 	}
 	return &types.HistoryQueryWorkflowRequest{
-		DomainUUID: t.DomainUUID,
+		DomainUUID: t.GetDomainUUID(),
 		Request:    ToQueryWorkflowRequest(t.Request),
 	}
 }
@@ -2438,8 +520,8 @@ func FromHistoryReapplyEventsRequest(t *types.HistoryReapplyEventsRequest) *hist
 		return nil
 	}
 	return &history.ReapplyEventsRequest{
-		DomainUUID: t.DomainUUID,
-		Request:    FromReapplyEventsRequest(t.Request),
+		DomainUUID: &t.DomainUUID,
+		Request:    FromAdminReapplyEventsRequest(t.Request),
 	}
 }
 
@@ -2449,8 +531,8 @@ func ToHistoryReapplyEventsRequest(t *history.ReapplyEventsRequest) *types.Histo
 		return nil
 	}
 	return &types.HistoryReapplyEventsRequest{
-		DomainUUID: t.DomainUUID,
-		Request:    ToReapplyEventsRequest(t.Request),
+		DomainUUID: t.GetDomainUUID(),
+		Request:    ToAdminReapplyEventsRequest(t.Request),
 	}
 }
 
@@ -2460,7 +542,7 @@ func FromHistoryRecordActivityTaskHeartbeatRequest(t *types.HistoryRecordActivit
 		return nil
 	}
 	return &history.RecordActivityTaskHeartbeatRequest{
-		DomainUUID:       t.DomainUUID,
+		DomainUUID:       &t.DomainUUID,
 		HeartbeatRequest: FromRecordActivityTaskHeartbeatRequest(t.HeartbeatRequest),
 	}
 }
@@ -2471,7 +553,7 @@ func ToHistoryRecordActivityTaskHeartbeatRequest(t *history.RecordActivityTaskHe
 		return nil
 	}
 	return &types.HistoryRecordActivityTaskHeartbeatRequest{
-		DomainUUID:       t.DomainUUID,
+		DomainUUID:       t.GetDomainUUID(),
 		HeartbeatRequest: ToRecordActivityTaskHeartbeatRequest(t.HeartbeatRequest),
 	}
 }
@@ -2482,11 +564,11 @@ func FromRecordActivityTaskStartedRequest(t *types.RecordActivityTaskStartedRequ
 		return nil
 	}
 	return &history.RecordActivityTaskStartedRequest{
-		DomainUUID:        t.DomainUUID,
+		DomainUUID:        &t.DomainUUID,
 		WorkflowExecution: FromWorkflowExecution(t.WorkflowExecution),
-		ScheduleId:        t.ScheduleID,
-		TaskId:            t.TaskID,
-		RequestId:         t.RequestID,
+		ScheduleId:        &t.ScheduleID,
+		TaskId:            &t.TaskID,
+		RequestId:         &t.RequestID,
 		PollRequest:       FromPollForActivityTaskRequest(t.PollRequest),
 	}
 }
@@ -2497,11 +579,11 @@ func ToRecordActivityTaskStartedRequest(t *history.RecordActivityTaskStartedRequ
 		return nil
 	}
 	return &types.RecordActivityTaskStartedRequest{
-		DomainUUID:        t.DomainUUID,
+		DomainUUID:        t.GetDomainUUID(),
 		WorkflowExecution: ToWorkflowExecution(t.WorkflowExecution),
-		ScheduleID:        t.ScheduleId,
-		TaskID:            t.TaskId,
-		RequestID:         t.RequestId,
+		ScheduleID:        t.GetScheduleId(),
+		TaskID:            t.GetTaskId(),
+		RequestID:         t.GetRequestId(),
 		PollRequest:       ToPollForActivityTaskRequest(t.PollRequest),
 	}
 }
@@ -2514,11 +596,11 @@ func FromRecordActivityTaskStartedResponse(t *types.RecordActivityTaskStartedRes
 	return &history.RecordActivityTaskStartedResponse{
 		ScheduledEvent:                  FromHistoryEvent(t.ScheduledEvent),
 		StartedTimestamp:                t.StartedTimestamp,
-		Attempt:                         t.Attempt,
+		Attempt:                         &t.Attempt,
 		ScheduledTimestampOfThisAttempt: t.ScheduledTimestampOfThisAttempt,
 		HeartbeatDetails:                t.HeartbeatDetails,
 		WorkflowType:                    FromWorkflowType(t.WorkflowType),
-		WorkflowDomain:                  t.WorkflowDomain,
+		WorkflowDomain:                  &t.WorkflowDomain,
 	}
 }
 
@@ -2530,11 +612,11 @@ func ToRecordActivityTaskStartedResponse(t *history.RecordActivityTaskStartedRes
 	return &types.RecordActivityTaskStartedResponse{
 		ScheduledEvent:                  ToHistoryEvent(t.ScheduledEvent),
 		StartedTimestamp:                t.StartedTimestamp,
-		Attempt:                         t.Attempt,
+		Attempt:                         t.GetAttempt(),
 		ScheduledTimestampOfThisAttempt: t.ScheduledTimestampOfThisAttempt,
 		HeartbeatDetails:                t.HeartbeatDetails,
 		WorkflowType:                    ToWorkflowType(t.WorkflowType),
-		WorkflowDomain:                  t.WorkflowDomain,
+		WorkflowDomain:                  t.GetWorkflowDomain(),
 	}
 }
 
@@ -2544,11 +626,14 @@ func FromRecordChildExecutionCompletedRequest(t *types.RecordChildExecutionCompl
 		return nil
 	}
 	return &history.RecordChildExecutionCompletedRequest{
-		DomainUUID:         t.DomainUUID,
-		WorkflowExecution:  FromWorkflowExecution(t.WorkflowExecution),
-		InitiatedId:        t.InitiatedID,
-		CompletedExecution: FromWorkflowExecution(t.CompletedExecution),
-		CompletionEvent:    FromHistoryEvent(t.CompletionEvent),
+		DomainUUID:          &t.DomainUUID,
+		WorkflowExecution:   FromWorkflowExecution(t.WorkflowExecution),
+		InitiatedId:         &t.InitiatedID,
+		CompletedExecution:  FromWorkflowExecution(t.CompletedExecution),
+		CompletionEvent:     FromHistoryEvent(t.CompletionEvent),
+		StartedId:           &t.StartedID,
+		FirstExecutionRunId: &t.FirstExecutionRunID,
+		ChildStartVersion:   t.ChildStartVersion,
 	}
 }
 
@@ -2558,11 +643,14 @@ func ToRecordChildExecutionCompletedRequest(t *history.RecordChildExecutionCompl
 		return nil
 	}
 	return &types.RecordChildExecutionCompletedRequest{
-		DomainUUID:         t.DomainUUID,
-		WorkflowExecution:  ToWorkflowExecution(t.WorkflowExecution),
-		InitiatedID:        t.InitiatedId,
-		CompletedExecution: ToWorkflowExecution(t.CompletedExecution),
-		CompletionEvent:    ToHistoryEvent(t.CompletionEvent),
+		DomainUUID:          t.GetDomainUUID(),
+		WorkflowExecution:   ToWorkflowExecution(t.WorkflowExecution),
+		InitiatedID:         t.GetInitiatedId(),
+		CompletedExecution:  ToWorkflowExecution(t.CompletedExecution),
+		CompletionEvent:     ToHistoryEvent(t.CompletionEvent),
+		StartedID:           t.GetStartedId(),
+		FirstExecutionRunID: t.GetFirstExecutionRunId(),
+		ChildStartVersion:   t.ChildStartVersion,
 	}
 }
 
@@ -2572,11 +660,11 @@ func FromRecordDecisionTaskStartedRequest(t *types.RecordDecisionTaskStartedRequ
 		return nil
 	}
 	return &history.RecordDecisionTaskStartedRequest{
-		DomainUUID:        t.DomainUUID,
+		DomainUUID:        &t.DomainUUID,
 		WorkflowExecution: FromWorkflowExecution(t.WorkflowExecution),
-		ScheduleId:        t.ScheduleID,
-		TaskId:            t.TaskID,
-		RequestId:         t.RequestID,
+		ScheduleId:        &t.ScheduleID,
+		TaskId:            &t.TaskID,
+		RequestId:         &t.RequestID,
 		PollRequest:       FromPollForDecisionTaskRequest(t.PollRequest),
 	}
 }
@@ -2587,11 +675,11 @@ func ToRecordDecisionTaskStartedRequest(t *history.RecordDecisionTaskStartedRequ
 		return nil
 	}
 	return &types.RecordDecisionTaskStartedRequest{
-		DomainUUID:        t.DomainUUID,
+		DomainUUID:        t.GetDomainUUID(),
 		WorkflowExecution: ToWorkflowExecution(t.WorkflowExecution),
-		ScheduleID:        t.ScheduleId,
-		TaskID:            t.TaskId,
-		RequestID:         t.RequestId,
+		ScheduleID:        t.GetScheduleId(),
+		TaskID:            t.GetTaskId(),
+		RequestID:         t.GetRequestId(),
 		PollRequest:       ToPollForDecisionTaskRequest(t.PollRequest),
 	}
 }
@@ -2604,18 +692,19 @@ func FromRecordDecisionTaskStartedResponse(t *types.RecordDecisionTaskStartedRes
 	return &history.RecordDecisionTaskStartedResponse{
 		WorkflowType:              FromWorkflowType(t.WorkflowType),
 		PreviousStartedEventId:    t.PreviousStartedEventID,
-		ScheduledEventId:          t.ScheduledEventID,
-		StartedEventId:            t.StartedEventID,
-		NextEventId:               t.NextEventID,
-		Attempt:                   t.Attempt,
-		StickyExecutionEnabled:    t.StickyExecutionEnabled,
+		ScheduledEventId:          &t.ScheduledEventID,
+		StartedEventId:            &t.StartedEventID,
+		NextEventId:               &t.NextEventID,
+		Attempt:                   &t.Attempt,
+		StickyExecutionEnabled:    &t.StickyExecutionEnabled,
 		DecisionInfo:              FromTransientDecisionInfo(t.DecisionInfo),
 		WorkflowExecutionTaskList: FromTaskList(t.WorkflowExecutionTaskList),
-		EventStoreVersion:         t.EventStoreVersion,
+		EventStoreVersion:         &t.EventStoreVersion,
 		BranchToken:               t.BranchToken,
 		ScheduledTimestamp:        t.ScheduledTimestamp,
 		StartedTimestamp:          t.StartedTimestamp,
 		Queries:                   FromWorkflowQueryMap(t.Queries),
+		HistorySize:               &t.HistorySize,
 	}
 }
 
@@ -2627,18 +716,19 @@ func ToRecordDecisionTaskStartedResponse(t *history.RecordDecisionTaskStartedRes
 	return &types.RecordDecisionTaskStartedResponse{
 		WorkflowType:              ToWorkflowType(t.WorkflowType),
 		PreviousStartedEventID:    t.PreviousStartedEventId,
-		ScheduledEventID:          t.ScheduledEventId,
-		StartedEventID:            t.StartedEventId,
-		NextEventID:               t.NextEventId,
-		Attempt:                   t.Attempt,
-		StickyExecutionEnabled:    t.StickyExecutionEnabled,
+		ScheduledEventID:          t.GetScheduledEventId(),
+		StartedEventID:            t.GetStartedEventId(),
+		NextEventID:               t.GetNextEventId(),
+		Attempt:                   t.GetAttempt(),
+		StickyExecutionEnabled:    t.GetStickyExecutionEnabled(),
 		DecisionInfo:              ToTransientDecisionInfo(t.DecisionInfo),
 		WorkflowExecutionTaskList: ToTaskList(t.WorkflowExecutionTaskList),
-		EventStoreVersion:         t.EventStoreVersion,
+		EventStoreVersion:         t.GetEventStoreVersion(),
 		BranchToken:               t.BranchToken,
 		ScheduledTimestamp:        t.ScheduledTimestamp,
 		StartedTimestamp:          t.StartedTimestamp,
 		Queries:                   ToWorkflowQueryMap(t.Queries),
+		HistorySize:               t.GetHistorySize(),
 	}
 }
 
@@ -2648,8 +738,8 @@ func FromHistoryRefreshWorkflowTasksRequest(t *types.HistoryRefreshWorkflowTasks
 		return nil
 	}
 	return &history.RefreshWorkflowTasksRequest{
-		DomainUIID: t.DomainUIID,
-		Request:    FromRefreshWorkflowTasksRequest(t.Request),
+		DomainUIID: &t.DomainUIID,
+		Request:    FromAdminRefreshWorkflowTasksRequest(t.Request),
 	}
 }
 
@@ -2659,42 +749,42 @@ func ToHistoryRefreshWorkflowTasksRequest(t *history.RefreshWorkflowTasksRequest
 		return nil
 	}
 	return &types.HistoryRefreshWorkflowTasksRequest{
-		DomainUIID: t.DomainUIID,
-		Request:    ToRefreshWorkflowTasksRequest(t.Request),
+		DomainUIID: t.GetDomainUIID(),
+		Request:    ToAdminRefreshWorkflowTasksRequest(t.Request),
 	}
 }
 
-// FromRemoveSignalMutableStateRequest converts internal RemoveSignalMutableStateRequest type to thrift
-func FromRemoveSignalMutableStateRequest(t *types.RemoveSignalMutableStateRequest) *history.RemoveSignalMutableStateRequest {
+// FromHistoryRemoveSignalMutableStateRequest converts internal RemoveSignalMutableStateRequest type to thrift
+func FromHistoryRemoveSignalMutableStateRequest(t *types.RemoveSignalMutableStateRequest) *history.RemoveSignalMutableStateRequest {
 	if t == nil {
 		return nil
 	}
 	return &history.RemoveSignalMutableStateRequest{
-		DomainUUID:        t.DomainUUID,
+		DomainUUID:        &t.DomainUUID,
 		WorkflowExecution: FromWorkflowExecution(t.WorkflowExecution),
-		RequestId:         t.RequestID,
+		RequestId:         &t.RequestID,
 	}
 }
 
-// ToRemoveSignalMutableStateRequest converts thrift RemoveSignalMutableStateRequest type to internal
-func ToRemoveSignalMutableStateRequest(t *history.RemoveSignalMutableStateRequest) *types.RemoveSignalMutableStateRequest {
+// ToHistoryRemoveSignalMutableStateRequest converts thrift RemoveSignalMutableStateRequest type to internal
+func ToHistoryRemoveSignalMutableStateRequest(t *history.RemoveSignalMutableStateRequest) *types.RemoveSignalMutableStateRequest {
 	if t == nil {
 		return nil
 	}
 	return &types.RemoveSignalMutableStateRequest{
-		DomainUUID:        t.DomainUUID,
+		DomainUUID:        t.GetDomainUUID(),
 		WorkflowExecution: ToWorkflowExecution(t.WorkflowExecution),
-		RequestID:         t.RequestId,
+		RequestID:         t.GetRequestId(),
 	}
 }
 
-// FromReplicateEventsV2Request converts internal ReplicateEventsV2Request type to thrift
-func FromReplicateEventsV2Request(t *types.ReplicateEventsV2Request) *history.ReplicateEventsV2Request {
+// FromHistoryReplicateEventsV2Request converts internal ReplicateEventsV2Request type to thrift
+func FromHistoryReplicateEventsV2Request(t *types.ReplicateEventsV2Request) *history.ReplicateEventsV2Request {
 	if t == nil {
 		return nil
 	}
 	return &history.ReplicateEventsV2Request{
-		DomainUUID:          t.DomainUUID,
+		DomainUUID:          &t.DomainUUID,
 		WorkflowExecution:   FromWorkflowExecution(t.WorkflowExecution),
 		VersionHistoryItems: FromVersionHistoryItemArray(t.VersionHistoryItems),
 		Events:              FromDataBlob(t.Events),
@@ -2702,13 +792,13 @@ func FromReplicateEventsV2Request(t *types.ReplicateEventsV2Request) *history.Re
 	}
 }
 
-// ToReplicateEventsV2Request converts thrift ReplicateEventsV2Request type to internal
-func ToReplicateEventsV2Request(t *history.ReplicateEventsV2Request) *types.ReplicateEventsV2Request {
+// ToHistoryReplicateEventsV2Request converts thrift ReplicateEventsV2Request type to internal
+func ToHistoryReplicateEventsV2Request(t *history.ReplicateEventsV2Request) *types.ReplicateEventsV2Request {
 	if t == nil {
 		return nil
 	}
 	return &types.ReplicateEventsV2Request{
-		DomainUUID:          t.DomainUUID,
+		DomainUUID:          t.GetDomainUUID(),
 		WorkflowExecution:   ToWorkflowExecution(t.WorkflowExecution),
 		VersionHistoryItems: ToVersionHistoryItemArray(t.VersionHistoryItems),
 		Events:              ToDataBlob(t.Events),
@@ -2722,11 +812,11 @@ func FromHistoryRequestCancelWorkflowExecutionRequest(t *types.HistoryRequestCan
 		return nil
 	}
 	return &history.RequestCancelWorkflowExecutionRequest{
-		DomainUUID:                t.DomainUUID,
+		DomainUUID:                &t.DomainUUID,
 		CancelRequest:             FromRequestCancelWorkflowExecutionRequest(t.CancelRequest),
 		ExternalInitiatedEventId:  t.ExternalInitiatedEventID,
 		ExternalWorkflowExecution: FromWorkflowExecution(t.ExternalWorkflowExecution),
-		ChildWorkflowOnly:         t.ChildWorkflowOnly,
+		ChildWorkflowOnly:         &t.ChildWorkflowOnly,
 	}
 }
 
@@ -2736,11 +826,11 @@ func ToHistoryRequestCancelWorkflowExecutionRequest(t *history.RequestCancelWork
 		return nil
 	}
 	return &types.HistoryRequestCancelWorkflowExecutionRequest{
-		DomainUUID:                t.DomainUUID,
+		DomainUUID:                t.GetDomainUUID(),
 		CancelRequest:             ToRequestCancelWorkflowExecutionRequest(t.CancelRequest),
 		ExternalInitiatedEventID:  t.ExternalInitiatedEventId,
 		ExternalWorkflowExecution: ToWorkflowExecution(t.ExternalWorkflowExecution),
-		ChildWorkflowOnly:         t.ChildWorkflowOnly,
+		ChildWorkflowOnly:         t.GetChildWorkflowOnly(),
 	}
 }
 
@@ -2750,7 +840,7 @@ func FromHistoryResetStickyTaskListRequest(t *types.HistoryResetStickyTaskListRe
 		return nil
 	}
 	return &history.ResetStickyTaskListRequest{
-		DomainUUID: t.DomainUUID,
+		DomainUUID: &t.DomainUUID,
 		Execution:  FromWorkflowExecution(t.Execution),
 	}
 }
@@ -2761,7 +851,7 @@ func ToHistoryResetStickyTaskListRequest(t *history.ResetStickyTaskListRequest) 
 		return nil
 	}
 	return &types.HistoryResetStickyTaskListRequest{
-		DomainUUID: t.DomainUUID,
+		DomainUUID: t.GetDomainUUID(),
 		Execution:  ToWorkflowExecution(t.Execution),
 	}
 }
@@ -2788,7 +878,7 @@ func FromHistoryResetWorkflowExecutionRequest(t *types.HistoryResetWorkflowExecu
 		return nil
 	}
 	return &history.ResetWorkflowExecutionRequest{
-		DomainUUID:   t.DomainUUID,
+		DomainUUID:   &t.DomainUUID,
 		ResetRequest: FromResetWorkflowExecutionRequest(t.ResetRequest),
 	}
 }
@@ -2799,7 +889,7 @@ func ToHistoryResetWorkflowExecutionRequest(t *history.ResetWorkflowExecutionReq
 		return nil
 	}
 	return &types.HistoryResetWorkflowExecutionRequest{
-		DomainUUID:   t.DomainUUID,
+		DomainUUID:   t.GetDomainUUID(),
 		ResetRequest: ToResetWorkflowExecutionRequest(t.ResetRequest),
 	}
 }
@@ -2810,7 +900,7 @@ func FromHistoryRespondActivityTaskCanceledRequest(t *types.HistoryRespondActivi
 		return nil
 	}
 	return &history.RespondActivityTaskCanceledRequest{
-		DomainUUID:    t.DomainUUID,
+		DomainUUID:    &t.DomainUUID,
 		CancelRequest: FromRespondActivityTaskCanceledRequest(t.CancelRequest),
 	}
 }
@@ -2821,7 +911,7 @@ func ToHistoryRespondActivityTaskCanceledRequest(t *history.RespondActivityTaskC
 		return nil
 	}
 	return &types.HistoryRespondActivityTaskCanceledRequest{
-		DomainUUID:    t.DomainUUID,
+		DomainUUID:    t.GetDomainUUID(),
 		CancelRequest: ToRespondActivityTaskCanceledRequest(t.CancelRequest),
 	}
 }
@@ -2832,7 +922,7 @@ func FromHistoryRespondActivityTaskCompletedRequest(t *types.HistoryRespondActiv
 		return nil
 	}
 	return &history.RespondActivityTaskCompletedRequest{
-		DomainUUID:      t.DomainUUID,
+		DomainUUID:      &t.DomainUUID,
 		CompleteRequest: FromRespondActivityTaskCompletedRequest(t.CompleteRequest),
 	}
 }
@@ -2843,7 +933,7 @@ func ToHistoryRespondActivityTaskCompletedRequest(t *history.RespondActivityTask
 		return nil
 	}
 	return &types.HistoryRespondActivityTaskCompletedRequest{
-		DomainUUID:      t.DomainUUID,
+		DomainUUID:      t.GetDomainUUID(),
 		CompleteRequest: ToRespondActivityTaskCompletedRequest(t.CompleteRequest),
 	}
 }
@@ -2854,7 +944,7 @@ func FromHistoryRespondActivityTaskFailedRequest(t *types.HistoryRespondActivity
 		return nil
 	}
 	return &history.RespondActivityTaskFailedRequest{
-		DomainUUID:    t.DomainUUID,
+		DomainUUID:    &t.DomainUUID,
 		FailedRequest: FromRespondActivityTaskFailedRequest(t.FailedRequest),
 	}
 }
@@ -2865,7 +955,7 @@ func ToHistoryRespondActivityTaskFailedRequest(t *history.RespondActivityTaskFai
 		return nil
 	}
 	return &types.HistoryRespondActivityTaskFailedRequest{
-		DomainUUID:    t.DomainUUID,
+		DomainUUID:    t.GetDomainUUID(),
 		FailedRequest: ToRespondActivityTaskFailedRequest(t.FailedRequest),
 	}
 }
@@ -2876,7 +966,7 @@ func FromHistoryRespondDecisionTaskCompletedRequest(t *types.HistoryRespondDecis
 		return nil
 	}
 	return &history.RespondDecisionTaskCompletedRequest{
-		DomainUUID:      t.DomainUUID,
+		DomainUUID:      &t.DomainUUID,
 		CompleteRequest: FromRespondDecisionTaskCompletedRequest(t.CompleteRequest),
 	}
 }
@@ -2887,7 +977,7 @@ func ToHistoryRespondDecisionTaskCompletedRequest(t *history.RespondDecisionTask
 		return nil
 	}
 	return &types.HistoryRespondDecisionTaskCompletedRequest{
-		DomainUUID:      t.DomainUUID,
+		DomainUUID:      t.GetDomainUUID(),
 		CompleteRequest: ToRespondDecisionTaskCompletedRequest(t.CompleteRequest),
 	}
 }
@@ -2920,7 +1010,7 @@ func FromHistoryRespondDecisionTaskFailedRequest(t *types.HistoryRespondDecision
 		return nil
 	}
 	return &history.RespondDecisionTaskFailedRequest{
-		DomainUUID:    t.DomainUUID,
+		DomainUUID:    &t.DomainUUID,
 		FailedRequest: FromRespondDecisionTaskFailedRequest(t.FailedRequest),
 	}
 }
@@ -2931,32 +1021,32 @@ func ToHistoryRespondDecisionTaskFailedRequest(t *history.RespondDecisionTaskFai
 		return nil
 	}
 	return &types.HistoryRespondDecisionTaskFailedRequest{
-		DomainUUID:    t.DomainUUID,
+		DomainUUID:    t.GetDomainUUID(),
 		FailedRequest: ToRespondDecisionTaskFailedRequest(t.FailedRequest),
 	}
 }
 
-// FromScheduleDecisionTaskRequest converts internal ScheduleDecisionTaskRequest type to thrift
-func FromScheduleDecisionTaskRequest(t *types.ScheduleDecisionTaskRequest) *history.ScheduleDecisionTaskRequest {
+// FromHistoryScheduleDecisionTaskRequest converts internal ScheduleDecisionTaskRequest type to thrift
+func FromHistoryScheduleDecisionTaskRequest(t *types.ScheduleDecisionTaskRequest) *history.ScheduleDecisionTaskRequest {
 	if t == nil {
 		return nil
 	}
 	return &history.ScheduleDecisionTaskRequest{
-		DomainUUID:        t.DomainUUID,
+		DomainUUID:        &t.DomainUUID,
 		WorkflowExecution: FromWorkflowExecution(t.WorkflowExecution),
-		IsFirstDecision:   t.IsFirstDecision,
+		IsFirstDecision:   &t.IsFirstDecision,
 	}
 }
 
-// ToScheduleDecisionTaskRequest converts thrift ScheduleDecisionTaskRequest type to internal
-func ToScheduleDecisionTaskRequest(t *history.ScheduleDecisionTaskRequest) *types.ScheduleDecisionTaskRequest {
+// ToHistoryScheduleDecisionTaskRequest converts thrift ScheduleDecisionTaskRequest type to internal
+func ToHistoryScheduleDecisionTaskRequest(t *history.ScheduleDecisionTaskRequest) *types.ScheduleDecisionTaskRequest {
 	if t == nil {
 		return nil
 	}
 	return &types.ScheduleDecisionTaskRequest{
-		DomainUUID:        t.DomainUUID,
+		DomainUUID:        t.GetDomainUUID(),
 		WorkflowExecution: ToWorkflowExecution(t.WorkflowExecution),
-		IsFirstDecision:   t.IsFirstDecision,
+		IsFirstDecision:   t.GetIsFirstDecision(),
 	}
 }
 
@@ -2966,8 +1056,8 @@ func FromShardOwnershipLostError(t *types.ShardOwnershipLostError) *history.Shar
 		return nil
 	}
 	return &history.ShardOwnershipLostError{
-		Message: t.Message,
-		Owner:   t.Owner,
+		Message: &t.Message,
+		Owner:   &t.Owner,
 	}
 }
 
@@ -2977,8 +1067,8 @@ func ToShardOwnershipLostError(t *history.ShardOwnershipLostError) *types.ShardO
 		return nil
 	}
 	return &types.ShardOwnershipLostError{
-		Message: t.Message,
-		Owner:   t.Owner,
+		Message: t.GetMessage(),
+		Owner:   t.GetOwner(),
 	}
 }
 
@@ -2988,8 +1078,9 @@ func FromHistorySignalWithStartWorkflowExecutionRequest(t *types.HistorySignalWi
 		return nil
 	}
 	return &history.SignalWithStartWorkflowExecutionRequest{
-		DomainUUID:             t.DomainUUID,
+		DomainUUID:             &t.DomainUUID,
 		SignalWithStartRequest: FromSignalWithStartWorkflowExecutionRequest(t.SignalWithStartRequest),
+		PartitionConfig:        t.PartitionConfig,
 	}
 }
 
@@ -2999,8 +1090,9 @@ func ToHistorySignalWithStartWorkflowExecutionRequest(t *history.SignalWithStart
 		return nil
 	}
 	return &types.HistorySignalWithStartWorkflowExecutionRequest{
-		DomainUUID:             t.DomainUUID,
+		DomainUUID:             t.GetDomainUUID(),
 		SignalWithStartRequest: ToSignalWithStartWorkflowExecutionRequest(t.SignalWithStartRequest),
+		PartitionConfig:        t.PartitionConfig,
 	}
 }
 
@@ -3010,10 +1102,10 @@ func FromHistorySignalWorkflowExecutionRequest(t *types.HistorySignalWorkflowExe
 		return nil
 	}
 	return &history.SignalWorkflowExecutionRequest{
-		DomainUUID:                t.DomainUUID,
+		DomainUUID:                &t.DomainUUID,
 		SignalRequest:             FromSignalWorkflowExecutionRequest(t.SignalRequest),
 		ExternalWorkflowExecution: FromWorkflowExecution(t.ExternalWorkflowExecution),
-		ChildWorkflowOnly:         t.ChildWorkflowOnly,
+		ChildWorkflowOnly:         &t.ChildWorkflowOnly,
 	}
 }
 
@@ -3023,10 +1115,10 @@ func ToHistorySignalWorkflowExecutionRequest(t *history.SignalWorkflowExecutionR
 		return nil
 	}
 	return &types.HistorySignalWorkflowExecutionRequest{
-		DomainUUID:                t.DomainUUID,
+		DomainUUID:                t.GetDomainUUID(),
 		SignalRequest:             ToSignalWorkflowExecutionRequest(t.SignalRequest),
 		ExternalWorkflowExecution: ToWorkflowExecution(t.ExternalWorkflowExecution),
-		ChildWorkflowOnly:         t.ChildWorkflowOnly,
+		ChildWorkflowOnly:         t.GetChildWorkflowOnly(),
 	}
 }
 
@@ -3036,16 +1128,18 @@ func FromHistoryStartWorkflowExecutionRequest(t *types.HistoryStartWorkflowExecu
 		return nil
 	}
 	return &history.StartWorkflowExecutionRequest{
-		DomainUUID:                      t.DomainUUID,
+		DomainUUID:                      &t.DomainUUID,
 		StartRequest:                    FromStartWorkflowExecutionRequest(t.StartRequest),
 		ParentExecutionInfo:             FromParentExecutionInfo(t.ParentExecutionInfo),
-		Attempt:                         t.Attempt,
+		Attempt:                         &t.Attempt,
 		ExpirationTimestamp:             t.ExpirationTimestamp,
 		ContinueAsNewInitiator:          FromContinueAsNewInitiator(t.ContinueAsNewInitiator),
 		ContinuedFailureReason:          t.ContinuedFailureReason,
 		ContinuedFailureDetails:         t.ContinuedFailureDetails,
 		LastCompletionResult:            t.LastCompletionResult,
 		FirstDecisionTaskBackoffSeconds: t.FirstDecisionTaskBackoffSeconds,
+		PartitionConfig:                 t.PartitionConfig,
+		ParentVersionHistoryItems:       FromVersionHistoryItemArray(t.ParentVersionHistoryItems),
 	}
 }
 
@@ -3055,87 +1149,91 @@ func ToHistoryStartWorkflowExecutionRequest(t *history.StartWorkflowExecutionReq
 		return nil
 	}
 	return &types.HistoryStartWorkflowExecutionRequest{
-		DomainUUID:                      t.DomainUUID,
+		DomainUUID:                      t.GetDomainUUID(),
 		StartRequest:                    ToStartWorkflowExecutionRequest(t.StartRequest),
 		ParentExecutionInfo:             ToParentExecutionInfo(t.ParentExecutionInfo),
-		Attempt:                         t.Attempt,
+		Attempt:                         t.GetAttempt(),
 		ExpirationTimestamp:             t.ExpirationTimestamp,
 		ContinueAsNewInitiator:          ToContinueAsNewInitiator(t.ContinueAsNewInitiator),
 		ContinuedFailureReason:          t.ContinuedFailureReason,
 		ContinuedFailureDetails:         t.ContinuedFailureDetails,
 		LastCompletionResult:            t.LastCompletionResult,
 		FirstDecisionTaskBackoffSeconds: t.FirstDecisionTaskBackoffSeconds,
+		PartitionConfig:                 t.PartitionConfig,
+		ParentVersionHistoryItems:       ToVersionHistoryItemArray(t.ParentVersionHistoryItems),
 	}
 }
 
-// FromSyncActivityRequest converts internal SyncActivityRequest type to thrift
-func FromSyncActivityRequest(t *types.SyncActivityRequest) *history.SyncActivityRequest {
+// FromHistorySyncActivityRequest converts internal SyncActivityRequest type to thrift
+func FromHistorySyncActivityRequest(t *types.SyncActivityRequest) *history.SyncActivityRequest {
 	if t == nil {
 		return nil
 	}
 	return &history.SyncActivityRequest{
-		DomainId:           t.DomainID,
-		WorkflowId:         t.WorkflowID,
-		RunId:              t.RunID,
-		Version:            t.Version,
-		ScheduledId:        t.ScheduledID,
+		DomainId:           &t.DomainID,
+		WorkflowId:         &t.WorkflowID,
+		RunId:              &t.RunID,
+		Version:            &t.Version,
+		ScheduledId:        &t.ScheduledID,
 		ScheduledTime:      t.ScheduledTime,
-		StartedId:          t.StartedID,
+		StartedId:          &t.StartedID,
 		StartedTime:        t.StartedTime,
 		LastHeartbeatTime:  t.LastHeartbeatTime,
 		Details:            t.Details,
-		Attempt:            t.Attempt,
+		Attempt:            &t.Attempt,
 		LastFailureReason:  t.LastFailureReason,
-		LastWorkerIdentity: t.LastWorkerIdentity,
+		LastWorkerIdentity: &t.LastWorkerIdentity,
 		LastFailureDetails: t.LastFailureDetails,
+		LastFailureOptions: FromFailureOptions(t.LastFailureOptions),
 		VersionHistory:     FromVersionHistory(t.VersionHistory),
 	}
 }
 
-// ToSyncActivityRequest converts thrift SyncActivityRequest type to internal
-func ToSyncActivityRequest(t *history.SyncActivityRequest) *types.SyncActivityRequest {
+// ToHistorySyncActivityRequest converts thrift SyncActivityRequest type to internal
+func ToHistorySyncActivityRequest(t *history.SyncActivityRequest) *types.SyncActivityRequest {
 	if t == nil {
 		return nil
 	}
 	return &types.SyncActivityRequest{
-		DomainID:           t.DomainId,
-		WorkflowID:         t.WorkflowId,
-		RunID:              t.RunId,
-		Version:            t.Version,
-		ScheduledID:        t.ScheduledId,
+		DomainID:           t.GetDomainId(),
+		WorkflowID:         t.GetWorkflowId(),
+		RunID:              t.GetRunId(),
+		Version:            t.GetVersion(),
+		ScheduledID:        t.GetScheduledId(),
 		ScheduledTime:      t.ScheduledTime,
-		StartedID:          t.StartedId,
+		StartedID:          t.GetStartedId(),
 		StartedTime:        t.StartedTime,
 		LastHeartbeatTime:  t.LastHeartbeatTime,
 		Details:            t.Details,
-		Attempt:            t.Attempt,
+		Attempt:            t.GetAttempt(),
 		LastFailureReason:  t.LastFailureReason,
-		LastWorkerIdentity: t.LastWorkerIdentity,
+		LastWorkerIdentity: t.GetLastWorkerIdentity(),
 		LastFailureDetails: t.LastFailureDetails,
+		LastFailureOptions: ToFailureOptions(t.LastFailureOptions),
 		VersionHistory:     ToVersionHistory(t.VersionHistory),
 	}
 }
 
-// FromSyncShardStatusRequest converts internal SyncShardStatusRequest type to thrift
-func FromSyncShardStatusRequest(t *types.SyncShardStatusRequest) *history.SyncShardStatusRequest {
+// FromHistorySyncShardStatusRequest converts internal SyncShardStatusRequest type to thrift
+func FromHistorySyncShardStatusRequest(t *types.SyncShardStatusRequest) *history.SyncShardStatusRequest {
 	if t == nil {
 		return nil
 	}
 	return &history.SyncShardStatusRequest{
-		SourceCluster: t.SourceCluster,
-		ShardId:       t.ShardID,
+		SourceCluster: &t.SourceCluster,
+		ShardId:       &t.ShardID,
 		Timestamp:     t.Timestamp,
 	}
 }
 
-// ToSyncShardStatusRequest converts thrift SyncShardStatusRequest type to internal
-func ToSyncShardStatusRequest(t *history.SyncShardStatusRequest) *types.SyncShardStatusRequest {
+// ToHistorySyncShardStatusRequest converts thrift SyncShardStatusRequest type to internal
+func ToHistorySyncShardStatusRequest(t *history.SyncShardStatusRequest) *types.SyncShardStatusRequest {
 	if t == nil {
 		return nil
 	}
 	return &types.SyncShardStatusRequest{
-		SourceCluster: t.SourceCluster,
-		ShardID:       t.ShardId,
+		SourceCluster: t.GetSourceCluster(),
+		ShardID:       t.GetShardId(),
 		Timestamp:     t.Timestamp,
 	}
 }
@@ -3146,8 +1244,10 @@ func FromHistoryTerminateWorkflowExecutionRequest(t *types.HistoryTerminateWorkf
 		return nil
 	}
 	return &history.TerminateWorkflowExecutionRequest{
-		DomainUUID:       t.DomainUUID,
-		TerminateRequest: FromTerminateWorkflowExecutionRequest(t.TerminateRequest),
+		DomainUUID:                &t.DomainUUID,
+		TerminateRequest:          FromTerminateWorkflowExecutionRequest(t.TerminateRequest),
+		ExternalWorkflowExecution: FromWorkflowExecution(t.ExternalWorkflowExecution),
+		ChildWorkflowOnly:         &t.ChildWorkflowOnly,
 	}
 }
 
@@ -3157,8 +1257,10 @@ func ToHistoryTerminateWorkflowExecutionRequest(t *history.TerminateWorkflowExec
 		return nil
 	}
 	return &types.HistoryTerminateWorkflowExecutionRequest{
-		DomainUUID:       t.DomainUUID,
-		TerminateRequest: ToTerminateWorkflowExecutionRequest(t.TerminateRequest),
+		DomainUUID:                t.GetDomainUUID(),
+		TerminateRequest:          ToTerminateWorkflowExecutionRequest(t.TerminateRequest),
+		ExternalWorkflowExecution: ToWorkflowExecution(t.ExternalWorkflowExecution),
+		ChildWorkflowOnly:         t.GetChildWorkflowOnly(),
 	}
 }
 
@@ -3210,30 +1312,7 @@ func ToProcessingQueueStateArray(t []*history.ProcessingQueueState) []*types.Pro
 	return v
 }
 
-// FromProcessingQueueStateMap converts internal ProcessingQueueState type map to thrift
-func FromProcessingQueueStateMap(t map[string]*types.ProcessingQueueState) map[string]*history.ProcessingQueueState {
-	if t == nil {
-		return nil
-	}
-	v := make(map[string]*history.ProcessingQueueState, len(t))
-	for key := range t {
-		v[key] = FromProcessingQueueState(t[key])
-	}
-	return v
-}
-
-// ToProcessingQueueStateMap converts thrift ProcessingQueueState type map to internal
-func ToProcessingQueueStateMap(t map[string]*history.ProcessingQueueState) map[string]*types.ProcessingQueueState {
-	if t == nil {
-		return nil
-	}
-	v := make(map[string]*types.ProcessingQueueState, len(t))
-	for key := range t {
-		v[key] = ToProcessingQueueState(t[key])
-	}
-	return v
-}
-
+// FromProcessingQueueStateArrayMap converts internal ProcessingQueueState array map to thrift
 func FromProcessingQueueStateArrayMap(t map[string][]*types.ProcessingQueueState) map[string][]*history.ProcessingQueueState {
 	if t == nil {
 		return nil
@@ -3245,6 +1324,7 @@ func FromProcessingQueueStateArrayMap(t map[string][]*types.ProcessingQueueState
 	return v
 }
 
+// ToProcessingQueueStateArrayMap converts thrift ProcessingQueueState array map to internal
 func ToProcessingQueueStateArrayMap(t map[string][]*history.ProcessingQueueState) map[string][]*types.ProcessingQueueState {
 	if t == nil {
 		return nil
@@ -3254,4 +1334,79 @@ func ToProcessingQueueStateArrayMap(t map[string][]*history.ProcessingQueueState
 		v[key] = ToProcessingQueueStateArray(t[key])
 	}
 	return v
+}
+
+// FromGetFailoverInfoRequest converts internal GetFailoverInfoRequest type to thrift
+func FromGetFailoverInfoRequest(t *types.GetFailoverInfoRequest) *history.GetFailoverInfoRequest {
+	if t == nil {
+		return nil
+	}
+	return &history.GetFailoverInfoRequest{
+		DomainID: &t.DomainID,
+	}
+}
+
+// ToGetFailoverInfoRequest converts thrift GetFailoverInfoRequest type to internal
+func ToGetFailoverInfoRequest(t *history.GetFailoverInfoRequest) *types.GetFailoverInfoRequest {
+	if t == nil {
+		return nil
+	}
+	return &types.GetFailoverInfoRequest{
+		DomainID: t.GetDomainID(),
+	}
+}
+
+// FromGetFailoverInfoResponse converts internal GetFailoverInfoRequest type to thrift
+func FromGetFailoverInfoResponse(t *types.GetFailoverInfoResponse) *history.GetFailoverInfoResponse {
+	if t == nil {
+		return nil
+	}
+	return &history.GetFailoverInfoResponse{
+		CompletedShardCount: &t.CompletedShardCount,
+		PendingShards:       t.GetPendingShards(),
+	}
+}
+
+// ToGetFailoverInfoResponse converts thrift GetFailoverInfoResponse type to internal
+func ToGetFailoverInfoResponse(t *history.GetFailoverInfoResponse) *types.GetFailoverInfoResponse {
+	if t == nil {
+		return nil
+	}
+	return &types.GetFailoverInfoResponse{
+		CompletedShardCount: t.GetCompletedShardCount(),
+		PendingShards:       t.GetPendingShards(),
+	}
+}
+
+func FromHistoryRatelimitUpdateRequest(t *types.RatelimitUpdateRequest) *history.RatelimitUpdateRequest {
+	if t == nil {
+		return nil
+	}
+	return &history.RatelimitUpdateRequest{
+		Data: FromAny(t.Any),
+	}
+}
+func ToHistoryRatelimitUpdateRequest(t *history.RatelimitUpdateRequest) *types.RatelimitUpdateRequest {
+	if t == nil {
+		return nil
+	}
+	return &types.RatelimitUpdateRequest{
+		Any: ToAny(t.Data),
+	}
+}
+func FromHistoryRatelimitUpdateResponse(t *types.RatelimitUpdateResponse) *history.RatelimitUpdateResponse {
+	if t == nil {
+		return nil
+	}
+	return &history.RatelimitUpdateResponse{
+		Data: FromAny(t.Any),
+	}
+}
+func ToHistoryRatelimitUpdateResponse(t *history.RatelimitUpdateResponse) *types.RatelimitUpdateResponse {
+	if t == nil {
+		return nil
+	}
+	return &types.RatelimitUpdateResponse{
+		Any: ToAny(t.Data),
+	}
 }

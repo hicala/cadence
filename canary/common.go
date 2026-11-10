@@ -29,13 +29,6 @@ import (
 	"go.uber.org/zap"
 )
 
-func maxInt64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 func absDurationDiff(d1, d2 time.Duration) time.Duration {
 	if d1 > d2 {
 		return d1 - d2
@@ -53,7 +46,7 @@ func int32Ptr(v int32) *int32 {
 
 // getContextValue retrieves and returns the value corresponding
 // to the given key - panics if the key does not exist
-func getContextValue(ctx context.Context, key string) interface{} {
+func getContextValue(ctx context.Context, key contextKey) interface{} {
 	value := ctx.Value(key)
 	if value == nil {
 		panic("ctx.Value(" + key + ") returned nil")
@@ -104,4 +97,11 @@ func beginWorkflow(ctx workflow.Context, wfType string, scheduledTimeNanos int64
 
 func concat(first string, second string) string {
 	return first + "/" + second
+}
+
+func getScheduledTimeFromInputIfNonZero(ctx workflow.Context, nanos int64) int64 {
+	if nanos == 0 {
+		return workflow.Now(ctx).UnixNano()
+	}
+	return nanos
 }

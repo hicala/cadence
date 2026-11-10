@@ -22,39 +22,45 @@ package task
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"math/rand"
+	"strconv"
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
 	"github.com/pborman/uuid"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"go.uber.org/mock/gomock"
+	"go.uber.org/yarpc"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
-	"github.com/uber/cadence/.gen/go/history"
-	"github.com/uber/cadence/.gen/go/history/historyservicetest"
-	"github.com/uber/cadence/.gen/go/matching"
-	"github.com/uber/cadence/.gen/go/matching/matchingservicetest"
-	workflow "github.com/uber/cadence/.gen/go/shared"
+	hclient "github.com/uber/cadence/client/history"
+	"github.com/uber/cadence/client/matching"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/archiver"
 	"github.com/uber/cadence/common/archiver/provider"
-	"github.com/uber/cadence/common/backoff"
 	"github.com/uber/cadence/common/cache"
 	"github.com/uber/cadence/common/clock"
-	"github.com/uber/cadence/common/cluster"
+	"github.com/uber/cadence/common/dynamicconfig/dynamicproperties"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/mocks"
 	"github.com/uber/cadence/common/persistence"
-	p "github.com/uber/cadence/common/persistence"
-	dc "github.com/uber/cadence/common/service/dynamicconfig"
+	commonsemaphore "github.com/uber/cadence/common/semaphore"
+	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/service/history/config"
 	"github.com/uber/cadence/service/history/constants"
 	"github.com/uber/cadence/service/history/engine"
 	"github.com/uber/cadence/service/history/events"
 	"github.com/uber/cadence/service/history/execution"
+	"github.com/uber/cadence/service/history/reset"
 	"github.com/uber/cadence/service/history/shard"
 	test "github.com/uber/cadence/service/history/testing"
+	"github.com/uber/cadence/service/history/workflowcache"
 	warchiver "github.com/uber/cadence/service/worker/archiver"
 	"github.com/uber/cadence/service/worker/parentclosepolicy"
 )
@@ -64,35 +70,28 @@ type (
 		suite.Suite
 		*require.Assertions
 
-		controller          *gomock.Controller
-		mockShard           *shard.TestContext
-		mockEngine          *engine.MockEngine
-		mockDomainCache     *cache.MockDomainCache
-		mockMatchingClient  *matchingservicetest.MockClient
-		mockHistoryClient   *historyservicetest.MockClient
-		mockClusterMetadata *cluster.MockMetadata
+		controller         *gomock.Controller
+		mockShard          *shard.TestContext
+		mockEngine         *engine.MockEngine
+		mockDomainCache    *cache.MockDomainCache
+		mockWFCache        *workflowcache.MockWFCache
+		mockHistoryClient  *hclient.MockClient
+		mockMatchingClient *matching.MockClient
 
 		mockVisibilityMgr           *mocks.VisibilityManager
 		mockExecutionMgr            *mocks.ExecutionManager
 		mockHistoryV2Mgr            *mocks.HistoryV2Manager
-		mockArchivalClient          *warchiver.ClientMock
+		mockArchivalClient          *warchiver.MockClient
 		mockArchivalMetadata        *archiver.MockArchivalMetadata
 		mockArchiverProvider        *provider.MockArchiverProvider
-		mockParentClosePolicyClient *parentclosepolicy.ClientMock
+		mockParentClosePolicyClient *parentclosepolicy.MockClient
 
 		logger                     log.Logger
 		domainID                   string
 		domainName                 string
 		domainEntry                *cache.DomainCacheEntry
-		targetDomainID             string
-		targetDomainName           string
-		targetDomainEntry          *cache.DomainCacheEntry
-		childDomainID              string
-		childDomainName            string
-		childDomainEntry           *cache.DomainCacheEntry
 		version                    int64
-		now                        time.Time
-		timeSource                 *clock.EventTimeSource
+		timeSource                 clock.MockedTimeSource
 		transferActiveTaskExecutor *transferActiveTaskExecutor
 	}
 )
@@ -116,27 +115,21 @@ func (s *transferActiveTaskExecutorSuite) SetupTest() {
 	s.domainID = constants.TestDomainID
 	s.domainName = constants.TestDomainName
 	s.domainEntry = constants.TestGlobalDomainEntry
-	s.targetDomainID = constants.TestTargetDomainID
-	s.targetDomainName = constants.TestTargetDomainName
-	s.targetDomainEntry = constants.TestGlobalTargetDomainEntry
-	s.childDomainID = constants.TestChildDomainID
-	s.childDomainName = constants.TestChildDomainName
-	s.childDomainEntry = constants.TestGlobalChildDomainEntry
 	s.version = s.domainEntry.GetFailoverVersion()
-	s.now = time.Now()
-	s.timeSource = clock.NewEventTimeSource().Update(s.now)
+	s.timeSource = clock.NewMockedTimeSource()
 
 	s.controller = gomock.NewController(s.T())
 
-	config := config.NewForTest()
+	testConfig := config.NewForTest()
 	s.mockShard = shard.NewTestContext(
+		s.T(),
 		s.controller,
 		&persistence.ShardInfo{
 			ShardID:          0,
 			RangeID:          1,
 			TransferAckLevel: 0,
 		},
-		config,
+		testConfig,
 	)
 	s.mockShard.SetEventsCache(events.NewCache(
 		s.mockShard.GetShardID(),
@@ -144,6 +137,7 @@ func (s *transferActiveTaskExecutorSuite) SetupTest() {
 		s.mockShard.GetConfig(),
 		s.mockShard.GetLogger(),
 		s.mockShard.GetMetricsClient(),
+		s.mockShard.GetDomainCache(),
 	))
 	s.mockShard.Resource.TimeSource = s.timeSource
 
@@ -151,31 +145,37 @@ func (s *transferActiveTaskExecutorSuite) SetupTest() {
 	s.mockEngine.EXPECT().NotifyNewHistoryEvent(gomock.Any()).AnyTimes()
 	s.mockEngine.EXPECT().NotifyNewTransferTasks(gomock.Any()).AnyTimes()
 	s.mockEngine.EXPECT().NotifyNewTimerTasks(gomock.Any()).AnyTimes()
+	s.mockEngine.EXPECT().NotifyNewReplicationTasks(gomock.Any()).AnyTimes()
 	s.mockShard.SetEngine(s.mockEngine)
 
-	s.mockParentClosePolicyClient = &parentclosepolicy.ClientMock{}
-	s.mockArchivalClient = &warchiver.ClientMock{}
+	s.mockParentClosePolicyClient = parentclosepolicy.NewMockClient(s.controller)
+	s.mockArchivalClient = warchiver.NewMockClient(s.controller)
 	s.mockMatchingClient = s.mockShard.Resource.MatchingClient
 	s.mockHistoryClient = s.mockShard.Resource.HistoryClient
 	s.mockExecutionMgr = s.mockShard.Resource.ExecutionMgr
 	s.mockHistoryV2Mgr = s.mockShard.Resource.HistoryMgr
 	s.mockVisibilityMgr = s.mockShard.Resource.VisibilityMgr
-	s.mockClusterMetadata = s.mockShard.Resource.ClusterMetadata
 	s.mockArchivalMetadata = s.mockShard.Resource.ArchivalMetadata
 	s.mockArchiverProvider = s.mockShard.Resource.ArchiverProvider
 	s.mockDomainCache = s.mockShard.Resource.DomainCache
-	s.mockDomainCache.EXPECT().GetDomainByID(constants.TestDomainID).Return(constants.TestGlobalDomainEntry, nil).AnyTimes()
-	s.mockDomainCache.EXPECT().GetDomain(constants.TestDomainName).Return(constants.TestGlobalDomainEntry, nil).AnyTimes()
-	s.mockDomainCache.EXPECT().GetDomainByID(constants.TestTargetDomainID).Return(constants.TestGlobalTargetDomainEntry, nil).AnyTimes()
-	s.mockDomainCache.EXPECT().GetDomain(constants.TestTargetDomainName).Return(constants.TestGlobalTargetDomainEntry, nil).AnyTimes()
-	s.mockDomainCache.EXPECT().GetDomainByID(constants.TestParentDomainID).Return(constants.TestGlobalParentDomainEntry, nil).AnyTimes()
-	s.mockDomainCache.EXPECT().GetDomain(constants.TestParentDomainName).Return(constants.TestGlobalParentDomainEntry, nil).AnyTimes()
-	s.mockDomainCache.EXPECT().GetDomainByID(constants.TestChildDomainID).Return(constants.TestGlobalChildDomainEntry, nil).AnyTimes()
-	s.mockDomainCache.EXPECT().GetDomain(constants.TestChildDomainName).Return(constants.TestGlobalChildDomainEntry, nil).AnyTimes()
-	s.mockClusterMetadata.EXPECT().GetCurrentClusterName().Return(cluster.TestCurrentClusterName).AnyTimes()
-	s.mockClusterMetadata.EXPECT().GetAllClusterInfo().Return(cluster.TestAllClusterInfo).AnyTimes()
-	s.mockClusterMetadata.EXPECT().IsGlobalDomainEnabled().Return(true).AnyTimes()
-	s.mockClusterMetadata.EXPECT().ClusterNameForFailoverVersion(s.version).Return(s.mockClusterMetadata.GetCurrentClusterName()).AnyTimes()
+	s.mockWFCache = workflowcache.NewMockWFCache(s.controller)
+
+	s.mockDomainCache.EXPECT().GetDomain(constants.TestRateLimitedDomainName).Return(constants.TestRateLimitedDomainEntry, nil).AnyTimes()
+	s.mockDomainCache.EXPECT().GetDomain(s.domainName).Return(s.domainEntry, nil).AnyTimes()
+	s.mockDomainCache.EXPECT().GetDomainByID(constants.TestRateLimitedDomainID).Return(constants.TestRateLimitedDomainEntry, nil).AnyTimes()
+	s.mockDomainCache.EXPECT().GetDomainByID(s.domainID).Return(s.domainEntry, nil).AnyTimes()
+	s.mockDomainCache.EXPECT().GetDomainID(s.domainName).Return(s.domainID, nil).AnyTimes()
+	s.mockDomainCache.EXPECT().GetDomainName(s.domainID).Return(s.domainName, nil).AnyTimes()
+
+	s.mockDomainCache.EXPECT().GetDomainByID(constants.TestRateLimitedDomainID).Return(constants.TestRateLimitedDomainEntry, nil).AnyTimes()
+	s.mockDomainCache.EXPECT().GetDomainName(constants.TestRateLimitedDomainID).Return(constants.TestRateLimitedDomainName, nil).AnyTimes()
+	s.mockDomainCache.EXPECT().GetDomain(constants.TestRateLimitedDomainName).Return(constants.TestRateLimitedDomainEntry, nil).AnyTimes()
+
+	testActiveClusterInfo := &types.ActiveClusterInfo{
+		ActiveClusterName: constants.TestGlobalDomainEntry.GetReplicationConfig().ActiveClusterName,
+		FailoverVersion:   constants.TestGlobalDomainEntry.GetFailoverVersion(),
+	}
+	s.mockShard.Resource.ActiveClusterMgr.EXPECT().GetActiveClusterInfoByWorkflow(gomock.Any(), constants.TestDomainID, constants.TestWorkflowID, constants.TestRunID).Return(testActiveClusterInfo, nil).AnyTimes()
 
 	s.logger = s.mockShard.GetLogger()
 	s.transferActiveTaskExecutor = NewTransferActiveTaskExecutor(
@@ -184,1787 +184,2316 @@ func (s *transferActiveTaskExecutorSuite) SetupTest() {
 		execution.NewCache(s.mockShard),
 		nil,
 		s.logger,
-		s.mockShard.GetMetricsClient(),
-		config,
+		testConfig,
+		s.mockWFCache,
 	).(*transferActiveTaskExecutor)
 	s.transferActiveTaskExecutor.parentClosePolicyClient = s.mockParentClosePolicyClient
 }
 
 func (s *transferActiveTaskExecutorSuite) TearDownTest() {
+	s.transferActiveTaskExecutor.Stop()
 	s.controller.Finish()
 	s.mockShard.Finish(s.T())
-	s.mockArchivalClient.AssertExpectations(s.T())
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessActivityTask_Success() {
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
 
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
+	event, ai := test.AddActivityTaskScheduledEvent(
+		mutableState,
+		decisionCompletionID,
+		"activity-1",
+		"some random activity type",
+		mutableState.GetExecutionInfo().TaskList,
+		[]byte{}, 1, 1, 1, 1,
 	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
+	mutableState.FlushBufferedEvents()
+
+	transferTask := s.newTransferTaskFromInfo(&persistence.ActivityTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
 		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+		TargetDomainID: constants.TestDomainID,
+		TaskList:       mutableState.GetExecutionInfo().TaskList,
+		ScheduleID:     event.ID,
+	})
+
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+	s.NoError(err)
+	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+	s.mockMatchingClient.EXPECT().AddActivityTask(gomock.Any(), createAddActivityTaskRequest(transferTask, ai, mutableState.GetExecutionInfo().PartitionConfig)).Return(&types.AddActivityTaskResponse{}, nil).Times(1)
+	s.mockWFCache.EXPECT().AllowInternal(constants.TestDomainID, constants.TestWorkflowID).Return(true).Times(1)
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+	s.Nil(err)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessActivityTask_EphemeralTaskListKind() {
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
+
+	event, ai, _, _ := mutableState.AddActivityTaskScheduledEvent(decisionCompletionID, &types.ScheduleActivityTaskDecisionAttributes{
+		ActivityID:                    "activity-1",
+		ActivityType:                  &types.ActivityType{Name: "some random activity type"},
+		TaskList:                      &types.TaskList{Name: mutableState.GetExecutionInfo().TaskList, Kind: types.TaskListKindEphemeral.Ptr()},
+		Input:                         []byte{},
+		ScheduleToCloseTimeoutSeconds: common.Int32Ptr(1),
+		ScheduleToStartTimeoutSeconds: common.Int32Ptr(1),
+		StartToCloseTimeoutSeconds:    common.Int32Ptr(1),
+		HeartbeatTimeoutSeconds:       common.Int32Ptr(1),
+	})
+	mutableState.FlushBufferedEvents()
+
+	transferTask := s.newTransferTaskFromInfo(&persistence.ActivityTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+		TargetDomainID: constants.TestDomainID,
+		TaskList:       "ignored",
+		ScheduleID:     event.ID,
+	})
+
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+	s.NoError(err)
+	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+	s.mockMatchingClient.EXPECT().AddActivityTask(gomock.Any(), createAddActivityTaskRequest(transferTask, ai, mutableState.GetExecutionInfo().PartitionConfig)).Return(&types.AddActivityTaskResponse{}, nil).Times(1)
+	s.mockWFCache.EXPECT().AllowInternal(constants.TestDomainID, constants.TestWorkflowID).Return(true).Times(1)
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+	s.Nil(err)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessActivityTask_Ratelimits() {
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, constants.TestDomainID)
+	s.NoError(err)
+
+	event, ai := test.AddActivityTaskScheduledEvent(
+		mutableState,
+		decisionCompletionID,
+		"activity-1",
+		"some random activity type",
+		mutableState.GetExecutionInfo().TaskList,
+		[]byte{}, 1, 1, 1, 1,
 	)
+	mutableState.FlushBufferedEvents()
+
+	transferTaskInRatelimitedDomain := s.newTransferTaskFromInfo(&persistence.ActivityTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   constants.TestRateLimitedDomainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+		TargetDomainID: constants.TestRateLimitedDomainID,
+		TaskList:       mutableState.GetExecutionInfo().TaskList,
+		ScheduleID:     event.ID,
+	})
+
+	transferTask := s.newTransferTaskFromInfo(&persistence.ActivityTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+		TargetDomainID: constants.TestDomainID,
+		TaskList:       mutableState.GetExecutionInfo().TaskList,
+		ScheduleID:     event.ID,
+	})
+
+	// Rate limited cases: rate check happens before mutable state is loaded, so no DB call needed.
+	s.mockWFCache.EXPECT().AllowInternal(constants.TestRateLimitedDomainID, constants.TestWorkflowID).Return(false).Times(1)
+	_, err = s.transferActiveTaskExecutor.Execute(transferTaskInRatelimitedDomain)
+	s.Error(err)
+	s.Equal("workflow is being rate limited for making too many requests", err.Error())
+
+	s.mockWFCache.EXPECT().AllowInternal(constants.TestDomainID, constants.TestWorkflowID).Return(false).Times(1)
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+	s.Error(err)
+	s.Equal("workflow is being rate limited for making too many requests", err.Error())
+
+	// Allowed cases: mutable state is loaded and the task is pushed to matching.
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+	s.NoError(err)
+	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+	s.mockMatchingClient.EXPECT().AddActivityTask(gomock.Any(), createAddActivityTaskRequest(transferTaskInRatelimitedDomain, ai, mutableState.GetExecutionInfo().PartitionConfig)).Return(&types.AddActivityTaskResponse{}, nil).Times(1)
+	s.mockMatchingClient.EXPECT().AddActivityTask(gomock.Any(), createAddActivityTaskRequest(transferTask, ai, mutableState.GetExecutionInfo().PartitionConfig)).Return(&types.AddActivityTaskResponse{}, nil).Times(1)
+
+	s.mockWFCache.EXPECT().AllowInternal(constants.TestRateLimitedDomainID, constants.TestWorkflowID).Return(true).Times(1)
+	_, err = s.transferActiveTaskExecutor.Execute(transferTaskInRatelimitedDomain)
 	s.Nil(err)
 
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-	event = test.AddDecisionTaskCompletedEvent(mutableState, di.ScheduleID, di.StartedID, nil, "some random identity")
-
-	taskID := int64(59)
-	activityID := "activity-1"
-	activityType := "some random activity type"
-	event, ai := test.AddActivityTaskScheduledEvent(mutableState, event.GetEventId(), activityID, activityType, taskListName, []byte{}, 1, 1, 1, 1)
-	mutableState.FlushBufferedEvents()
-	transferTask := &persistence.TransferTaskInfo{
-		Version:        s.version,
-		DomainID:       s.domainID,
-		TargetDomainID: constants.TestTargetDomainID,
-		WorkflowID:     workflowExecution.GetWorkflowId(),
-		RunID:          workflowExecution.GetRunId(),
-		TaskID:         taskID,
-		TaskList:       taskListName,
-		TaskType:       persistence.TransferTaskTypeActivityTask,
-		ScheduleID:     event.GetEventId(),
-	}
-
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, event.GetEventId(), event.GetVersion())
-	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
-	s.mockMatchingClient.EXPECT().AddActivityTask(gomock.Any(), s.createAddActivityTaskRequest(transferTask, ai)).Return(nil).Times(1)
-
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
+	s.mockWFCache.EXPECT().AllowInternal(constants.TestDomainID, constants.TestWorkflowID).Return(true).Times(1)
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
 	s.Nil(err)
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessActivityTask_Duplication() {
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
 
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
+	event, ai := test.AddActivityTaskScheduledEvent(
+		mutableState,
+		decisionCompletionID,
+		"activity-1",
+		"some random activity type",
+		mutableState.GetExecutionInfo().TaskList,
+		[]byte{}, 1, 1, 1, 1,
 	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
-		},
-	)
-	s.Nil(err)
 
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-	event = test.AddDecisionTaskCompletedEvent(mutableState, di.ScheduleID, di.StartedID, nil, "some random identity")
-
-	taskID := int64(59)
-	activityID := "activity-1"
-	activityType := "some random activity type"
-	event, ai := test.AddActivityTaskScheduledEvent(mutableState, event.GetEventId(), activityID, activityType, taskListName, []byte{}, 1, 1, 1, 1)
-
-	transferTask := &persistence.TransferTaskInfo{
-		Version:        s.version,
-		DomainID:       s.domainID,
-		TargetDomainID: s.targetDomainID,
-		WorkflowID:     workflowExecution.GetWorkflowId(),
-		RunID:          workflowExecution.GetRunId(),
-		TaskID:         taskID,
-		TaskList:       taskListName,
-		TaskType:       persistence.TransferTaskTypeActivityTask,
-		ScheduleID:     event.GetEventId(),
-	}
-
-	event = test.AddActivityTaskStartedEvent(mutableState, event.GetEventId(), "")
-	ai.StartedID = event.GetEventId()
+	event = test.AddActivityTaskStartedEvent(mutableState, event.ID, "")
+	ai.StartedID = event.ID
 	event = test.AddActivityTaskCompletedEvent(mutableState, ai.ScheduleID, ai.StartedID, nil, "")
 	mutableState.FlushBufferedEvents()
 
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, event.GetEventId(), event.GetVersion())
-	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+	transferTask := s.newTransferTaskFromInfo(&persistence.ActivityTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+		TargetDomainID: constants.TestDomainID,
+		TaskList:       mutableState.GetExecutionInfo().TaskList,
+		ScheduleID:     event.ID,
+	})
 
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+	s.NoError(err)
+	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+	s.mockWFCache.EXPECT().AllowInternal(s.domainID, constants.TestWorkflowID).Return(true).Times(1)
+
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
 	s.Nil(err)
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessDecisionTask_FirstDecision() {
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
+	workflowExecution, mutableState, err := test.StartWorkflow(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
 
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
-		},
-	)
-	s.Nil(err)
-
-	taskID := int64(59)
 	di := test.AddDecisionTaskScheduledEvent(mutableState)
 
-	transferTask := &persistence.TransferTaskInfo{
-		Version:    s.version,
-		DomainID:   s.domainID,
-		WorkflowID: workflowExecution.GetWorkflowId(),
-		RunID:      workflowExecution.GetRunId(),
-		TaskID:     taskID,
-		TaskList:   taskListName,
-		TaskType:   persistence.TransferTaskTypeDecisionTask,
+	transferTask := s.newTransferTaskFromInfo(&persistence.DecisionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+		TaskList:   mutableState.GetExecutionInfo().TaskList,
 		ScheduleID: di.ScheduleID,
-	}
+	})
 
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, di.ScheduleID, di.Version)
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, di.ScheduleID, di.Version)
+	s.NoError(err)
 	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
-	s.mockMatchingClient.EXPECT().AddDecisionTask(gomock.Any(), s.createAddDecisionTaskRequest(transferTask, mutableState)).Return(nil).Times(1)
+	s.mockWFCache.EXPECT().AllowInternal(constants.TestDomainID, constants.TestWorkflowID).Return(true).Times(1)
+	s.mockMatchingClient.EXPECT().AddDecisionTask(gomock.Any(), createAddDecisionTaskRequest(transferTask, mutableState)).Return(&types.AddDecisionTaskResponse{}, nil).Times(1)
 
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
 	s.Nil(err)
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessDecisionTask_NonFirstDecision() {
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
-
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
-		},
-	)
-	s.Nil(err)
-
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-	event = test.AddDecisionTaskCompletedEvent(mutableState, di.ScheduleID, di.StartedID, nil, "some random identity")
-	s.NotNil(event)
+	workflowExecution, mutableState, _, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
 
 	// make another round of decision
-	taskID := int64(59)
-	di = test.AddDecisionTaskScheduledEvent(mutableState)
+	di := test.AddDecisionTaskScheduledEvent(mutableState)
 
-	transferTask := &persistence.TransferTaskInfo{
-		Version:    s.version,
-		DomainID:   s.domainID,
-		WorkflowID: workflowExecution.GetWorkflowId(),
-		RunID:      workflowExecution.GetRunId(),
-		TaskID:     taskID,
-		TaskList:   taskListName,
-		TaskType:   persistence.TransferTaskTypeDecisionTask,
+	transferTask := s.newTransferTaskFromInfo(&persistence.DecisionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+		TaskList:   mutableState.GetExecutionInfo().TaskList,
 		ScheduleID: di.ScheduleID,
-	}
+	})
 
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, di.ScheduleID, di.Version)
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, di.ScheduleID, di.Version)
+	s.NoError(err)
 	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
-	s.mockMatchingClient.EXPECT().AddDecisionTask(gomock.Any(), s.createAddDecisionTaskRequest(transferTask, mutableState)).Return(nil).Times(1)
+	s.mockWFCache.EXPECT().AllowInternal(constants.TestDomainID, constants.TestWorkflowID).Return(true).Times(1)
+	s.mockMatchingClient.EXPECT().AddDecisionTask(gomock.Any(), createAddDecisionTaskRequest(transferTask, mutableState)).Return(&types.AddDecisionTaskResponse{}, nil).Times(1)
 
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
 	s.Nil(err)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessDecisionTask_Ratelimits() {
+
+	workflowExecution, mutableState, _, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
+
+	// make another round of decision
+	di := test.AddDecisionTaskScheduledEvent(mutableState)
+
+	transferTask := s.newTransferTaskFromInfo(&persistence.DecisionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+		TaskList:   mutableState.GetExecutionInfo().TaskList,
+		ScheduleID: di.ScheduleID,
+	})
+
+	rateLimitedTransferTask := s.newTransferTaskFromInfo(&persistence.DecisionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   constants.TestRateLimitedDomainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+		TaskList:   mutableState.GetExecutionInfo().TaskList,
+		ScheduleID: di.ScheduleID,
+	})
+
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, di.ScheduleID, di.Version)
+	s.NoError(err)
+	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+
+	// expected calls to the matching service if task processing is allowed
+	s.mockMatchingClient.EXPECT().AddDecisionTask(gomock.Any(), createAddDecisionTaskRequest(transferTask, mutableState)).Return(&types.AddDecisionTaskResponse{}, nil).Times(1)
+	s.mockMatchingClient.EXPECT().AddDecisionTask(gomock.Any(), createAddDecisionTaskRequest(rateLimitedTransferTask, mutableState)).Return(&types.AddDecisionTaskResponse{}, nil).Times(1)
+
+	// RPS still below allowed value so the task can be executed
+	s.mockWFCache.EXPECT().AllowInternal(constants.TestRateLimitedDomainID, constants.TestWorkflowID).Return(true).Times(1)
+	_, err = s.transferActiveTaskExecutor.Execute(rateLimitedTransferTask)
+	s.Nil(err)
+
+	// RPS more than allowed limit so the task cannot be executed
+	s.mockWFCache.EXPECT().AllowInternal(constants.TestRateLimitedDomainID, constants.TestWorkflowID).Return(false).Times(1)
+	_, err = s.transferActiveTaskExecutor.Execute(rateLimitedTransferTask)
+	s.Error(err)
+	s.Equal("workflow is being rate limited for making too many requests", err.Error())
+
+	// RPS still below allowed value so the task can be executed
+	s.mockWFCache.EXPECT().AllowInternal(constants.TestDomainID, constants.TestWorkflowID).Return(true).Times(1)
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+	s.Nil(err)
+
+	// RPS more than allowed limit so the task cannot be executed
+	s.mockWFCache.EXPECT().AllowInternal(constants.TestDomainID, constants.TestWorkflowID).Return(false).Times(1)
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+	s.Error(err)
+	s.Equal("workflow is being rate limited for making too many requests", err.Error())
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessDecisionTask_Sticky_NonFirstDecision() {
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
-	stickyTaskListName := "some random sticky task list"
-	stickyTaskListTimeout := int32(233)
+	workflowExecution, mutableState, _, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
 
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
-		},
-	)
-	s.Nil(err)
-
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-	event = test.AddDecisionTaskCompletedEvent(mutableState, di.ScheduleID, di.StartedID, nil, "some random identity")
-	s.NotNil(event)
 	// set the sticky tasklist attr
 	executionInfo := mutableState.GetExecutionInfo()
-	executionInfo.StickyTaskList = stickyTaskListName
-	executionInfo.StickyScheduleToStartTimeout = stickyTaskListTimeout
+	executionInfo.StickyTaskList = "some random sticky task list"
+	executionInfo.StickyScheduleToStartTimeout = int32(233)
 
 	// make another round of decision
-	taskID := int64(59)
-	di = test.AddDecisionTaskScheduledEvent(mutableState)
+	di := test.AddDecisionTaskScheduledEvent(mutableState)
 
-	transferTask := &persistence.TransferTaskInfo{
-		Version:    s.version,
-		DomainID:   s.domainID,
-		WorkflowID: workflowExecution.GetWorkflowId(),
-		RunID:      workflowExecution.GetRunId(),
-		TaskID:     taskID,
-		TaskList:   stickyTaskListName,
-		TaskType:   persistence.TransferTaskTypeDecisionTask,
+	transferTask := s.newTransferTaskFromInfo(&persistence.DecisionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+		TaskList:   executionInfo.StickyTaskList,
 		ScheduleID: di.ScheduleID,
-	}
+	})
 
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, di.ScheduleID, di.Version)
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, di.ScheduleID, di.Version)
+	s.NoError(err)
 	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
-	s.mockMatchingClient.EXPECT().AddDecisionTask(gomock.Any(), s.createAddDecisionTaskRequest(transferTask, mutableState)).Return(nil).Times(1)
+	s.mockWFCache.EXPECT().AllowInternal(constants.TestDomainID, constants.TestWorkflowID).Return(true).Times(1)
+	s.mockMatchingClient.EXPECT().AddDecisionTask(gomock.Any(), createAddDecisionTaskRequest(transferTask, mutableState)).Return(&types.AddDecisionTaskResponse{}, nil).Times(1)
 
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
 	s.Nil(err)
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessDecisionTask_DecisionNotSticky_MutableStateSticky() {
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
-	stickyTaskListName := "some random sticky task list"
-	stickyTaskListTimeout := int32(233)
+	workflowExecution, mutableState, _, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
 
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
-		},
-	)
-	s.Nil(err)
-
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-	event = test.AddDecisionTaskCompletedEvent(mutableState, di.ScheduleID, di.StartedID, nil, "some random identity")
-	s.NotNil(event)
 	// set the sticky tasklist attr
 	executionInfo := mutableState.GetExecutionInfo()
-	executionInfo.StickyTaskList = stickyTaskListName
-	executionInfo.StickyScheduleToStartTimeout = stickyTaskListTimeout
+	executionInfo.StickyTaskList = "some random sticky task list"
+	executionInfo.StickyScheduleToStartTimeout = int32(233)
 
 	// make another round of decision
-	taskID := int64(59)
-	di = test.AddDecisionTaskScheduledEvent(mutableState)
+	di := test.AddDecisionTaskScheduledEvent(mutableState)
 
-	transferTask := &persistence.TransferTaskInfo{
-		Version:    s.version,
-		DomainID:   s.domainID,
-		WorkflowID: workflowExecution.GetWorkflowId(),
-		RunID:      workflowExecution.GetRunId(),
-		TaskID:     taskID,
-		TaskList:   taskListName,
-		TaskType:   persistence.TransferTaskTypeDecisionTask,
+	transferTask := s.newTransferTaskFromInfo(&persistence.DecisionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+		TaskList:   mutableState.GetExecutionInfo().TaskList,
 		ScheduleID: di.ScheduleID,
-	}
+	})
 
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, di.ScheduleID, di.Version)
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, di.ScheduleID, di.Version)
+	s.NoError(err)
 	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
-	s.mockMatchingClient.EXPECT().AddDecisionTask(gomock.Any(), s.createAddDecisionTaskRequest(transferTask, mutableState)).Return(nil).Times(1)
+	s.mockWFCache.EXPECT().AllowInternal(constants.TestDomainID, constants.TestWorkflowID).Return(true).Times(1)
+	s.mockMatchingClient.EXPECT().AddDecisionTask(gomock.Any(), createAddDecisionTaskRequest(transferTask, mutableState)).Return(&types.AddDecisionTaskResponse{}, nil).Times(1)
 
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
 	s.Nil(err)
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessDecisionTask_Duplication() {
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
+	workflowExecution, mutableState, _, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
 
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
+	transferTask := s.newTransferTaskFromInfo(&persistence.DecisionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
 		},
-	)
-	s.Nil(err)
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(4096),
+		},
+		TaskList:   mutableState.GetExecutionInfo().TaskList,
+		ScheduleID: mutableState.GetPreviousStartedEventID() - 1,
+	})
 
-	taskID := int64(4096)
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-	event = test.AddDecisionTaskCompletedEvent(mutableState, di.ScheduleID, di.StartedID, nil, "some random identity")
-
-	transferTask := &persistence.TransferTaskInfo{
-		Version:    s.version,
-		DomainID:   s.domainID,
-		WorkflowID: workflowExecution.GetWorkflowId(),
-		RunID:      workflowExecution.GetRunId(),
-		TaskID:     taskID,
-		TaskList:   taskListName,
-		TaskType:   persistence.TransferTaskTypeDecisionTask,
-		ScheduleID: di.ScheduleID,
-	}
-
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, event.GetEventId(), event.GetVersion())
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, mutableState.GetNextEventID()-1, mutableState.GetCurrentVersion())
+	s.NoError(err)
 	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
 
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
 	s.Nil(err)
 }
 
-func (s *transferActiveTaskExecutorSuite) TestProcessCloseExecution_HasParent() {
+func (s *transferActiveTaskExecutorSuite) TestProcessDecisionTask_StickyWorkerUnavailable() {
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
+	workflowExecution, mutableState, _, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
 
-	parentDomainID := "some random parent domain ID"
-	parentInitiatedID := int64(3222)
-	parentDomainName := "some random parent domain Name"
-	parentExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random parent workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
+	// set the sticky tasklist attr
+	executionInfo := mutableState.GetExecutionInfo()
+	executionInfo.StickyTaskList = "some random sticky task list"
+	executionInfo.StickyScheduleToStartTimeout = int32(233)
 
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
-			ParentExecutionInfo: &history.ParentExecutionInfo{
-				DomainUUID:  common.StringPtr(parentDomainID),
-				Domain:      common.StringPtr(parentDomainName),
-				Execution:   &parentExecution,
-				InitiatedId: common.Int64Ptr(parentInitiatedID),
-			},
+	// make another round of decision
+	di := test.AddDecisionTaskScheduledEvent(mutableState)
+
+	transferTask := s.newTransferTaskFromInfo(&persistence.DecisionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
 		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+		TaskList:   executionInfo.StickyTaskList,
+		ScheduleID: di.ScheduleID,
+	})
+
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, di.ScheduleID, di.Version)
+	s.NoError(err)
+	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+	s.mockWFCache.EXPECT().AllowInternal(constants.TestDomainID, constants.TestWorkflowID).Return(true).Times(1)
+
+	addDecisionTaskRequest := createAddDecisionTaskRequest(transferTask, mutableState)
+
+	// Create a deep copy of the expected modified request
+	modifiedRequest := *addDecisionTaskRequest
+	modifiedRequest.TaskList = &types.TaskList{
+		Name: mutableState.GetExecutionInfo().TaskList,
+	}
+
+	gomock.InOrder(
+		s.mockMatchingClient.EXPECT().AddDecisionTask(gomock.Any(), addDecisionTaskRequest).Return(nil, &types.StickyWorkerUnavailableError{}).Times(1),
+		s.mockMatchingClient.EXPECT().AddDecisionTask(gomock.Any(), gomock.Eq(&modifiedRequest)).Return(&types.AddDecisionTaskResponse{}, nil).Times(1),
 	)
-	s.Nil(err)
+
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+	s.NoError(err)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessDecisionTask_EphemeralTaskListKind() {
+	workflowExecution, mutableState, err := test.StartWorkflowWithTaskList(&types.TaskList{Name: "ephemmy", Kind: types.TaskListKindEphemeral.Ptr()}, s.mockShard, s.domainID)
+	s.NoError(err)
 
 	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-	event = test.AddDecisionTaskCompletedEvent(mutableState, di.ScheduleID, di.StartedID, nil, "some random identity")
 
-	taskID := int64(59)
-	event = test.AddCompleteWorkflowEvent(mutableState, event.GetEventId(), nil)
+	transferTask := s.newTransferTaskFromInfo(&persistence.DecisionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+		TaskList:   mutableState.GetExecutionInfo().TaskList,
+		ScheduleID: di.ScheduleID,
+	})
 
-	transferTask := &persistence.TransferTaskInfo{
-		Version:    s.version,
-		DomainID:   s.domainID,
-		WorkflowID: workflowExecution.GetWorkflowId(),
-		RunID:      workflowExecution.GetRunId(),
-		TaskID:     taskID,
-		TaskList:   taskListName,
-		TaskType:   persistence.TransferTaskTypeCloseExecution,
-		ScheduleID: event.GetEventId(),
-	}
-
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, event.GetEventId(), event.GetVersion())
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, di.ScheduleID, di.Version)
+	s.NoError(err)
 	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
-	s.mockHistoryClient.EXPECT().RecordChildExecutionCompleted(gomock.Any(), &history.RecordChildExecutionCompletedRequest{
-		DomainUUID:         common.StringPtr(parentDomainID),
-		WorkflowExecution:  &parentExecution,
-		InitiatedId:        common.Int64Ptr(parentInitiatedID),
-		CompletedExecution: &workflowExecution,
-		CompletionEvent:    event,
-	}).Return(nil).AnyTimes()
+	s.mockWFCache.EXPECT().AllowInternal(constants.TestDomainID, constants.TestWorkflowID).Return(true).Times(1)
+	s.mockMatchingClient.EXPECT().AddDecisionTask(gomock.Any(), createAddDecisionTaskRequest(transferTask, mutableState)).Return(&types.AddDecisionTaskResponse{}, nil).Times(1)
+
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+	s.Nil(err)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessCloseExecution_HasParent_Success() {
+	s.testProcessCloseExecutionWithParent(
+		constants.TestDomainID,
+		func(
+			mutableState execution.MutableState,
+			workflowExecution, targetExecution types.WorkflowExecution,
+		) {
+			s.mockVisibilityMgr.On("RecordWorkflowExecutionClosed", mock.Anything, mock.Anything).Return(nil).Once()
+			s.mockArchivalMetadata.On("GetVisibilityConfig").Return(archiver.NewDisabledArchvialConfig())
+		},
+		false,
+	)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessCloseExecution_HasParent_Failure() {
+	s.testProcessCloseExecutionWithParent(
+		constants.TestDomainID,
+		func(
+			mutableState execution.MutableState,
+			workflowExecution, targetExecution types.WorkflowExecution,
+		) {
+			s.mockVisibilityMgr.On("RecordWorkflowExecutionClosed", mock.Anything, mock.Anything).Return(nil).Once()
+			s.mockArchivalMetadata.On("GetVisibilityConfig").Return(archiver.NewDisabledArchvialConfig())
+		},
+		true,
+	)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessCloseExecution_HasParent_LaterRunOfChain() {
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
+	executionInfo := mutableState.GetExecutionInfo()
+	parentInitiatedID := int64(3222)
+	parentExecution := types.WorkflowExecution{
+		WorkflowID: "some random parent workflow ID",
+		RunID:      uuid.New(),
+	}
+	executionInfo.ParentDomainID = s.domainID
+	executionInfo.ParentWorkflowID = parentExecution.WorkflowID
+	executionInfo.ParentRunID = parentExecution.RunID
+	executionInfo.InitiatedID = parentInitiatedID
+	// the closed run is a later run of a chain
+	firstRunID := uuid.New()
+	executionInfo.FirstExecutionRunID = firstRunID
+
+	event := test.AddCompleteWorkflowEvent(mutableState, decisionCompletionID, nil)
+
+	transferTask := s.newTransferTaskFromInfo(&persistence.CloseExecutionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+	})
+
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+	s.NoError(err)
+	closedRunStartVersion, err := mutableState.GetStartVersion()
+	s.NoError(err)
+	firstRunStartVersion := closedRunStartVersion - 1
+	// the first run of the chain is read only for its start version
+	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.MatchedBy(func(request *persistence.GetWorkflowExecutionRequest) bool {
+		return request.Execution.GetRunID() == firstRunID
+	})).Return(&persistence.GetWorkflowExecutionResponse{
+		State: &persistence.WorkflowMutableState{
+			ExecutionInfo: &persistence.WorkflowExecutionInfo{
+				DomainID:   s.domainID,
+				WorkflowID: workflowExecution.GetWorkflowID(),
+				RunID:      firstRunID,
+			},
+			VersionHistories: persistence.NewVersionHistories(persistence.NewVersionHistory(
+				[]byte("first-run-branch-token"),
+				[]*persistence.VersionHistoryItem{persistence.NewVersionHistoryItem(3, firstRunStartVersion)},
+			)),
+		},
+	}, nil).Once()
+	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
 	s.mockVisibilityMgr.On("RecordWorkflowExecutionClosed", mock.Anything, mock.Anything).Return(nil).Once()
 	s.mockArchivalMetadata.On("GetVisibilityConfig").Return(archiver.NewDisabledArchvialConfig())
+	// the parent gets the start version of the first run, not the start version of the closed run
+	s.mockHistoryClient.EXPECT().RecordChildExecutionCompleted(gomock.Any(), &types.RecordChildExecutionCompletedRequest{
+		DomainUUID:          s.domainID,
+		WorkflowExecution:   &parentExecution,
+		InitiatedID:         parentInitiatedID,
+		CompletedExecution:  &workflowExecution,
+		CompletionEvent:     event,
+		FirstExecutionRunID: firstRunID,
+		ChildStartVersion:   common.Int64Ptr(firstRunStartVersion),
+	}).Return(nil).Times(1)
 
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
-	s.Nil(err)
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+	s.NoError(err)
+}
+
+func (s *transferActiveTaskExecutorSuite) testProcessCloseExecutionWithParent(
+	targetDomainID string,
+	setupMockFn func(
+		mutableState execution.MutableState,
+		workflowExecution, targetExecution types.WorkflowExecution,
+	),
+	failRecordChild bool,
+) {
+
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
+	executionInfo := mutableState.GetExecutionInfo()
+	parentInitiatedID := int64(3222)
+	parentExecution := types.WorkflowExecution{
+		WorkflowID: "some random parent workflow ID",
+		RunID:      uuid.New(),
+	}
+	executionInfo.ParentDomainID = targetDomainID
+	executionInfo.ParentWorkflowID = parentExecution.WorkflowID
+	executionInfo.ParentRunID = parentExecution.RunID
+	executionInfo.InitiatedID = parentInitiatedID
+
+	event := test.AddCompleteWorkflowEvent(mutableState, decisionCompletionID, nil)
+
+	transferTask := s.newTransferTaskFromInfo(&persistence.CloseExecutionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+	})
+
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+	s.NoError(err)
+	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+	if targetDomainID == constants.TestDomainID {
+		var recordChildErr error
+		if failRecordChild {
+			recordChildErr = &types.DomainNotActiveError{}
+		}
+		// the parent is in the same domain, so the child also sends its start version
+		startVersion, err := mutableState.GetStartVersion()
+		s.NoError(err)
+		s.mockHistoryClient.EXPECT().RecordChildExecutionCompleted(gomock.Any(), &types.RecordChildExecutionCompletedRequest{
+			DomainUUID:          targetDomainID,
+			WorkflowExecution:   &parentExecution,
+			InitiatedID:         parentInitiatedID,
+			CompletedExecution:  &workflowExecution,
+			CompletionEvent:     event,
+			FirstExecutionRunID: executionInfo.FirstExecutionRunID,
+			ChildStartVersion:   common.Int64Ptr(startVersion),
+		}).Return(recordChildErr).Times(1)
+	}
+
+	setupMockFn(mutableState, workflowExecution, parentExecution)
+
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+	if failRecordChild {
+		s.Equal(&types.DomainNotActiveError{}, err)
+	} else {
+		s.NoError(err)
+	}
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessCloseExecution_NoParent() {
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
-
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
+	executionInfo := mutableState.GetExecutionInfo()
+	executionInfo.ActiveClusterSelectionPolicy = &types.ActiveClusterSelectionPolicy{
+		ClusterAttribute: &types.ClusterAttribute{
+			Scope: "region",
+			Name:  "us-west",
 		},
-	)
-	s.Nil(err)
-
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-	event = test.AddDecisionTaskCompletedEvent(mutableState, di.ScheduleID, di.StartedID, nil, "some random identity")
-
-	taskID := int64(59)
-	event = test.AddCompleteWorkflowEvent(mutableState, event.GetEventId(), nil)
-
-	transferTask := &persistence.TransferTaskInfo{
-		Version:    s.version,
-		DomainID:   s.domainID,
-		WorkflowID: workflowExecution.GetWorkflowId(),
-		RunID:      workflowExecution.GetRunId(),
-		TaskID:     taskID,
-		TaskList:   taskListName,
-		TaskType:   persistence.TransferTaskTypeCloseExecution,
-		ScheduleID: event.GetEventId(),
 	}
+	event := test.AddCompleteWorkflowEvent(mutableState, decisionCompletionID, nil)
 
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, event.GetEventId(), event.GetVersion())
+	transferTask := s.newTransferTaskFromInfo(&persistence.CloseExecutionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+	})
+
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+	s.NoError(err)
 	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
 	s.mockVisibilityMgr.On("RecordWorkflowExecutionClosed", mock.Anything, mock.Anything).Return(nil).Once()
-	s.mockArchivalMetadata.On("GetVisibilityConfig").Return(archiver.NewArchivalConfig("enabled", dc.GetStringPropertyFn("enabled"), dc.GetBoolPropertyFn(true), "disabled", "random URI"))
-	s.mockArchivalClient.On("Archive", mock.Anything, mock.Anything).Return(nil, nil).Once()
+	s.mockArchivalMetadata.On("GetVisibilityConfig").Return(archiver.NewArchivalConfig("enabled", dynamicproperties.GetStringPropertyFn("enabled"), true, dynamicproperties.GetBoolPropertyFn(true), "disabled", "random URI"))
+	s.mockArchivalClient.EXPECT().Archive(gomock.Any(), gomock.Any()).Return(nil, nil).Times(1)
+	// switch on context header in viz
+	s.mockShard.GetConfig().EnableContextHeaderInVisibility = func(domain string) bool {
+		return true
+	}
+	s.mockShard.GetConfig().ValidSearchAttributes = func(opts ...dynamicproperties.FilterOption) map[string]interface{} {
+		return map[string]interface{}{
+			"Header_context_key": struct{}{},
+		}
+	}
 
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
 	s.Nil(err)
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessCloseExecution_NoParent_HasFewChildren() {
-
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
-
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
+	s.testProcessCloseExecutionNoParentHasFewChildren(
+		map[string]string{
+			"child_abandon":   s.domainName,
+			"child_terminate": s.domainName,
+			"child_cancel":    s.domainName,
+		},
+		func() {
+			s.expectCancelRequest(s.domainName)
+			s.expectTerminateRequest(s.domainName)
 		},
 	)
-	s.Nil(err)
+}
 
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-
-	dt := workflow.DecisionTypeStartChildWorkflowExecution
-	parentClosePolicy1 := workflow.ParentClosePolicyAbandon
-	parentClosePolicy2 := workflow.ParentClosePolicyTerminate
-	parentClosePolicy3 := workflow.ParentClosePolicyRequestCancel
-
-	event, _ = mutableState.AddDecisionTaskCompletedEvent(di.ScheduleID, di.StartedID, &workflow.RespondDecisionTaskCompletedRequest{
-		ExecutionContext: nil,
-		Identity:         common.StringPtr("some random identity"),
-		Decisions: []*workflow.Decision{
-			{
-				DecisionType: &dt,
-				StartChildWorkflowExecutionDecisionAttributes: &workflow.StartChildWorkflowExecutionDecisionAttributes{
-					WorkflowId: common.StringPtr("child workflow1"),
-					WorkflowType: &workflow.WorkflowType{
-						Name: common.StringPtr("child workflow type"),
-					},
-					TaskList:          &workflow.TaskList{Name: common.StringPtr(taskListName)},
-					Input:             []byte("random input"),
-					ParentClosePolicy: &parentClosePolicy1,
-				},
-			},
-			{
-				DecisionType: &dt,
-				StartChildWorkflowExecutionDecisionAttributes: &workflow.StartChildWorkflowExecutionDecisionAttributes{
-					WorkflowId: common.StringPtr("child workflow2"),
-					WorkflowType: &workflow.WorkflowType{
-						Name: common.StringPtr("child workflow type"),
-					},
-					TaskList:          &workflow.TaskList{Name: common.StringPtr(taskListName)},
-					Input:             []byte("random input"),
-					ParentClosePolicy: &parentClosePolicy2,
-				},
-			},
-			{
-				DecisionType: &dt,
-				StartChildWorkflowExecutionDecisionAttributes: &workflow.StartChildWorkflowExecutionDecisionAttributes{
-					WorkflowId: common.StringPtr("child workflow3"),
-					WorkflowType: &workflow.WorkflowType{
-						Name: common.StringPtr("child workflow type"),
-					},
-					TaskList:          &workflow.TaskList{Name: common.StringPtr(taskListName)},
-					Input:             []byte("random input"),
-					ParentClosePolicy: &parentClosePolicy3,
-				},
-			},
+func (s *transferActiveTaskExecutorSuite) TestApplyParentPolicy_SameClusterChild_TargetNotActive() {
+	s.testProcessCloseExecutionNoParentHasFewChildrenWithError(
+		map[string]string{
+			"child_terminate": s.domainName,
+			"child_cancel":    s.domainName,
 		},
-	}, config.DefaultHistoryMaxAutoResetPoints)
-
-	_, _, err = mutableState.AddStartChildWorkflowExecutionInitiatedEvent(event.GetEventId(), uuid.New(), &workflow.StartChildWorkflowExecutionDecisionAttributes{
-		WorkflowId: common.StringPtr("child workflow1"),
-		WorkflowType: &workflow.WorkflowType{
-			Name: common.StringPtr("child workflow type"),
+		func() {
+			s.mockHistoryClient.EXPECT().RequestCancelWorkflowExecution(gomock.Any(), gomock.Any()).
+				Return(&types.DomainNotActiveError{}).MaxTimes(1)
+			s.mockHistoryClient.EXPECT().TerminateWorkflowExecution(gomock.Any(), gomock.Any()).
+				Return(&types.DomainNotActiveError{}).MaxTimes(1)
 		},
-		TaskList:          &workflow.TaskList{Name: common.StringPtr(taskListName)},
+		&types.DomainNotActiveError{},
+	)
+}
+
+func (s *transferActiveTaskExecutorSuite) expectCancelRequest(childDomainName string) {
+	childDomainID, err := s.mockDomainCache.GetDomainID(childDomainName)
+	s.NoError(err)
+	s.mockHistoryClient.EXPECT().RequestCancelWorkflowExecution(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(
+			_ context.Context,
+			request *types.HistoryRequestCancelWorkflowExecutionRequest,
+			option ...yarpc.CallOption,
+		) error {
+			s.Equal(childDomainID, request.DomainUUID)
+			s.Equal(childDomainName, request.CancelRequest.Domain)
+			s.True(request.GetChildWorkflowOnly())
+			errs := []error{nil, &types.CancellationAlreadyRequestedError{}, &types.EntityNotExistsError{}}
+			return errs[rand.Intn(len(errs))]
+		},
+	).Times(1)
+}
+
+func (s *transferActiveTaskExecutorSuite) expectTerminateRequest(childDomainName string) {
+	childDomainID, err := s.mockDomainCache.GetDomainID(childDomainName)
+	s.NoError(err)
+	s.mockHistoryClient.EXPECT().TerminateWorkflowExecution(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(
+			_ context.Context,
+			request *types.HistoryTerminateWorkflowExecutionRequest,
+			option ...yarpc.CallOption,
+		) error {
+			s.Equal(childDomainID, request.DomainUUID)
+			s.Equal(childDomainName, request.TerminateRequest.Domain)
+			errs := []error{nil, &types.EntityNotExistsError{}}
+			return errs[rand.Intn(len(errs))]
+		},
+	).Times(1)
+}
+
+func (s *transferActiveTaskExecutorSuite) testProcessCloseExecutionNoParentHasFewChildren(
+	childrenDomainNames map[string]string,
+	setupMockFn func(),
+) {
+	s.testProcessCloseExecutionNoParentHasFewChildrenWithError(childrenDomainNames, setupMockFn, nil)
+}
+
+func (s *transferActiveTaskExecutorSuite) testProcessCloseExecutionNoParentHasFewChildrenWithError(
+	childrenDomainNames map[string]string,
+	setupMockFn func(),
+	expectedErr error,
+) {
+
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
+
+	parentClosePolicy1 := types.ParentClosePolicyAbandon
+	parentClosePolicy2 := types.ParentClosePolicyTerminate
+	parentClosePolicy3 := types.ParentClosePolicyRequestCancel
+
+	_, _, err = mutableState.AddStartChildWorkflowExecutionInitiatedEvent(decisionCompletionID, &types.StartChildWorkflowExecutionDecisionAttributes{
+		Domain:     childrenDomainNames["child_abandon"],
+		WorkflowID: "child workflow1",
+		WorkflowType: &types.WorkflowType{
+			Name: "child workflow type",
+		},
+		TaskList:          &types.TaskList{Name: mutableState.GetExecutionInfo().TaskList},
 		Input:             []byte("random input"),
 		ParentClosePolicy: &parentClosePolicy1,
 	})
 	s.Nil(err)
-	_, _, err = mutableState.AddStartChildWorkflowExecutionInitiatedEvent(event.GetEventId(), uuid.New(), &workflow.StartChildWorkflowExecutionDecisionAttributes{
-		WorkflowId: common.StringPtr("child workflow2"),
-		WorkflowType: &workflow.WorkflowType{
-			Name: common.StringPtr("child workflow type"),
+	_, _, err = mutableState.AddStartChildWorkflowExecutionInitiatedEvent(decisionCompletionID, &types.StartChildWorkflowExecutionDecisionAttributes{
+		Domain:     childrenDomainNames["child_terminate"],
+		WorkflowID: "child workflow2",
+		WorkflowType: &types.WorkflowType{
+			Name: "child workflow type",
 		},
-		TaskList:          &workflow.TaskList{Name: common.StringPtr(taskListName)},
+		TaskList:          &types.TaskList{Name: mutableState.GetExecutionInfo().TaskList},
 		Input:             []byte("random input"),
 		ParentClosePolicy: &parentClosePolicy2,
 	})
 	s.Nil(err)
-	_, _, err = mutableState.AddStartChildWorkflowExecutionInitiatedEvent(event.GetEventId(), uuid.New(), &workflow.StartChildWorkflowExecutionDecisionAttributes{
-		WorkflowId: common.StringPtr("child workflow3"),
-		WorkflowType: &workflow.WorkflowType{
-			Name: common.StringPtr("child workflow type"),
+	_, _, err = mutableState.AddStartChildWorkflowExecutionInitiatedEvent(decisionCompletionID, &types.StartChildWorkflowExecutionDecisionAttributes{
+		Domain:     childrenDomainNames["child_cancel"],
+		WorkflowID: "child workflow3",
+		WorkflowType: &types.WorkflowType{
+			Name: "child workflow type",
 		},
-		TaskList:          &workflow.TaskList{Name: common.StringPtr(taskListName)},
+		TaskList:          &types.TaskList{Name: mutableState.GetExecutionInfo().TaskList},
 		Input:             []byte("random input"),
 		ParentClosePolicy: &parentClosePolicy3,
 	})
 	s.Nil(err)
-
 	s.NoError(mutableState.FlushBufferedEvents())
 
-	taskID := int64(59)
-	event = test.AddCompleteWorkflowEvent(mutableState, event.GetEventId(), nil)
+	event := test.AddCompleteWorkflowEvent(mutableState, decisionCompletionID, nil)
 
-	transferTask := &persistence.TransferTaskInfo{
-		Version:    s.version,
-		DomainID:   s.domainID,
-		WorkflowID: workflowExecution.GetWorkflowId(),
-		RunID:      workflowExecution.GetRunId(),
-		TaskID:     taskID,
-		TaskList:   taskListName,
-		TaskType:   persistence.TransferTaskTypeCloseExecution,
-		ScheduleID: event.GetEventId(),
-	}
+	transferTask := s.newTransferTaskFromInfo(&persistence.CloseExecutionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+	})
 
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, event.GetEventId(), event.GetVersion())
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+	s.NoError(err)
 	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
 	s.mockVisibilityMgr.On("RecordWorkflowExecutionClosed", mock.Anything, mock.Anything).Return(nil).Once()
 	s.mockArchivalMetadata.On("GetVisibilityConfig").Return(archiver.NewDisabledArchvialConfig())
-	s.mockHistoryClient.EXPECT().RequestCancelWorkflowExecution(gomock.Any(), gomock.Any()).Return(nil).Times(1)
-	s.mockHistoryClient.EXPECT().TerminateWorkflowExecution(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+	setupMockFn()
 
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
-	s.Nil(err)
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+	s.Equal(expectedErr, err)
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessCloseExecution_NoParent_HasManyChildren() {
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
 
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
+	numChildWorkflows := 500
+	for i := 0; i < numChildWorkflows; i++ {
+		_, _, err = mutableState.AddStartChildWorkflowExecutionInitiatedEvent(decisionCompletionID, &types.StartChildWorkflowExecutionDecisionAttributes{
+			Domain:     s.domainName,
+			WorkflowID: "child workflow" + strconv.Itoa(i),
+			WorkflowType: &types.WorkflowType{
+				Name: "child workflow type",
 			},
-		},
-	)
-	s.Nil(err)
-
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-
-	dt := workflow.DecisionTypeStartChildWorkflowExecution
-	parentClosePolicy := workflow.ParentClosePolicyTerminate
-	var decisions []*workflow.Decision
-	for i := 0; i < 10; i++ {
-		decisions = append(decisions, &workflow.Decision{
-			DecisionType: &dt,
-			StartChildWorkflowExecutionDecisionAttributes: &workflow.StartChildWorkflowExecutionDecisionAttributes{
-				WorkflowId: common.StringPtr("child workflow" + string(i)),
-				WorkflowType: &workflow.WorkflowType{
-					Name: common.StringPtr("child workflow type"),
-				},
-				TaskList:          &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				Input:             []byte("random input"),
-				ParentClosePolicy: &parentClosePolicy,
-			},
-		})
-	}
-
-	event, _ = mutableState.AddDecisionTaskCompletedEvent(di.ScheduleID, di.StartedID, &workflow.RespondDecisionTaskCompletedRequest{
-		ExecutionContext: nil,
-		Identity:         common.StringPtr("some random identity"),
-		Decisions:        decisions,
-	}, config.DefaultHistoryMaxAutoResetPoints)
-
-	for i := 0; i < 10; i++ {
-		_, _, err = mutableState.AddStartChildWorkflowExecutionInitiatedEvent(event.GetEventId(), uuid.New(), &workflow.StartChildWorkflowExecutionDecisionAttributes{
-			WorkflowId: common.StringPtr("child workflow" + string(i)),
-			WorkflowType: &workflow.WorkflowType{
-				Name: common.StringPtr("child workflow type"),
-			},
-			TaskList:          &workflow.TaskList{Name: common.StringPtr(taskListName)},
+			TaskList:          &types.TaskList{Name: mutableState.GetExecutionInfo().TaskList},
 			Input:             []byte("random input"),
-			ParentClosePolicy: &parentClosePolicy,
+			ParentClosePolicy: types.ParentClosePolicyTerminate.Ptr(),
 		})
 		s.Nil(err)
 	}
 
 	s.NoError(mutableState.FlushBufferedEvents())
 
-	taskID := int64(59)
-	event = test.AddCompleteWorkflowEvent(mutableState, event.GetEventId(), nil)
+	event := test.AddCompleteWorkflowEvent(mutableState, decisionCompletionID, nil)
 
-	transferTask := &persistence.TransferTaskInfo{
-		Version:    s.version,
-		DomainID:   s.domainID,
-		WorkflowID: workflowExecution.GetWorkflowId(),
-		RunID:      workflowExecution.GetRunId(),
-		TaskID:     taskID,
-		TaskList:   taskListName,
-		TaskType:   persistence.TransferTaskTypeCloseExecution,
-		ScheduleID: event.GetEventId(),
-	}
+	transferTask := s.newTransferTaskFromInfo(&persistence.CloseExecutionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+	})
 
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, event.GetEventId(), event.GetVersion())
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+	s.NoError(err)
 	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
 	s.mockVisibilityMgr.On("RecordWorkflowExecutionClosed", mock.Anything, mock.Anything).Return(nil).Once()
 	s.mockArchivalMetadata.On("GetVisibilityConfig").Return(archiver.NewDisabledArchvialConfig())
-	s.mockParentClosePolicyClient.On("SendParentClosePolicyRequest", mock.Anything, mock.Anything).Return(nil).Times(1)
+	s.mockParentClosePolicyClient.EXPECT().SendParentClosePolicyRequest(gomock.Any(), gomock.Cond(
+		func(request parentclosepolicy.Request) bool {
+			if len(request.Executions) != s.mockShard.GetConfig().ParentClosePolicyBatchSize(constants.TestDomainName) {
+				return false
+			}
+			for _, executions := range request.Executions {
+				if executions.DomainName != constants.TestDomainName {
+					return false
+				}
+			}
+			return true
+		},
+	)).Return(nil).Times(numChildWorkflows / s.mockShard.GetConfig().ParentClosePolicyBatchSize(constants.TestDomainName))
+	s.mockParentClosePolicyClient.EXPECT().SendParentClosePolicyRequest(gomock.Any(), gomock.Cond(
+		func(request parentclosepolicy.Request) bool {
+			if len(request.Executions) != numChildWorkflows%s.mockShard.GetConfig().ParentClosePolicyBatchSize(constants.TestDomainName) {
+				return false
+			}
+			for _, executions := range request.Executions {
+				if executions.DomainName != constants.TestDomainName {
+					return false
+				}
+			}
+			return true
+		},
+	)).Return(nil).Times(1)
 
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
 	s.Nil(err)
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessCloseExecution_NoParent_HasManyAbandonedChildren() {
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
-
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
-		},
-	)
-	s.Nil(err)
-
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-
-	dt := workflow.DecisionTypeStartChildWorkflowExecution
-	parentClosePolicy := workflow.ParentClosePolicyAbandon
-	var decisions []*workflow.Decision
-	for i := 0; i < 10; i++ {
-		decisions = append(decisions, &workflow.Decision{
-			DecisionType: &dt,
-			StartChildWorkflowExecutionDecisionAttributes: &workflow.StartChildWorkflowExecutionDecisionAttributes{
-				WorkflowId: common.StringPtr("child workflow" + string(i)),
-				WorkflowType: &workflow.WorkflowType{
-					Name: common.StringPtr("child workflow type"),
-				},
-				TaskList:          &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				Input:             []byte("random input"),
-				ParentClosePolicy: &parentClosePolicy,
-			},
-		})
-	}
-
-	event, _ = mutableState.AddDecisionTaskCompletedEvent(di.ScheduleID, di.StartedID, &workflow.RespondDecisionTaskCompletedRequest{
-		ExecutionContext: nil,
-		Identity:         common.StringPtr("some random identity"),
-		Decisions:        decisions,
-	}, config.DefaultHistoryMaxAutoResetPoints)
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
 
 	for i := 0; i < 10; i++ {
-		_, _, err = mutableState.AddStartChildWorkflowExecutionInitiatedEvent(event.GetEventId(), uuid.New(), &workflow.StartChildWorkflowExecutionDecisionAttributes{
-			WorkflowId: common.StringPtr("child workflow" + string(i)),
-			WorkflowType: &workflow.WorkflowType{
-				Name: common.StringPtr("child workflow type"),
+		_, _, err = mutableState.AddStartChildWorkflowExecutionInitiatedEvent(decisionCompletionID, &types.StartChildWorkflowExecutionDecisionAttributes{
+			WorkflowID: "child workflow" + strconv.Itoa(i),
+			WorkflowType: &types.WorkflowType{
+				Name: "child workflow type",
 			},
-			TaskList:          &workflow.TaskList{Name: common.StringPtr(taskListName)},
+			TaskList:          &types.TaskList{Name: mutableState.GetExecutionInfo().TaskList},
 			Input:             []byte("random input"),
-			ParentClosePolicy: &parentClosePolicy,
+			ParentClosePolicy: types.ParentClosePolicyAbandon.Ptr(),
 		})
 		s.Nil(err)
 	}
 
 	s.NoError(mutableState.FlushBufferedEvents())
 
-	taskID := int64(59)
-	event = test.AddCompleteWorkflowEvent(mutableState, event.GetEventId(), nil)
+	event := test.AddCompleteWorkflowEvent(mutableState, decisionCompletionID, nil)
 
-	transferTask := &persistence.TransferTaskInfo{
-		Version:    s.version,
-		DomainID:   s.domainID,
-		WorkflowID: workflowExecution.GetWorkflowId(),
-		RunID:      workflowExecution.GetRunId(),
-		TaskID:     taskID,
-		TaskList:   taskListName,
-		TaskType:   persistence.TransferTaskTypeCloseExecution,
-		ScheduleID: event.GetEventId(),
-	}
+	transferTask := s.newTransferTaskFromInfo(&persistence.CloseExecutionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+	})
 
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, event.GetEventId(), event.GetVersion())
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+	s.NoError(err)
 	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
 	s.mockVisibilityMgr.On("RecordWorkflowExecutionClosed", mock.Anything, mock.Anything).Return(nil).Once()
 	s.mockArchivalMetadata.On("GetVisibilityConfig").Return(archiver.NewDisabledArchvialConfig())
 
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
 	s.Nil(err)
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessCancelExecution_Success() {
-
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
-
-	targetExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random target workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
+	s.testProcessCancelExecution(
+		constants.TestDomainID,
+		func(
+			mutableState execution.MutableState,
+			workflowExecution, targetExecution types.WorkflowExecution,
+			event *types.HistoryEvent,
+			transferTask Task,
+			requestCancelInfo *persistence.RequestCancelInfo,
+		) {
+			persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+			s.NoError(err)
+			s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+			cancelRequest := createTestRequestCancelWorkflowExecutionRequest(constants.TestDomainName, transferTask.GetInfo().(*persistence.CancelExecutionTask), requestCancelInfo.CancelRequestID)
+			s.mockHistoryClient.EXPECT().RequestCancelWorkflowExecution(gomock.Any(), cancelRequest).Return(nil).Times(1)
+			s.mockHistoryV2Mgr.On("AppendHistoryNodes", mock.Anything, mock.Anything).Return(&persistence.AppendHistoryNodesResponse{}, nil).Once()
+			s.mockExecutionMgr.On("UpdateWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.UpdateWorkflowExecutionResponse{MutableStateUpdateSessionStats: &persistence.MutableStateUpdateSessionStats{}}, nil).Once()
 		},
 	)
-	s.Nil(err)
-
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-	event = test.AddDecisionTaskCompletedEvent(mutableState, di.ScheduleID, di.StartedID, nil, "some random identity")
-
-	taskID := int64(59)
-	event, rci := test.AddRequestCancelInitiatedEvent(mutableState, event.GetEventId(), uuid.New(), constants.TestTargetDomainName, targetExecution.GetWorkflowId(), targetExecution.GetRunId())
-
-	transferTask := &persistence.TransferTaskInfo{
-		Version:          s.version,
-		DomainID:         s.domainID,
-		WorkflowID:       workflowExecution.GetWorkflowId(),
-		RunID:            workflowExecution.GetRunId(),
-		TargetDomainID:   s.targetDomainID,
-		TargetWorkflowID: targetExecution.GetWorkflowId(),
-		TargetRunID:      targetExecution.GetRunId(),
-		TaskID:           taskID,
-		TaskList:         taskListName,
-		TaskType:         persistence.TransferTaskTypeCancelExecution,
-		ScheduleID:       event.GetEventId(),
-	}
-
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, event.GetEventId(), event.GetVersion())
-	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
-	s.mockHistoryClient.EXPECT().RequestCancelWorkflowExecution(gomock.Any(), s.createRequestCancelWorkflowExecutionRequest(s.targetDomainName, transferTask, rci)).Return(nil).Times(1)
-	s.mockHistoryV2Mgr.On("AppendHistoryNodes", mock.Anything, mock.Anything).Return(&p.AppendHistoryNodesResponse{Size: 0}, nil).Once()
-	s.mockExecutionMgr.On("UpdateWorkflowExecution", mock.Anything, mock.Anything).Return(&p.UpdateWorkflowExecutionResponse{MutableStateUpdateSessionStats: &p.MutableStateUpdateSessionStats{}}, nil).Once()
-	s.mockClusterMetadata.EXPECT().ClusterNameForFailoverVersion(s.version).Return(cluster.TestCurrentClusterName).AnyTimes()
-
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
-	s.Nil(err)
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessCancelExecution_Failure() {
-
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
-
-	targetExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random target workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
+	s.testProcessCancelExecution(
+		constants.TestDomainID,
+		func(
+			mutableState execution.MutableState,
+			workflowExecution, targetExecution types.WorkflowExecution,
+			event *types.HistoryEvent,
+			transferTask Task,
+			requestCancelInfo *persistence.RequestCancelInfo,
+		) {
+			persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+			s.NoError(err)
+			s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+			cancelRequest := createTestRequestCancelWorkflowExecutionRequest(constants.TestDomainName, transferTask.GetInfo().(*persistence.CancelExecutionTask), requestCancelInfo.CancelRequestID)
+			s.mockHistoryClient.EXPECT().RequestCancelWorkflowExecution(gomock.Any(), cancelRequest).Return(&types.EntityNotExistsError{}).Times(1)
+			s.mockHistoryV2Mgr.On("AppendHistoryNodes", mock.Anything, mock.Anything).Return(&persistence.AppendHistoryNodesResponse{}, nil).Once()
+			s.mockExecutionMgr.On("UpdateWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.UpdateWorkflowExecutionResponse{MutableStateUpdateSessionStats: &persistence.MutableStateUpdateSessionStats{}}, nil).Once()
 		},
 	)
-	s.Nil(err)
-
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-	event = test.AddDecisionTaskCompletedEvent(mutableState, di.ScheduleID, di.StartedID, nil, "some random identity")
-
-	taskID := int64(59)
-	event, rci := test.AddRequestCancelInitiatedEvent(mutableState, event.GetEventId(), uuid.New(), constants.TestTargetDomainName, targetExecution.GetWorkflowId(), targetExecution.GetRunId())
-	mutableState.FlushBufferedEvents()
-
-	transferTask := &persistence.TransferTaskInfo{
-		Version:          s.version,
-		DomainID:         s.domainID,
-		WorkflowID:       workflowExecution.GetWorkflowId(),
-		RunID:            workflowExecution.GetRunId(),
-		TargetDomainID:   s.targetDomainID,
-		TargetWorkflowID: targetExecution.GetWorkflowId(),
-		TargetRunID:      targetExecution.GetRunId(),
-		TaskID:           taskID,
-		TaskList:         taskListName,
-		TaskType:         persistence.TransferTaskTypeCancelExecution,
-		ScheduleID:       event.GetEventId(),
-	}
-
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, event.GetEventId(), event.GetVersion())
-	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
-	s.mockHistoryClient.EXPECT().RequestCancelWorkflowExecution(gomock.Any(), s.createRequestCancelWorkflowExecutionRequest(s.targetDomainName, transferTask, rci)).Return(&workflow.EntityNotExistsError{}).Times(1)
-	s.mockHistoryV2Mgr.On("AppendHistoryNodes", mock.Anything, mock.Anything).Return(&p.AppendHistoryNodesResponse{Size: 0}, nil).Once()
-	s.mockExecutionMgr.On("UpdateWorkflowExecution", mock.Anything, mock.Anything).Return(&p.UpdateWorkflowExecutionResponse{MutableStateUpdateSessionStats: &p.MutableStateUpdateSessionStats{}}, nil).Once()
-	s.mockClusterMetadata.EXPECT().ClusterNameForFailoverVersion(s.version).Return(cluster.TestCurrentClusterName).AnyTimes()
-
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
-	s.Nil(err)
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessCancelExecution_Duplication() {
+	s.testProcessCancelExecution(
+		constants.TestDomainID,
+		func(
+			mutableState execution.MutableState,
+			workflowExecution, targetExecution types.WorkflowExecution,
+			event *types.HistoryEvent,
+			transferTask Task,
+			requestCancelInfo *persistence.RequestCancelInfo,
+		) {
+			event = test.AddCancelRequestedEvent(mutableState, event.ID, constants.TestDomainID, targetExecution.GetWorkflowID(), targetExecution.GetRunID())
+			mutableState.FlushBufferedEvents()
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
-
-	targetExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random target workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
+			persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+			s.NoError(err)
+			s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
 		},
 	)
-	s.Nil(err)
+}
 
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-	event = test.AddDecisionTaskCompletedEvent(mutableState, di.ScheduleID, di.StartedID, nil, "some random identity")
+func (s *transferActiveTaskExecutorSuite) testProcessCancelExecution(
+	targetDomainID string,
+	setupMockFn func(
+		mutableState execution.MutableState,
+		workflowExecution, targetExecution types.WorkflowExecution,
+		cancelInitEvent *types.HistoryEvent,
+		transferTask Task,
+		requestCancelInfo *persistence.RequestCancelInfo,
+	),
+) {
+	s.testProcessCancelExecutionWithError(targetDomainID, setupMockFn, nil)
+}
 
-	taskID := int64(59)
-	event, _ = test.AddRequestCancelInitiatedEvent(mutableState, event.GetEventId(), uuid.New(), constants.TestTargetDomainName, targetExecution.GetWorkflowId(), targetExecution.GetRunId())
-
-	transferTask := &persistence.TransferTaskInfo{
-		Version:          s.version,
-		DomainID:         s.domainID,
-		WorkflowID:       workflowExecution.GetWorkflowId(),
-		RunID:            workflowExecution.GetRunId(),
-		TargetDomainID:   s.targetDomainID,
-		TargetWorkflowID: targetExecution.GetWorkflowId(),
-		TargetRunID:      targetExecution.GetRunId(),
-		TaskID:           taskID,
-		TaskList:         taskListName,
-		TaskType:         persistence.TransferTaskTypeCancelExecution,
-		ScheduleID:       event.GetEventId(),
+func (s *transferActiveTaskExecutorSuite) testProcessCancelExecutionWithError(
+	targetDomainID string,
+	setupMockFn func(
+		mutableState execution.MutableState,
+		workflowExecution, targetExecution types.WorkflowExecution,
+		cancelInitEvent *types.HistoryEvent,
+		transferTask Task,
+		requestCancelInfo *persistence.RequestCancelInfo,
+	),
+	expectedErr error,
+) {
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
+	targetExecution := types.WorkflowExecution{
+		WorkflowID: "some random target workflow ID",
+		RunID:      uuid.New(),
 	}
 
-	event = test.AddCancelRequestedEvent(mutableState, event.GetEventId(), constants.TestTargetDomainID, targetExecution.GetWorkflowId(), targetExecution.GetRunId())
-	mutableState.FlushBufferedEvents()
+	event, rci := test.AddRequestCancelInitiatedEvent(
+		mutableState,
+		decisionCompletionID,
+		uuid.New(),
+		constants.TestDomainName,
+		targetExecution.GetWorkflowID(),
+		targetExecution.GetRunID(),
+	)
 
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, event.GetEventId(), event.GetVersion())
-	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+	transferTask := s.newTransferTaskFromInfo(&persistence.CancelExecutionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+		TargetDomainID:   targetDomainID,
+		TargetWorkflowID: targetExecution.GetWorkflowID(),
+		TargetRunID:      targetExecution.GetRunID(),
+		InitiatedID:      event.ID,
+	})
 
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
-	s.Nil(err)
+	setupMockFn(mutableState, workflowExecution, targetExecution, event, transferTask, rci)
+
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+	s.Equal(expectedErr, err)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessCancelExecution_WorkflowCancellingItself() {
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
+
+	event, rci := test.AddRequestCancelInitiatedEvent(
+		mutableState,
+		decisionCompletionID,
+		uuid.New(),
+		constants.TestDomainName,
+		workflowExecution.GetWorkflowID(),
+		workflowExecution.GetRunID(),
+	)
+
+	transferTask := s.newTransferTaskFromInfo(&persistence.CancelExecutionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+		TargetDomainID:   s.domainID,
+		TargetWorkflowID: workflowExecution.GetWorkflowID(),
+		TargetRunID:      workflowExecution.GetRunID(),
+		InitiatedID:      event.ID,
+	})
+
+	setupMockFn := func(
+		mutableState execution.MutableState,
+		workflowExecution, targetExecution types.WorkflowExecution,
+		event *types.HistoryEvent,
+		transferTask Task,
+		requestCancelInfo *persistence.RequestCancelInfo,
+	) {
+		persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+		s.NoError(err)
+		s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+		s.mockHistoryV2Mgr.On("AppendHistoryNodes", mock.Anything, mock.Anything).Return(&persistence.AppendHistoryNodesResponse{}, nil).Once()
+		s.mockExecutionMgr.On("UpdateWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.UpdateWorkflowExecutionResponse{MutableStateUpdateSessionStats: &persistence.MutableStateUpdateSessionStats{}}, nil).Once()
+	}
+	setupMockFn(mutableState, workflowExecution, workflowExecution, event, transferTask, rci)
+
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+	s.NoError(err)
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessSignalExecution_Success() {
+	s.testProcessSignalExecution(
+		func(
+			mutableState execution.MutableState,
+			workflowExecution, targetExecution types.WorkflowExecution,
+			event *types.HistoryEvent,
+			transferTask Task,
+			signalInfo *persistence.SignalInfo,
+		) {
+			persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+			s.NoError(err)
+			s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+			signalRequest := createTestSignalWorkflowExecutionRequest(constants.TestDomainName, transferTask.GetInfo().(*persistence.SignalExecutionTask), signalInfo)
+			s.mockHistoryClient.EXPECT().SignalWorkflowExecution(gomock.Any(), signalRequest).Return(nil).Times(1)
+			s.mockHistoryV2Mgr.On("AppendHistoryNodes", mock.Anything, mock.Anything).Return(&persistence.AppendHistoryNodesResponse{}, nil).Once()
+			s.mockExecutionMgr.On("UpdateWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.UpdateWorkflowExecutionResponse{MutableStateUpdateSessionStats: &persistence.MutableStateUpdateSessionStats{}}, nil).Once()
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
-
-	targetExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random target workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	signalName := "some random signal name"
-	signalInput := []byte("some random signal input")
-	signalControl := []byte("some random signal control")
-
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
+			taskInfo := transferTask.GetInfo().(*persistence.SignalExecutionTask)
+			s.mockHistoryClient.EXPECT().RemoveSignalMutableState(gomock.Any(), &types.RemoveSignalMutableStateRequest{
+				DomainUUID: taskInfo.TargetDomainID,
+				WorkflowExecution: &types.WorkflowExecution{
+					WorkflowID: taskInfo.TargetWorkflowID,
+					RunID:      taskInfo.TargetRunID,
+				},
+				RequestID: signalInfo.SignalRequestID,
+			}).Return(nil).Times(1)
 		},
 	)
-	s.Nil(err)
-
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-	event = test.AddDecisionTaskCompletedEvent(mutableState, di.ScheduleID, di.StartedID, nil, "some random identity")
-
-	taskID := int64(59)
-	event, si := test.AddRequestSignalInitiatedEvent(mutableState, event.GetEventId(), uuid.New(),
-		constants.TestTargetDomainName, targetExecution.GetWorkflowId(), targetExecution.GetRunId(), signalName, signalInput, signalControl)
-
-	transferTask := &persistence.TransferTaskInfo{
-		Version:          s.version,
-		DomainID:         s.domainID,
-		WorkflowID:       workflowExecution.GetWorkflowId(),
-		RunID:            workflowExecution.GetRunId(),
-		TargetDomainID:   s.targetDomainID,
-		TargetWorkflowID: targetExecution.GetWorkflowId(),
-		TargetRunID:      targetExecution.GetRunId(),
-		TaskID:           taskID,
-		TaskList:         taskListName,
-		TaskType:         persistence.TransferTaskTypeSignalExecution,
-		ScheduleID:       event.GetEventId(),
-	}
-
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, event.GetEventId(), event.GetVersion())
-	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
-	s.mockHistoryClient.EXPECT().SignalWorkflowExecution(gomock.Any(), s.createSignalWorkflowExecutionRequest(s.targetDomainName, transferTask, si)).Return(nil).Times(1)
-	s.mockHistoryV2Mgr.On("AppendHistoryNodes", mock.Anything, mock.Anything).Return(&p.AppendHistoryNodesResponse{Size: 0}, nil).Once()
-	s.mockExecutionMgr.On("UpdateWorkflowExecution", mock.Anything, mock.Anything).Return(&p.UpdateWorkflowExecutionResponse{MutableStateUpdateSessionStats: &p.MutableStateUpdateSessionStats{}}, nil).Once()
-	s.mockClusterMetadata.EXPECT().ClusterNameForFailoverVersion(s.version).Return(cluster.TestCurrentClusterName).AnyTimes()
-
-	s.mockHistoryClient.EXPECT().RemoveSignalMutableState(gomock.Any(), &history.RemoveSignalMutableStateRequest{
-		DomainUUID: common.StringPtr(transferTask.TargetDomainID),
-		WorkflowExecution: &workflow.WorkflowExecution{
-			WorkflowId: common.StringPtr(transferTask.TargetWorkflowID),
-			RunId:      common.StringPtr(transferTask.TargetRunID),
-		},
-		RequestId: common.StringPtr(si.SignalRequestID),
-	}).Return(nil).Times(1)
-
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
-	s.Nil(err)
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessSignalExecution_Failure() {
-
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
-
-	targetExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random target workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	signalName := "some random signal name"
-	signalInput := []byte("some random signal input")
-	signalControl := []byte("some random signal control")
-
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
+	for name, c := range map[string]struct {
+		Err          error
+		ExpectedLogs []string
+	}{
+		"GenericErr": {
+			Err:          assert.AnError,
+			ExpectedLogs: []string{"Failed to signal external workflow execution"},
 		},
-	)
-	s.Nil(err)
-
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-	event = test.AddDecisionTaskCompletedEvent(mutableState, di.ScheduleID, di.StartedID, nil, "some random identity")
-
-	taskID := int64(59)
-	event, si := test.AddRequestSignalInitiatedEvent(mutableState, event.GetEventId(), uuid.New(),
-		constants.TestTargetDomainName, targetExecution.GetWorkflowId(), targetExecution.GetRunId(), signalName, signalInput, signalControl)
-
-	transferTask := &persistence.TransferTaskInfo{
-		Version:          s.version,
-		DomainID:         s.domainID,
-		WorkflowID:       workflowExecution.GetWorkflowId(),
-		RunID:            workflowExecution.GetRunId(),
-		TargetDomainID:   s.targetDomainID,
-		TargetWorkflowID: targetExecution.GetWorkflowId(),
-		TargetRunID:      targetExecution.GetRunId(),
-		TaskID:           taskID,
-		TaskList:         taskListName,
-		TaskType:         persistence.TransferTaskTypeSignalExecution,
-		ScheduleID:       event.GetEventId(),
+		"NotExistsErr": {
+			Err:          &types.EntityNotExistsError{},
+			ExpectedLogs: nil,
+		},
+		"WorkflowExecutionAlreadyCompleted": {
+			Err:          &types.WorkflowExecutionAlreadyCompletedError{},
+			ExpectedLogs: nil,
+		},
+	} {
+		s.Run(name, func() {
+			// Need set up the suite manually, since we are in a subtest
+			s.SetupTest()
+			s.testProcessSignalExecutionWithErrorAndLogs(
+				constants.TestDomainID,
+				func(
+					mutableState execution.MutableState,
+					workflowExecution, targetExecution types.WorkflowExecution,
+					event *types.HistoryEvent,
+					transferTask Task,
+					signalInfo *persistence.SignalInfo,
+				) {
+					persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+					s.NoError(err)
+					s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+					signalRequest := createTestSignalWorkflowExecutionRequest(constants.TestDomainName, transferTask.GetInfo().(*persistence.SignalExecutionTask), signalInfo)
+					s.mockHistoryClient.EXPECT().SignalWorkflowExecution(gomock.Any(), signalRequest).Return(c.Err).Times(1)
+					s.mockHistoryV2Mgr.On("AppendHistoryNodes", mock.Anything, mock.Anything).Return(&persistence.AppendHistoryNodesResponse{}, nil).Once()
+					s.mockExecutionMgr.On("UpdateWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.UpdateWorkflowExecutionResponse{MutableStateUpdateSessionStats: &persistence.MutableStateUpdateSessionStats{}}, nil).Once()
+				},
+				nil,
+				c.ExpectedLogs,
+			)
+		})
 	}
 
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, event.GetEventId(), event.GetVersion())
-	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
-	s.mockHistoryClient.EXPECT().SignalWorkflowExecution(gomock.Any(), s.createSignalWorkflowExecutionRequest(s.targetDomainName, transferTask, si)).Return(&workflow.EntityNotExistsError{}).Times(1)
-	s.mockHistoryV2Mgr.On("AppendHistoryNodes", mock.Anything, mock.Anything).Return(&p.AppendHistoryNodesResponse{Size: 0}, nil).Once()
-	s.mockExecutionMgr.On("UpdateWorkflowExecution", mock.Anything, mock.Anything).Return(&p.UpdateWorkflowExecutionResponse{MutableStateUpdateSessionStats: &p.MutableStateUpdateSessionStats{}}, nil).Once()
-	s.mockClusterMetadata.EXPECT().ClusterNameForFailoverVersion(s.version).Return(cluster.TestCurrentClusterName).AnyTimes()
-
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
-	s.Nil(err)
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessSignalExecution_Duplication() {
+	s.testProcessSignalExecution(
+		func(
+			mutableState execution.MutableState,
+			workflowExecution, targetExecution types.WorkflowExecution,
+			event *types.HistoryEvent,
+			transferTask Task,
+			signalInfo *persistence.SignalInfo,
+		) {
+			event = test.AddSignaledEvent(mutableState, event.ID, constants.TestDomainName, targetExecution.GetWorkflowID(), targetExecution.GetRunID(), nil)
+			mutableState.FlushBufferedEvents()
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
-
-	targetExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random target workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	signalName := "some random signal name"
-	signalInput := []byte("some random signal input")
-	signalControl := []byte("some random signal control")
-
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
+			persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+			s.NoError(err)
+			s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
 		},
 	)
-	s.Nil(err)
+}
 
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-	event = test.AddDecisionTaskCompletedEvent(mutableState, di.ScheduleID, di.StartedID, nil, "some random identity")
+func (s *transferActiveTaskExecutorSuite) TestProcessSignalExecution_WorkflowSignalingItself() {
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
 
-	taskID := int64(59)
-	event, _ = test.AddRequestSignalInitiatedEvent(mutableState, event.GetEventId(), uuid.New(),
-		constants.TestTargetDomainName, targetExecution.GetWorkflowId(), targetExecution.GetRunId(), signalName, signalInput, signalControl)
+	event, signalInfo := test.AddRequestSignalInitiatedEvent(
+		mutableState,
+		decisionCompletionID,
+		uuid.New(),
+		constants.TestDomainName,
+		workflowExecution.GetWorkflowID(),
+		workflowExecution.GetRunID(),
+		"some random signal name",
+		[]byte("some random signal input"),
+		[]byte("some random signal control"),
+	)
 
-	transferTask := &persistence.TransferTaskInfo{
-		Version:          s.version,
-		DomainID:         s.domainID,
-		WorkflowID:       workflowExecution.GetWorkflowId(),
-		RunID:            workflowExecution.GetRunId(),
-		TargetDomainID:   s.targetDomainID,
-		TargetWorkflowID: targetExecution.GetWorkflowId(),
-		TargetRunID:      targetExecution.GetRunId(),
-		TaskID:           taskID,
-		TaskList:         taskListName,
-		TaskType:         persistence.TransferTaskTypeSignalExecution,
-		ScheduleID:       event.GetEventId(),
+	transferTask := s.newTransferTaskFromInfo(&persistence.SignalExecutionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+		TargetDomainID:   s.domainID,
+		TargetWorkflowID: workflowExecution.GetWorkflowID(),
+		TargetRunID:      workflowExecution.GetRunID(),
+		InitiatedID:      event.ID,
+	})
+
+	// Make sure we can observe the logs
+	observedZapCore, _ := observer.New(zap.InfoLevel)
+	s.transferActiveTaskExecutor.logger = log.NewLogger(zap.New(observedZapCore))
+
+	setupMockFn := func(
+		mutableState execution.MutableState,
+		workflowExecution, targetExecution types.WorkflowExecution,
+		event *types.HistoryEvent,
+		transferTask Task,
+		signalInfo *persistence.SignalInfo,
+	) {
+		mutableState.FlushBufferedEvents()
+
+		persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+		s.NoError(err)
+		s.mockHistoryV2Mgr.On("AppendHistoryNodes", mock.Anything, mock.Anything).Return(&persistence.AppendHistoryNodesResponse{}, nil).Once()
+		s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+		s.mockExecutionMgr.On("UpdateWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.UpdateWorkflowExecutionResponse{MutableStateUpdateSessionStats: &persistence.MutableStateUpdateSessionStats{}}, nil).Once()
 	}
 
-	event = test.AddSignaledEvent(mutableState, event.GetEventId(), constants.TestTargetDomainName, targetExecution.GetWorkflowId(), targetExecution.GetRunId(), nil)
-	mutableState.FlushBufferedEvents()
+	setupMockFn(mutableState, workflowExecution, workflowExecution, event, transferTask, signalInfo)
 
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, event.GetEventId(), event.GetVersion())
-	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+	s.NoError(err)
+}
 
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
-	s.Nil(err)
+func (s *transferActiveTaskExecutorSuite) testProcessSignalExecution(
+	setupMockFn func(
+		mutableState execution.MutableState,
+		workflowExecution, targetExecution types.WorkflowExecution,
+		signalInitEvent *types.HistoryEvent,
+		transferTask Task,
+		signalInfo *persistence.SignalInfo,
+	),
+) {
+	s.testProcessSignalExecutionWithErrorAndLogs(constants.TestDomainID, setupMockFn, nil, nil)
+}
+
+func (s *transferActiveTaskExecutorSuite) testProcessSignalExecutionWithErrorAndLogs(
+	targetDomainID string,
+	setupMockFn func(
+		mutableState execution.MutableState,
+		workflowExecution, targetExecution types.WorkflowExecution,
+		signalInitEvent *types.HistoryEvent,
+		transferTask Task,
+		signalInfo *persistence.SignalInfo,
+	),
+	expectedErr error,
+	expectedLogs []string,
+) {
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
+	targetExecution := types.WorkflowExecution{
+		WorkflowID: "some random target workflow ID",
+		RunID:      uuid.New(),
+	}
+
+	event, signalInfo := test.AddRequestSignalInitiatedEvent(
+		mutableState,
+		decisionCompletionID,
+		uuid.New(),
+		constants.TestDomainName,
+		targetExecution.GetWorkflowID(),
+		targetExecution.GetRunID(),
+		"some random signal name",
+		[]byte("some random signal input"),
+		[]byte("some random signal control"),
+	)
+
+	transferTask := s.newTransferTaskFromInfo(&persistence.SignalExecutionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+		TargetDomainID:   targetDomainID,
+		TargetWorkflowID: targetExecution.GetWorkflowID(),
+		TargetRunID:      targetExecution.GetRunID(),
+		InitiatedID:      event.ID,
+	})
+
+	// Make sure we can observe the logs
+	observedZapCore, observedLogs := observer.New(zap.InfoLevel)
+	s.transferActiveTaskExecutor.logger = log.NewLogger(zap.New(observedZapCore))
+
+	setupMockFn(mutableState, workflowExecution, targetExecution, event, transferTask, signalInfo)
+
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+	s.Equal(expectedErr, err)
+
+	assert.Equal(s.T(), len(expectedLogs), observedLogs.Len(), "expected %v logs, but got %v logs", len(expectedLogs), observedLogs.Len())
+	for _, expectedLog := range expectedLogs {
+		s.True(observedLogs.FilterMessage(expectedLog).Len() > 0, "expected log missing: %v", expectedLog)
+	}
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessStartChildExecution_Success() {
-
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
-
-	childWorkflowID := "some random child workflow ID"
-	childRunID := uuid.New()
-	childWorkflowType := "some random child workflow type"
-	childTaskListName := "some random child task list"
-
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
+	s.testProcessStartChildExecution(
+		constants.TestDomainID,
+		func(
+			mutableState execution.MutableState,
+			workflowExecution, childExecution types.WorkflowExecution,
+			event *types.HistoryEvent,
+			transferTask Task,
+			childInfo *persistence.ChildExecutionInfo,
+		) {
+			persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+			s.NoError(err)
+			s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+			taskInfo := transferTask.GetInfo().(*persistence.StartChildExecutionTask)
+			event, err = mutableState.GetChildExecutionInitiatedEvent(context.Background(), taskInfo.InitiatedID)
+			s.NoError(err)
+			currentVersionHistory, err := mutableState.GetVersionHistories().GetCurrentVersionHistory()
+			s.NoError(err)
+			historyReq, err := createTestChildWorkflowExecutionRequest(
+				s.domainName,
+				constants.TestDomainName,
+				taskInfo,
+				event.StartChildWorkflowExecutionInitiatedEventAttributes,
+				childInfo.CreateRequestID,
+				s.mockShard.GetTimeSource().Now(),
+				mutableState.GetExecutionInfo().PartitionConfig,
+				mutableState.GetExecutionInfo().ActiveClusterSelectionPolicy,
+				// the parent sends its current branch, so the child start can find a run from a stale branch
+				currentVersionHistory.ToInternalType().Items,
+			)
+			require.NoError(s.T(), err)
+			s.mockHistoryClient.EXPECT().StartWorkflowExecution(gomock.Any(), historyReq).Return(&types.StartWorkflowExecutionResponse{RunID: childExecution.RunID}, nil).Times(1)
+			s.mockHistoryV2Mgr.On("AppendHistoryNodes", mock.Anything, mock.Anything).Return(&persistence.AppendHistoryNodesResponse{}, nil).Once()
+			s.mockExecutionMgr.On("UpdateWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.UpdateWorkflowExecutionResponse{MutableStateUpdateSessionStats: &persistence.MutableStateUpdateSessionStats{}}, nil).Once()
+			s.mockHistoryClient.EXPECT().ScheduleDecisionTask(gomock.Any(), &types.ScheduleDecisionTaskRequest{
+				DomainUUID: constants.TestDomainID,
+				WorkflowExecution: &types.WorkflowExecution{
+					WorkflowID: childExecution.WorkflowID,
+					RunID:      childExecution.RunID,
+				},
+				IsFirstDecision: true,
+			}).Return(nil).Times(1)
 		},
 	)
-	s.Nil(err)
-
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-	event = test.AddDecisionTaskCompletedEvent(mutableState, di.ScheduleID, di.StartedID, nil, "some random identity")
-
-	taskID := int64(59)
-
-	event, ci := test.AddStartChildWorkflowExecutionInitiatedEvent(mutableState, event.GetEventId(), uuid.New(),
-		s.childDomainName, childWorkflowID, childWorkflowType, childTaskListName, nil, 1, 1)
-
-	transferTask := &persistence.TransferTaskInfo{
-		Version:          s.version,
-		DomainID:         s.domainID,
-		WorkflowID:       workflowExecution.GetWorkflowId(),
-		RunID:            workflowExecution.GetRunId(),
-		TargetDomainID:   constants.TestChildDomainID,
-		TargetWorkflowID: childWorkflowID,
-		TargetRunID:      "",
-		TaskID:           taskID,
-		TaskList:         taskListName,
-		TaskType:         persistence.TransferTaskTypeStartChildExecution,
-		ScheduleID:       event.GetEventId(),
-	}
-
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, event.GetEventId(), event.GetVersion())
-	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
-	s.mockHistoryClient.EXPECT().StartWorkflowExecution(gomock.Any(), s.createChildWorkflowExecutionRequest(
-		s.domainName,
-		s.childDomainName,
-		transferTask,
-		mutableState,
-		ci,
-	)).Return(&workflow.StartWorkflowExecutionResponse{RunId: common.StringPtr(childRunID)}, nil).Times(1)
-	s.mockHistoryV2Mgr.On("AppendHistoryNodes", mock.Anything, mock.Anything).Return(&p.AppendHistoryNodesResponse{Size: 0}, nil).Once()
-	s.mockExecutionMgr.On("UpdateWorkflowExecution", mock.Anything, mock.Anything).Return(&p.UpdateWorkflowExecutionResponse{MutableStateUpdateSessionStats: &p.MutableStateUpdateSessionStats{}}, nil).Once()
-	s.mockClusterMetadata.EXPECT().ClusterNameForFailoverVersion(s.version).Return(cluster.TestCurrentClusterName).AnyTimes()
-	s.mockHistoryClient.EXPECT().ScheduleDecisionTask(gomock.Any(), &history.ScheduleDecisionTaskRequest{
-		DomainUUID: common.StringPtr(constants.TestChildDomainID),
-		WorkflowExecution: &workflow.WorkflowExecution{
-			WorkflowId: common.StringPtr(childWorkflowID),
-			RunId:      common.StringPtr(childRunID),
-		},
-		IsFirstDecision: common.BoolPtr(true),
-	}).Return(nil).Times(1)
-
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
-	s.Nil(err)
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessStartChildExecution_Failure() {
-
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
-
-	childWorkflowID := "some random child workflow ID"
-	childWorkflowType := "some random child workflow type"
-	childTaskListName := "some random child task list"
-
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
+	s.testProcessStartChildExecution(
+		constants.TestDomainID,
+		func(
+			mutableState execution.MutableState,
+			workflowExecution, childExecution types.WorkflowExecution,
+			event *types.HistoryEvent,
+			transferTask Task,
+			childInfo *persistence.ChildExecutionInfo,
+		) {
+			persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+			s.NoError(err)
+			s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+			taskInfo := transferTask.GetInfo().(*persistence.StartChildExecutionTask)
+			event, err = mutableState.GetChildExecutionInitiatedEvent(context.Background(), taskInfo.InitiatedID)
+			s.NoError(err)
+			currentVersionHistory, err := mutableState.GetVersionHistories().GetCurrentVersionHistory()
+			s.NoError(err)
+			historyReq, err := createTestChildWorkflowExecutionRequest(
+				s.domainName,
+				constants.TestDomainName,
+				taskInfo,
+				event.StartChildWorkflowExecutionInitiatedEventAttributes,
+				childInfo.CreateRequestID,
+				s.mockShard.GetTimeSource().Now(),
+				mutableState.GetExecutionInfo().PartitionConfig,
+				mutableState.GetExecutionInfo().ActiveClusterSelectionPolicy,
+				// the parent sends its current branch, so the child start can find a run from a stale branch
+				currentVersionHistory.ToInternalType().Items,
+			)
+			require.NoError(s.T(), err)
+			s.mockHistoryClient.EXPECT().StartWorkflowExecution(gomock.Any(), historyReq).Return(nil, &types.WorkflowExecutionAlreadyStartedError{}).Times(1)
+			s.mockHistoryV2Mgr.On("AppendHistoryNodes", mock.Anything, mock.Anything).Return(&persistence.AppendHistoryNodesResponse{}, nil).Once()
+			s.mockExecutionMgr.On("UpdateWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.UpdateWorkflowExecutionResponse{MutableStateUpdateSessionStats: &persistence.MutableStateUpdateSessionStats{}}, nil).Once()
 		},
 	)
-	s.Nil(err)
+}
 
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-	event = test.AddDecisionTaskCompletedEvent(mutableState, di.ScheduleID, di.StartedID, nil, "some random identity")
-
-	taskID := int64(59)
-
-	event, ci := test.AddStartChildWorkflowExecutionInitiatedEvent(
-		mutableState,
-		event.GetEventId(),
-		uuid.New(),
-		s.childDomainName,
-		childWorkflowID,
-		childWorkflowType,
-		childTaskListName,
-		nil,
-		1,
-		1,
+// This test was originally written for the Cross-cluster use-case where the target domain is not active.
+// However, it remains a valid test for the scenario where there's a race between parent and child in transfer
+// tasks.
+// ie: When a failover has occurred, and the parent workflow has spawned a child, this has been picked up by a
+// host which has not yet updated it's domain-cache to include the new information that the domain has failed over
+// and incorrectly thinks that the domain is not active.
+// In this case the correct behaviour would be to return the domainNotActive error and ensure that it's retried on the
+// host running the child workflow.
+func (s *transferActiveTaskExecutorSuite) TestProcessStartChildExecution_TargetNotActive() {
+	s.testProcessStartChildExecutionWithError(
+		constants.TestDomainID,
+		func(
+			mutableState execution.MutableState,
+			workflowExecution, childExecution types.WorkflowExecution,
+			event *types.HistoryEvent,
+			transferTask Task,
+			childInfo *persistence.ChildExecutionInfo,
+		) {
+			persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+			s.NoError(err)
+			s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+			taskInfo := transferTask.GetInfo().(*persistence.StartChildExecutionTask)
+			_, err = mutableState.GetChildExecutionInitiatedEvent(context.Background(), taskInfo.InitiatedID)
+			s.NoError(err)
+			s.mockHistoryClient.EXPECT().StartWorkflowExecution(gomock.Any(), gomock.Any()).Return(nil, &types.DomainNotActiveError{
+				Message: "domain not active error 123",
+			}).Times(1)
+		},
+		&types.DomainNotActiveError{
+			Message: "domain not active error 123",
+		},
 	)
-
-	transferTask := &persistence.TransferTaskInfo{
-		Version:          s.version,
-		DomainID:         s.domainID,
-		WorkflowID:       workflowExecution.GetWorkflowId(),
-		RunID:            workflowExecution.GetRunId(),
-		TargetDomainID:   constants.TestChildDomainID,
-		TargetWorkflowID: childWorkflowID,
-		TargetRunID:      "",
-		TaskID:           taskID,
-		TaskList:         taskListName,
-		TaskType:         persistence.TransferTaskTypeStartChildExecution,
-		ScheduleID:       event.GetEventId(),
-	}
-
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, event.GetEventId(), event.GetVersion())
-	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
-	s.mockHistoryClient.EXPECT().StartWorkflowExecution(gomock.Any(), s.createChildWorkflowExecutionRequest(
-		s.domainName,
-		s.childDomainName,
-		transferTask,
-		mutableState,
-		ci,
-	)).Return(nil, &workflow.WorkflowExecutionAlreadyStartedError{}).Times(1)
-	s.mockHistoryV2Mgr.On("AppendHistoryNodes", mock.Anything, mock.Anything).Return(&p.AppendHistoryNodesResponse{Size: 0}, nil).Once()
-	s.mockExecutionMgr.On("UpdateWorkflowExecution", mock.Anything, mock.Anything).Return(&p.UpdateWorkflowExecutionResponse{MutableStateUpdateSessionStats: &p.MutableStateUpdateSessionStats{}}, nil).Once()
-	s.mockClusterMetadata.EXPECT().ClusterNameForFailoverVersion(s.version).Return(cluster.TestCurrentClusterName).AnyTimes()
-
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
-	s.Nil(err)
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessStartChildExecution_Success_Dup() {
+	s.testProcessStartChildExecution(
+		constants.TestDomainID,
+		func(
+			mutableState execution.MutableState,
+			workflowExecution, childExecution types.WorkflowExecution,
+			event *types.HistoryEvent,
+			transferTask Task,
+			childInfo *persistence.ChildExecutionInfo,
+		) {
+			startEvent := test.AddChildWorkflowExecutionStartedEvent(mutableState, event.ID, constants.TestDomainID, childExecution.WorkflowID, childExecution.RunID, childInfo.WorkflowTypeName)
+			childInfo.StartedID = startEvent.ID
+			mutableState.FlushBufferedEvents()
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
-
-	childWorkflowID := "some random child workflow ID"
-	childRunID := uuid.New()
-	childWorkflowType := "some random child workflow type"
-	childTaskListName := "some random child task list"
-
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
+			persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, startEvent.ID, startEvent.Version)
+			s.NoError(err)
+			s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+			s.mockHistoryClient.EXPECT().ScheduleDecisionTask(gomock.Any(), &types.ScheduleDecisionTaskRequest{
+				DomainUUID: constants.TestDomainID,
+				WorkflowExecution: &types.WorkflowExecution{
+					WorkflowID: childExecution.WorkflowID,
+					RunID:      childExecution.RunID,
+				},
+				IsFirstDecision: true,
+			}).Return(nil).Times(1)
 		},
 	)
-	s.Nil(err)
+}
 
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-	event = test.AddDecisionTaskCompletedEvent(mutableState, di.ScheduleID, di.StartedID, nil, "some random identity")
+func (s *transferActiveTaskExecutorSuite) TestProcessStartChildExecution_Dup_TargetNotActive() {
+	s.testProcessStartChildExecutionWithError(
+		constants.TestDomainID,
+		func(
+			mutableState execution.MutableState,
+			workflowExecution, childExecution types.WorkflowExecution,
+			event *types.HistoryEvent,
+			transferTask Task,
+			childInfo *persistence.ChildExecutionInfo,
+		) {
+			startEvent := test.AddChildWorkflowExecutionStartedEvent(mutableState, event.ID, constants.TestDomainID, childExecution.WorkflowID, childExecution.RunID, childInfo.WorkflowTypeName)
+			childInfo.StartedID = startEvent.ID
+			mutableState.FlushBufferedEvents()
 
-	taskID := int64(59)
-
-	event, ci := test.AddStartChildWorkflowExecutionInitiatedEvent(
-		mutableState,
-		event.GetEventId(),
-		uuid.New(),
-		s.childDomainName,
-		childWorkflowID,
-		childWorkflowType,
-		childTaskListName,
-		nil,
-		1,
-		1,
-	)
-
-	transferTask := &persistence.TransferTaskInfo{
-		Version:          s.version,
-		DomainID:         s.domainID,
-		WorkflowID:       workflowExecution.GetWorkflowId(),
-		RunID:            workflowExecution.GetRunId(),
-		TargetDomainID:   constants.TestChildDomainID,
-		TargetWorkflowID: childWorkflowID,
-		TargetRunID:      "",
-		TaskID:           taskID,
-		TaskList:         taskListName,
-		TaskType:         persistence.TransferTaskTypeStartChildExecution,
-		ScheduleID:       event.GetEventId(),
-	}
-
-	event = test.AddChildWorkflowExecutionStartedEvent(mutableState, event.GetEventId(), constants.TestChildDomainID, childWorkflowID, childRunID, childWorkflowType)
-	ci.StartedID = event.GetEventId()
-	mutableState.FlushBufferedEvents()
-
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, event.GetEventId(), event.GetVersion())
-	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
-	s.mockHistoryClient.EXPECT().ScheduleDecisionTask(gomock.Any(), &history.ScheduleDecisionTaskRequest{
-		DomainUUID: common.StringPtr(constants.TestChildDomainID),
-		WorkflowExecution: &workflow.WorkflowExecution{
-			WorkflowId: common.StringPtr(childWorkflowID),
-			RunId:      common.StringPtr(childRunID),
+			persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, startEvent.ID, startEvent.Version)
+			s.NoError(err)
+			s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+			s.mockHistoryClient.EXPECT().ScheduleDecisionTask(gomock.Any(), gomock.Any()).Return(&types.DomainNotActiveError{}).Times(1)
 		},
-		IsFirstDecision: common.BoolPtr(true),
-	}).Return(nil).Times(1)
-
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
-	s.Nil(err)
+		&types.DomainNotActiveError{},
+	)
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessStartChildExecution_Duplication() {
+	s.testProcessStartChildExecution(
+		constants.TestDomainID,
+		func(
+			mutableState execution.MutableState,
+			workflowExecution, childExecution types.WorkflowExecution,
+			event *types.HistoryEvent,
+			transferTask Task,
+			childInfo *persistence.ChildExecutionInfo,
+		) {
+			startEvent := test.AddChildWorkflowExecutionStartedEvent(mutableState, event.ID, constants.TestDomainID, childExecution.GetWorkflowID(), childExecution.GetRunID(), childInfo.WorkflowTypeName)
+			childInfo.StartedID = startEvent.ID
+			startEvent = test.AddChildWorkflowExecutionCompletedEvent(mutableState, childInfo.InitiatedID, &childExecution, &types.WorkflowExecutionCompletedEventAttributes{
+				Result:                       []byte("some random child workflow execution result"),
+				DecisionTaskCompletedEventID: transferTask.GetInfo().(*persistence.StartChildExecutionTask).InitiatedID,
+			})
+			mutableState.FlushBufferedEvents()
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
-
-	childExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random child workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	childWorkflowType := "some random child workflow type"
-	childTaskListName := "some random child task list"
-
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-	_, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-			},
+			persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, startEvent.ID, startEvent.Version)
+			s.NoError(err)
+			s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
 		},
 	)
-	s.Nil(err)
+}
 
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-	event := test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, taskListName, uuid.New())
-	di.StartedID = event.GetEventId()
-	event = test.AddDecisionTaskCompletedEvent(mutableState, di.ScheduleID, di.StartedID, nil, "some random identity")
+func (s *transferActiveTaskExecutorSuite) TestProcessStartChildExecution_StartedAbandonChild_ParentClosed() {
+	s.testProcessStartChildExecution(
+		constants.TestDomainID,
+		func(
+			mutableState execution.MutableState,
+			workflowExecution, childExecution types.WorkflowExecution,
+			event *types.HistoryEvent,
+			transferTask Task,
+			childInfo *persistence.ChildExecutionInfo,
+		) {
+			event = test.AddChildWorkflowExecutionStartedEvent(mutableState, event.ID, constants.TestDomainID, childExecution.WorkflowID, childExecution.RunID, childInfo.WorkflowTypeName)
+			childInfo.StartedID = event.ID
+			di := test.AddDecisionTaskScheduledEvent(mutableState)
+			event = test.AddDecisionTaskStartedEvent(mutableState, di.ScheduleID, mutableState.GetExecutionInfo().TaskList, "some random identity")
+			event = test.AddDecisionTaskCompletedEvent(mutableState, di.ScheduleID, event.ID, nil, "some random identity")
+			event = test.AddCompleteWorkflowEvent(mutableState, event.ID, nil)
+			mutableState.FlushBufferedEvents()
 
-	taskID := int64(59)
+			persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, event.ID, event.Version)
+			s.NoError(err)
+			s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+			s.mockHistoryClient.EXPECT().ScheduleDecisionTask(gomock.Any(), &types.ScheduleDecisionTaskRequest{
+				DomainUUID: constants.TestDomainID,
+				WorkflowExecution: &types.WorkflowExecution{
+					WorkflowID: childExecution.WorkflowID,
+					RunID:      childExecution.RunID,
+				},
+				IsFirstDecision: true,
+			}).Return(nil).Times(1)
+		},
+	)
+}
+
+func (s *transferActiveTaskExecutorSuite) testProcessStartChildExecution(
+	targetDomainID string,
+	setupMockFn func(
+		mutableState execution.MutableState,
+		workflowExecution, targetExecution types.WorkflowExecution,
+		childInitEvent *types.HistoryEvent,
+		transferTask Task,
+		childInfo *persistence.ChildExecutionInfo,
+	),
+) {
+	s.testProcessStartChildExecutionWithError(targetDomainID, setupMockFn, nil)
+}
+
+func (s *transferActiveTaskExecutorSuite) testProcessStartChildExecutionWithError(
+	targetDomainID string,
+	setupMockFn func(
+		mutableState execution.MutableState,
+		workflowExecution, targetExecution types.WorkflowExecution,
+		childInitEvent *types.HistoryEvent,
+		transferTask Task,
+		childInfo *persistence.ChildExecutionInfo,
+	),
+	expectedErr error,
+) {
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
+	childExecution := types.WorkflowExecution{
+		WorkflowID: "some random child workflow ID",
+		RunID:      uuid.New(),
+	}
 
 	event, ci := test.AddStartChildWorkflowExecutionInitiatedEvent(
 		mutableState,
-		event.GetEventId(),
-		uuid.New(),
-		s.childDomainName,
-		childExecution.GetWorkflowId(),
-		childWorkflowType,
-		childTaskListName,
+		decisionCompletionID,
+		constants.TestDomainName,
+		childExecution.WorkflowID,
+		"some random child workflow type",
+		"some random child task list",
 		nil,
 		1,
 		1,
+		&types.RetryPolicy{
+			ExpirationIntervalInSeconds: 100,
+			MaximumAttempts:             3,
+			InitialIntervalInSeconds:    1,
+			MaximumIntervalInSeconds:    2,
+			BackoffCoefficient:          1,
+		},
 	)
 
-	transferTask := &persistence.TransferTaskInfo{
-		Version:          s.version,
-		DomainID:         s.domainID,
-		WorkflowID:       workflowExecution.GetWorkflowId(),
-		RunID:            workflowExecution.GetRunId(),
-		TargetDomainID:   constants.TestChildDomainID,
-		TargetWorkflowID: childExecution.GetWorkflowId(),
-		TargetRunID:      "",
-		TaskID:           taskID,
-		TaskList:         taskListName,
-		TaskType:         persistence.TransferTaskTypeStartChildExecution,
-		ScheduleID:       event.GetEventId(),
-	}
-
-	event = test.AddChildWorkflowExecutionStartedEvent(mutableState, event.GetEventId(), constants.TestChildDomainID, childExecution.GetWorkflowId(), childExecution.GetRunId(), childWorkflowType)
-	ci.StartedID = event.GetEventId()
-	event = test.AddChildWorkflowExecutionCompletedEvent(mutableState, ci.InitiatedID, &childExecution, &workflow.WorkflowExecutionCompletedEventAttributes{
-		Result:                       []byte("some random child workflow execution result"),
-		DecisionTaskCompletedEventId: common.Int64Ptr(transferTask.ScheduleID),
+	transferTask := s.newTransferTaskFromInfo(&persistence.StartChildExecutionTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+		TargetDomainID:   targetDomainID,
+		TargetWorkflowID: childExecution.WorkflowID,
+		InitiatedID:      event.ID,
 	})
-	mutableState.FlushBufferedEvents()
 
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, event.GetEventId(), event.GetVersion())
-	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+	setupMockFn(mutableState, workflowExecution, childExecution, event, transferTask, ci)
 
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
-	s.Nil(err)
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+	s.Equal(expectedErr, err)
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessRecordWorkflowStartedTask() {
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
-	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
-	cronSchedule := "@every 5s"
-	backoffSeconds := int32(5)
-
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
-
-	event, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
-				CronSchedule:                        common.StringPtr(cronSchedule),
-			},
-			FirstDecisionTaskBackoffSeconds: common.Int32Ptr(backoffSeconds),
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
+	executionInfo := mutableState.GetExecutionInfo()
+	executionInfo.CronSchedule = "@every 5s"
+	executionInfo.ActiveClusterSelectionPolicy = &types.ActiveClusterSelectionPolicy{
+		ClusterAttribute: &types.ClusterAttribute{
+			Scope: "region",
+			Name:  "us-west",
 		},
-	)
+	}
+	startEvent, err := mutableState.GetStartEvent(context.Background())
+	s.NoError(err)
+	startEvent.WorkflowExecutionStartedEventAttributes.FirstDecisionTaskBackoffSeconds = common.Int32Ptr(5)
+
+	transferTask := s.newTransferTaskFromInfo(&persistence.RecordWorkflowStartedTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+	})
+
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, decisionCompletionID, mutableState.GetCurrentVersion())
+	s.NoError(err)
+	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+	if s.mockShard.GetConfig().EnableRecordWorkflowExecutionUninitialized(s.domainName) {
+		s.mockVisibilityMgr.On(
+			"RecordWorkflowExecutionUninitialized",
+			mock.Anything,
+			createRecordWorkflowExecutionUninitializedRequest(transferTask, mutableState, s.mockShard.GetTimeSource().Now(), 1234),
+		).Once().Return(nil)
+	}
+	s.mockVisibilityMgr.On(
+		"RecordWorkflowExecutionStarted",
+		mock.Anything,
+		createRecordWorkflowExecutionStartedRequest(
+			s.T(),
+			s.domainName, startEvent, transferTask, mutableState, 2, s.mockShard.GetTimeSource().Now(),
+			false),
+	).Once().Return(nil)
+
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
 	s.Nil(err)
+}
 
-	taskID := int64(59)
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-
-	transferTask := &persistence.TransferTaskInfo{
-		Version:    s.version,
-		DomainID:   s.domainID,
-		WorkflowID: workflowExecution.GetWorkflowId(),
-		RunID:      workflowExecution.GetRunId(),
-		TaskID:     taskID,
-		TaskList:   taskListName,
-		TaskType:   persistence.TransferTaskTypeRecordWorkflowStarted,
-		ScheduleID: event.GetEventId(),
+func (s *transferActiveTaskExecutorSuite) TestProcessRecordWorkflowStartedTaskWithContextHeader() {
+	// switch on context header in viz
+	s.mockShard.GetConfig().EnableContextHeaderInVisibility = func(domain string) bool { return true }
+	s.mockShard.GetConfig().ValidSearchAttributes = func(opts ...dynamicproperties.FilterOption) map[string]interface{} {
+		return map[string]interface{}{
+			"Header_context_key": struct{}{},
+			"123456":             struct{}{}, // unsanitizable key
+		}
 	}
 
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, di.ScheduleID, di.Version)
-	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
-	s.mockVisibilityMgr.On("RecordWorkflowExecutionStarted", mock.Anything, s.createRecordWorkflowExecutionStartedRequest(s.domainName, event, transferTask, mutableState, backoffSeconds)).Once().Return(nil)
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
+	executionInfo := mutableState.GetExecutionInfo()
+	executionInfo.CronSchedule = "@every 5s"
+	startEvent, err := mutableState.GetStartEvent(context.Background())
+	s.NoError(err)
+	startEvent.WorkflowExecutionStartedEventAttributes.FirstDecisionTaskBackoffSeconds = common.Int32Ptr(5)
 
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
+	transferTask := s.newTransferTaskFromInfo(&persistence.RecordWorkflowStartedTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+	})
+
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, decisionCompletionID, mutableState.GetCurrentVersion())
+	s.NoError(err)
+	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+	if s.mockShard.GetConfig().EnableRecordWorkflowExecutionUninitialized(s.domainName) {
+		s.mockVisibilityMgr.On(
+			"RecordWorkflowExecutionUninitialized",
+			mock.Anything,
+			createRecordWorkflowExecutionUninitializedRequest(transferTask, mutableState, s.mockShard.GetTimeSource().Now(), 1234),
+		).Once().Return(nil)
+	}
+	s.mockVisibilityMgr.On(
+		"RecordWorkflowExecutionStarted",
+		mock.Anything,
+		createRecordWorkflowExecutionStartedRequest(
+			s.T(),
+			s.domainName, startEvent, transferTask, mutableState, 2, s.mockShard.GetTimeSource().Now(),
+			true),
+	).Once().Return(nil)
+
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
 	s.Nil(err)
 }
 
 func (s *transferActiveTaskExecutorSuite) TestProcessUpsertWorkflowSearchAttributes() {
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr("some random workflow ID"),
-		RunId:      common.StringPtr(uuid.New()),
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
+	executionInfo := mutableState.GetExecutionInfo()
+	executionInfo.ActiveClusterSelectionPolicy = &types.ActiveClusterSelectionPolicy{
+		ClusterAttribute: &types.ClusterAttribute{
+			Scope: "region",
+			Name:  "us-west",
+		},
 	}
-	workflowType := "some random workflow type"
-	taskListName := "some random task list"
 
-	mutableState := execution.NewMutableStateBuilderWithVersionHistoriesWithEventV2(
-		s.mockShard,
-		s.logger,
-		s.version,
-		workflowExecution.GetRunId(),
-		constants.TestGlobalDomainEntry,
-	)
+	transferTask := s.newTransferTaskFromInfo(&persistence.UpsertWorkflowSearchAttributesTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+	})
 
-	event, err := mutableState.AddWorkflowExecutionStartedEvent(
-		workflowExecution,
-		&history.StartWorkflowExecutionRequest{
-			DomainUUID: common.StringPtr(s.domainID),
-			StartRequest: &workflow.StartWorkflowExecutionRequest{
-				WorkflowType:                        &workflow.WorkflowType{Name: common.StringPtr(workflowType)},
-				TaskList:                            &workflow.TaskList{Name: common.StringPtr(taskListName)},
-				ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(2),
-				TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(1),
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, decisionCompletionID, mutableState.GetCurrentVersion())
+	s.NoError(err)
+	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+	startEvent, err := mutableState.GetStartEvent(context.Background())
+	s.NoError(err)
+	s.mockVisibilityMgr.On(
+		"UpsertWorkflowExecution",
+		mock.Anything,
+		createUpsertWorkflowSearchAttributesRequest(
+			s.T(),
+			s.domainName, startEvent, transferTask, mutableState, 2, s.mockShard.GetTimeSource().Now(),
+			false),
+	).Once().Return(nil)
+
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+	s.Nil(err)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessUpsertWorkflowSearchAttributesWithContextHeader() {
+	// switch on context header in viz
+	s.mockShard.GetConfig().EnableContextHeaderInVisibility = func(domain string) bool { return true }
+	s.mockShard.GetConfig().ValidSearchAttributes = func(opts ...dynamicproperties.FilterOption) map[string]interface{} {
+		return map[string]interface{}{
+			"Header_context_key": struct{}{},
+		}
+	}
+
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
+
+	transferTask := s.newTransferTaskFromInfo(&persistence.UpsertWorkflowSearchAttributesTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+	})
+
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, decisionCompletionID, mutableState.GetCurrentVersion())
+	s.NoError(err)
+	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+	startEvent, err := mutableState.GetStartEvent(context.Background())
+	s.NoError(err)
+	s.mockVisibilityMgr.On(
+		"UpsertWorkflowExecution",
+		mock.Anything,
+		createUpsertWorkflowSearchAttributesRequest(
+			s.T(),
+			s.domainName, startEvent, transferTask, mutableState, 2, s.mockShard.GetTimeSource().Now(),
+			true),
+	).Once().Return(nil)
+
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+	s.Nil(err)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessResetWorkflow_ResetPointNil() {
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
+
+	transferTask := s.newTransferTaskFromInfo(&persistence.ResetWorkflowTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+	})
+
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, decisionCompletionID, mutableState.GetCurrentVersion())
+	s.NoError(err)
+	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+	s.Nil(err)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessResetWorkflow_WorkflowNotRunning() {
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
+
+	transferTask := s.newTransferTaskFromInfo(&persistence.ResetWorkflowTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+	})
+
+	mutableState.GetExecutionInfo().State = persistence.WorkflowStateCompleted
+
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, decisionCompletionID, mutableState.GetCurrentVersion())
+	s.NoError(err)
+	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+	s.mockExecutionMgr.On("GetCurrentExecution", mock.Anything, &persistence.GetCurrentExecutionRequest{DomainID: s.domainID, WorkflowID: workflowExecution.GetWorkflowID(), DomainName: s.domainName, ShardID: common.Ptr(0)}).
+		Return(&persistence.GetCurrentExecutionResponse{RunID: "runID"}, nil)
+
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+	s.Nil(err)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessResetWorkflow_Success() {
+	s.testProcessResetWorkflowWithError(true, nil, nil)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessResetWorkflow_DifferentRunID() {
+	s.testProcessResetWorkflowWithError(false, nil, nil)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessResetWorkflow_CorruptedResetPoint() {
+	s.testProcessResetWorkflowWithError(true, &types.BadRequestError{}, nil)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessResetWorkflow_OtherError() {
+	s.testProcessResetWorkflowWithError(true, errors.New("some random error"), errors.New("some random error"))
+}
+
+func (s *transferActiveTaskExecutorSuite) testProcessResetWorkflowWithError(sameRunID bool, resetError error, returnErr error) {
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
+
+	s.domainEntry.GetConfig().BadBinaries = types.BadBinaries{
+		Binaries: map[string]*types.BadBinaryInfo{
+			"test-binary-checksum": {
+				Reason:          "test-reason",
+				Operator:        "test-operator",
+				CreatedTimeNano: common.Ptr(time.Now().UnixNano()),
 			},
 		},
-	)
-	s.Nil(err)
-
-	taskID := int64(59)
-	di := test.AddDecisionTaskScheduledEvent(mutableState)
-
-	transferTask := &persistence.TransferTaskInfo{
-		Version:    s.version,
-		DomainID:   s.domainID,
-		WorkflowID: workflowExecution.GetWorkflowId(),
-		RunID:      workflowExecution.GetRunId(),
-		TaskID:     taskID,
-		TaskList:   taskListName,
-		TaskType:   persistence.TransferTaskTypeUpsertWorkflowSearchAttributes,
-		ScheduleID: event.GetEventId(),
 	}
 
-	persistenceMutableState := s.createPersistenceMutableState(mutableState, di.ScheduleID, di.Version)
-	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
-	s.mockVisibilityMgr.On("UpsertWorkflowExecution", mock.Anything, s.createUpsertWorkflowSearchAttributesRequest(s.domainName, event, transferTask, mutableState)).Once().Return(nil)
+	transferTask := s.newTransferTaskFromInfo(&persistence.ResetWorkflowTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+	})
 
-	err = s.transferActiveTaskExecutor.Execute(transferTask, true)
-	s.Nil(err)
+	firstDecisionCompletedID := int64(2)
+
+	runID := workflowExecution.GetRunID()
+	if !sameRunID {
+		runID = uuid.New()
+	}
+
+	resetPoints := &types.ResetPoints{
+		Points: []*types.ResetPointInfo{
+			{
+				BinaryChecksum:           "test-binary-checksum",
+				RunID:                    runID,
+				FirstDecisionCompletedID: firstDecisionCompletedID,
+				Resettable:               true,
+			},
+		},
+	}
+
+	mutableState.GetExecutionInfo().AutoResetPoints = resetPoints
+
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, decisionCompletionID, mutableState.GetCurrentVersion())
+	s.NoError(err)
+	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+
+	workflowResetter := reset.NewMockWorkflowResetter(s.controller)
+	s.transferActiveTaskExecutor.workflowResetter = workflowResetter
+	versionHistories := mutableState.GetVersionHistories()
+	currentVersionHistory, err := versionHistories.GetCurrentVersionHistory()
+	s.NoError(err)
+
+	currentBranchToken := currentVersionHistory.GetBranchToken()
+	rebuildLastEventVersion, err := currentVersionHistory.GetEventVersion(firstDecisionCompletedID)
+	s.NoError(err)
+
+	workflowResetter.EXPECT().ResetWorkflow(
+		gomock.Any(),
+		s.domainID,
+		workflowExecution.GetWorkflowID(),
+		workflowExecution.GetRunID(),
+		currentBranchToken,
+		firstDecisionCompletedID-1,
+		rebuildLastEventVersion,
+		mutableState.GetNextEventID(),
+		gomock.Any(),
+		gomock.Any(),
+		gomock.Any(),
+		"test-reason",
+		nil,
+		false).Return(resetError).Times(1)
+
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+
+	if returnErr != nil {
+		s.Equal(returnErr, err)
+	} else {
+		s.Nil(err)
+	}
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessAcquireSemaphore_Success() {
+	s.testProcessAcquireSemaphore(func(_ execution.MutableState, semaphoreInfo *persistence.SemaphoreInfo) {
+		s.expectAcquireSemaphoreRequest(semaphoreInfo, &types.AcquireSemaphoreResponse{
+			Outcome: types.SemaphoreAcquireOutcomeAcquired,
+			TokenID: 3,
+		}, nil)
+		s.mockHistoryV2Mgr.On("AppendHistoryNodes", mock.Anything, mock.Anything).Return(&persistence.AppendHistoryNodesResponse{}, nil).Once()
+		s.mockExecutionMgr.On("UpdateWorkflowExecution", mock.Anything, mock.MatchedBy(func(request *persistence.UpdateWorkflowExecutionRequest) bool {
+			mutation := request.UpdateWorkflowMutation
+			if len(mutation.UpsertSemaphoreInfos) != 1 || mutation.UpsertSemaphoreInfos[0].TokenID != 3 {
+				return false
+			}
+			for _, task := range mutation.TasksByCategory[persistence.HistoryTaskCategoryTransfer] {
+				if _, ok := task.(*persistence.DecisionTask); ok {
+					return true
+				}
+			}
+			return false
+		})).Return(&persistence.UpdateWorkflowExecutionResponse{MutableStateUpdateSessionStats: &persistence.MutableStateUpdateSessionStats{}}, nil).Once()
+	}, nil)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessAcquireSemaphore_NoSlot() {
+	s.testProcessAcquireSemaphore(func(_ execution.MutableState, semaphoreInfo *persistence.SemaphoreInfo) {
+		s.expectAcquireSemaphoreRequest(semaphoreInfo, &types.AcquireSemaphoreResponse{Outcome: types.SemaphoreAcquireOutcomeNoSlot}, nil)
+	}, errSemaphoreNoSlot)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessAcquireSemaphore_MatchingError() {
+	badRequest := &types.BadRequestError{Message: "Feature not supported on TChannel"}
+	s.testProcessAcquireSemaphore(func(_ execution.MutableState, semaphoreInfo *persistence.SemaphoreInfo) {
+		s.expectAcquireSemaphoreRequest(semaphoreInfo, nil, badRequest)
+	}, badRequest)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessAcquireSemaphore_NoTokenInResponse() {
+	s.testProcessAcquireSemaphore(func(_ execution.MutableState, semaphoreInfo *persistence.SemaphoreInfo) {
+		s.expectAcquireSemaphoreRequest(semaphoreInfo, &types.AcquireSemaphoreResponse{Outcome: types.SemaphoreAcquireOutcomeAcquired}, nil)
+	}, &types.InternalServiceError{Message: "unexpected semaphore acquire response: outcome 1, token 0"})
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessAcquireSemaphore_SemaphoreNotFound() {
+	s.testProcessAcquireSemaphore(func(_ execution.MutableState, semaphoreInfo *persistence.SemaphoreInfo) {
+		s.mockShard.Resource.SemaphoreMetadataMgr.EXPECT().GetSemaphore(gomock.Any(), gomock.Any()).
+			Return(nil, &types.EntityNotExistsError{Message: "semaphore not found"})
+		s.mockHistoryV2Mgr.On("AppendHistoryNodes", mock.Anything, mock.MatchedBy(func(request *persistence.AppendHistoryNodesRequest) bool {
+			for _, event := range request.Events {
+				if event.GetEventType() == types.EventTypeSemaphoreAcquireFailed {
+					attributes := event.SemaphoreAcquireFailedEventAttributes
+					return attributes.GetCause() == types.SemaphoreAcquireFailedCauseNotFound &&
+						attributes.GetInitiatedEventID() == semaphoreInfo.InitiatedID
+				}
+			}
+			return false
+		})).Return(&persistence.AppendHistoryNodesResponse{}, nil).Once()
+		s.mockExecutionMgr.On("UpdateWorkflowExecution", mock.Anything, mock.MatchedBy(func(request *persistence.UpdateWorkflowExecutionRequest) bool {
+			mutation := request.UpdateWorkflowMutation
+			if len(mutation.DeleteSemaphoreInfos) != 1 || mutation.DeleteSemaphoreInfos[0] != semaphoreInfo.InitiatedID {
+				return false
+			}
+			for _, task := range mutation.TasksByCategory[persistence.HistoryTaskCategoryTransfer] {
+				if _, ok := task.(*persistence.DecisionTask); ok {
+					return true
+				}
+			}
+			return false
+		})).Return(&persistence.UpdateWorkflowExecutionResponse{MutableStateUpdateSessionStats: &persistence.MutableStateUpdateSessionStats{}}, nil).Once()
+	}, nil)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessAcquireSemaphore_Duplication() {
+	s.testProcessAcquireSemaphore(func(mutableState execution.MutableState, semaphoreInfo *persistence.SemaphoreInfo) {
+		_, err := mutableState.AddSemaphoreAcquiredEvent(semaphoreInfo.InitiatedID, 3)
+		s.NoError(err)
+		mutableState.FlushBufferedEvents()
+	}, nil)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessAcquireSemaphore_HoldNotFound() {
+	s.testProcessAcquireSemaphore(func(mutableState execution.MutableState, semaphoreInfo *persistence.SemaphoreInfo) {
+		s.NoError(mutableState.DeleteSemaphoreInfo(semaphoreInfo.InitiatedID))
+	}, nil)
+}
+
+func (s *transferActiveTaskExecutorSuite) TestProcessAcquireSemaphore_WorkflowNotRunning() {
+	s.testProcessAcquireSemaphore(func(mutableState execution.MutableState, _ *persistence.SemaphoreInfo) {
+		mutableState.GetExecutionInfo().State = persistence.WorkflowStateCompleted
+	}, nil)
+}
+
+const testSemaphoreName = "my-semaphore"
+
+func (s *transferActiveTaskExecutorSuite) testProcessAcquireSemaphore(
+	setupFn func(mutableState execution.MutableState, semaphoreInfo *persistence.SemaphoreInfo),
+	expectedErr error,
+) {
+	workflowExecution, mutableState, decisionCompletionID, err := test.SetupWorkflowWithCompletedDecision(s.T(), s.mockShard, s.domainID)
+	s.NoError(err)
+	event, semaphoreInfo, err := mutableState.AddSemaphoreAcquireInitiatedEvent(decisionCompletionID, testSemaphoreName, 30)
+	s.NoError(err)
+
+	setupFn(mutableState, semaphoreInfo)
+
+	transferTask := s.newTransferTaskFromInfo(&persistence.AcquireSemaphoreTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: workflowExecution.GetWorkflowID(),
+			RunID:      workflowExecution.GetRunID(),
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+		InitiatedID: event.ID,
+		TaskList:    mutableState.GetExecutionInfo().TaskList,
+	})
+	persistenceMutableState, err := test.CreatePersistenceMutableState(s.T(), mutableState, mutableState.GetNextEventID()-1, s.version)
+	s.NoError(err)
+	s.mockExecutionMgr.On("GetWorkflowExecution", mock.Anything, mock.Anything).Return(&persistence.GetWorkflowExecutionResponse{State: persistenceMutableState}, nil)
+
+	_, err = s.transferActiveTaskExecutor.Execute(transferTask)
+	s.Equal(expectedErr, err)
+}
+
+// Tests that a release task reaches processReleaseSemaphore, which needs no mutable state.
+func (s *transferActiveTaskExecutorSuite) TestProcessReleaseSemaphore() {
+	transferTask := s.newTransferTaskFromInfo(&persistence.ReleaseSemaphoreTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{
+			DomainID:   s.domainID,
+			WorkflowID: "wid",
+			RunID:      "rid",
+		},
+		TaskData: persistence.TaskData{
+			Version: s.version,
+			TaskID:  int64(59),
+		},
+		InitiatedID:   7,
+		SemaphoreName: testSemaphoreName,
+	})
+	s.mockShard.Resource.SemaphoreMetadataMgr.EXPECT().GetSemaphore(gomock.Any(), gomock.Any()).
+		Return(&persistence.GetSemaphoreResponse{Semaphore: &persistence.SemaphoreMetadata{Size: 4, BucketSize: 2}}, nil)
+	s.mockMatchingClient.EXPECT().ReleaseSemaphore(gomock.Any(), gomock.Any()).Return(&types.ReleaseSemaphoreResponse{}, nil)
+
+	_, err := s.transferActiveTaskExecutor.Execute(transferTask)
+	s.NoError(err)
+}
+
+func (s *transferActiveTaskExecutorSuite) expectAcquireSemaphoreRequest(
+	semaphoreInfo *persistence.SemaphoreInfo,
+	resp *types.AcquireSemaphoreResponse,
+	err error,
+) {
+	s.mockShard.Resource.SemaphoreMetadataMgr.EXPECT().GetSemaphore(gomock.Any(), &persistence.GetSemaphoreRequest{
+		DomainID:      s.domainID,
+		SemaphoreName: testSemaphoreName,
+	}).Return(&persistence.GetSemaphoreResponse{Semaphore: &persistence.SemaphoreMetadata{Size: 4, BucketSize: 2}}, nil)
+	bucket, bucketErr := commonsemaphore.OwnerIDToBucket(semaphoreInfo.OwnerID, 2)
+	s.NoError(bucketErr)
+	s.mockMatchingClient.EXPECT().AcquireSemaphore(gomock.Any(), &types.AcquireSemaphoreRequest{
+		DomainUUID:    s.domainID,
+		SemaphoreName: testSemaphoreName,
+		Bucket:        int32(bucket),
+		OwnerID:       semaphoreInfo.OwnerID,
+	}).Return(resp, err)
+}
+
+func TestRecordSemaphoreAcquire(t *testing.T) {
+	recordGranted := func(wfContext execution.Context) error {
+		return recordSemaphoreGranted(context.Background(), log.NewNoop(), wfContext, 5, 3, testTime)
+	}
+	recordFailed := func(wfContext execution.Context) error {
+		return recordSemaphoreAcquireFailed(context.Background(), log.NewNoop(), wfContext, 5, types.SemaphoreAcquireFailedCauseNotFound, testTime)
+	}
+	expectSaved := func(mutableState *execution.MockMutableState, wfContext *execution.MockContext) {
+		mutableState.EXPECT().HasPendingDecision().Return(false)
+		mutableState.EXPECT().AddDecisionTaskScheduledEvent(false).Return(&execution.DecisionInfo{}, nil)
+		mutableState.EXPECT().GetExecutionInfo().Return(&persistence.WorkflowExecutionInfo{})
+		wfContext.EXPECT().UpdateWorkflowExecutionAsActive(gomock.Any(), testTime).Return(nil)
+	}
+	errCompleted := &types.WorkflowExecutionAlreadyCompletedError{Message: "Workflow execution already completed."}
+	errHoldNotFound := &types.EntityNotExistsError{Message: "Pending semaphore hold not found."}
+
+	testCases := []struct {
+		name      string
+		record    func(wfContext execution.Context) error
+		setupMock func(mutableState *execution.MockMutableState, wfContext *execution.MockContext)
+		wantErr   error
+	}{
+		{
+			name:   "granted: the token is recorded and a decision is scheduled",
+			record: recordGranted,
+			setupMock: func(mutableState *execution.MockMutableState, wfContext *execution.MockContext) {
+				mutableState.EXPECT().IsWorkflowExecutionRunning().Return(true)
+				mutableState.EXPECT().GetSemaphoreInfo(int64(5)).Return(&persistence.SemaphoreInfo{InitiatedID: 5}, true)
+				mutableState.EXPECT().AddSemaphoreAcquiredEvent(int64(5), int32(3)).Return(&types.HistoryEvent{}, nil)
+				expectSaved(mutableState, wfContext)
+			},
+		},
+		{
+			name:   "granted: workflow not running",
+			record: recordGranted,
+			setupMock: func(mutableState *execution.MockMutableState, wfContext *execution.MockContext) {
+				mutableState.EXPECT().IsWorkflowExecutionRunning().Return(false)
+			},
+			wantErr: errCompleted,
+		},
+		{
+			name:   "granted: hold not found",
+			record: recordGranted,
+			setupMock: func(mutableState *execution.MockMutableState, wfContext *execution.MockContext) {
+				mutableState.EXPECT().IsWorkflowExecutionRunning().Return(true)
+				mutableState.EXPECT().GetSemaphoreInfo(int64(5)).Return(nil, false)
+			},
+			wantErr: errHoldNotFound,
+		},
+		{
+			name:   "granted: hold already has the granted token",
+			record: recordGranted,
+			setupMock: func(mutableState *execution.MockMutableState, wfContext *execution.MockContext) {
+				mutableState.EXPECT().IsWorkflowExecutionRunning().Return(true)
+				mutableState.EXPECT().GetSemaphoreInfo(int64(5)).Return(&persistence.SemaphoreInfo{InitiatedID: 5, TokenID: 3}, true)
+			},
+			wantErr: errHoldNotFound,
+		},
+		{
+			name:   "granted: hold already has a different token",
+			record: recordGranted,
+			setupMock: func(mutableState *execution.MockMutableState, wfContext *execution.MockContext) {
+				mutableState.EXPECT().IsWorkflowExecutionRunning().Return(true)
+				mutableState.EXPECT().GetSemaphoreInfo(int64(5)).Return(&persistence.SemaphoreInfo{InitiatedID: 5, TokenID: 7}, true)
+				mutableState.EXPECT().GetExecutionInfo().Return(&persistence.WorkflowExecutionInfo{})
+			},
+			wantErr: errHoldNotFound,
+		},
+		{
+			name:   "acquire failed: the failure is recorded and a decision is scheduled",
+			record: recordFailed,
+			setupMock: func(mutableState *execution.MockMutableState, wfContext *execution.MockContext) {
+				mutableState.EXPECT().IsWorkflowExecutionRunning().Return(true)
+				mutableState.EXPECT().GetSemaphoreInfo(int64(5)).Return(&persistence.SemaphoreInfo{InitiatedID: 5}, true)
+				mutableState.EXPECT().AddSemaphoreAcquireFailedEvent(int64(5), types.SemaphoreAcquireFailedCauseNotFound).Return(&types.HistoryEvent{}, nil)
+				expectSaved(mutableState, wfContext)
+			},
+		},
+		{
+			name:   "acquire failed: workflow not running",
+			record: recordFailed,
+			setupMock: func(mutableState *execution.MockMutableState, wfContext *execution.MockContext) {
+				mutableState.EXPECT().IsWorkflowExecutionRunning().Return(false)
+			},
+			wantErr: errCompleted,
+		},
+		{
+			name:   "acquire failed: hold not found",
+			record: recordFailed,
+			setupMock: func(mutableState *execution.MockMutableState, wfContext *execution.MockContext) {
+				mutableState.EXPECT().IsWorkflowExecutionRunning().Return(true)
+				mutableState.EXPECT().GetSemaphoreInfo(int64(5)).Return(nil, false)
+			},
+			wantErr: errHoldNotFound,
+		},
+		{
+			name:   "acquire failed: hold already has a token",
+			record: recordFailed,
+			setupMock: func(mutableState *execution.MockMutableState, wfContext *execution.MockContext) {
+				mutableState.EXPECT().IsWorkflowExecutionRunning().Return(true)
+				mutableState.EXPECT().GetSemaphoreInfo(int64(5)).Return(&persistence.SemaphoreInfo{InitiatedID: 5, TokenID: 7}, true)
+			},
+			wantErr: errHoldNotFound,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			wfContext := execution.NewMockContext(ctrl)
+			mutableState := execution.NewMockMutableState(ctrl)
+			wfContext.EXPECT().LoadWorkflowExecution(gomock.Any()).Return(mutableState, nil)
+			tc.setupMock(mutableState, wfContext)
+
+			err := tc.record(wfContext)
+			assert.Equal(t, tc.wantErr, err)
+		})
+	}
 }
 
 func (s *transferActiveTaskExecutorSuite) TestCopySearchAttributes() {
@@ -1982,223 +2511,605 @@ func (s *transferActiveTaskExecutorSuite) TestCopySearchAttributes() {
 	s.Equal(byte('1'), val[0])
 }
 
-func (s *transferActiveTaskExecutorSuite) createAddActivityTaskRequest(
-	task *persistence.TransferTaskInfo,
+func (s *transferActiveTaskExecutorSuite) newTransferTaskFromInfo(
+	task persistence.Task,
+) Task {
+	return NewHistoryTask(s.mockShard, task, QueueTypeActiveTransfer, s.logger, nil, nil, nil, nil, nil)
+}
+
+func createAddActivityTaskRequest(
+	transferTask Task,
 	ai *persistence.ActivityInfo,
-) *matching.AddActivityTaskRequest {
+	partitionConfig map[string]string,
+) *types.AddActivityTaskRequest {
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr(task.WorkflowID),
-		RunId:      common.StringPtr(task.RunID),
+	taskInfo := transferTask.GetInfo().(*persistence.ActivityTask)
+	workflowExecution := types.WorkflowExecution{
+		WorkflowID: taskInfo.WorkflowID,
+		RunID:      taskInfo.RunID,
 	}
-	taskList := &workflow.TaskList{Name: &task.TaskList}
+	taskList := &types.TaskList{Name: ai.TaskList, Kind: ai.TaskListKind.Ptr()}
 
-	return &matching.AddActivityTaskRequest{
-		DomainUUID:                    common.StringPtr(task.TargetDomainID),
-		SourceDomainUUID:              common.StringPtr(task.DomainID),
+	return &types.AddActivityTaskRequest{
+		DomainUUID:                    taskInfo.TargetDomainID,
+		SourceDomainUUID:              taskInfo.DomainID,
 		Execution:                     &workflowExecution,
 		TaskList:                      taskList,
-		ScheduleId:                    &task.ScheduleID,
+		ScheduleID:                    taskInfo.ScheduleID,
 		ScheduleToStartTimeoutSeconds: common.Int32Ptr(ai.ScheduleToStartTimeout),
+		PartitionConfig:               partitionConfig,
 	}
 }
 
-func (s *transferActiveTaskExecutorSuite) createAddDecisionTaskRequest(
-	task *persistence.TransferTaskInfo,
+func createAddDecisionTaskRequest(
+	transferTask Task,
 	mutableState execution.MutableState,
-) *matching.AddDecisionTaskRequest {
+) *types.AddDecisionTaskRequest {
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr(task.WorkflowID),
-		RunId:      common.StringPtr(task.RunID),
+	taskInfo := transferTask.GetInfo().(*persistence.DecisionTask)
+	workflowExecution := types.WorkflowExecution{
+		WorkflowID: taskInfo.WorkflowID,
+		RunID:      taskInfo.RunID,
 	}
-	taskList := &workflow.TaskList{Name: &task.TaskList}
+	taskList := &types.TaskList{Name: taskInfo.TaskList, Kind: mutableState.GetExecutionInfo().TaskListKind.Ptr()}
 	executionInfo := mutableState.GetExecutionInfo()
 	timeout := executionInfo.WorkflowTimeout
-	if mutableState.GetExecutionInfo().TaskList != task.TaskList {
-		taskList.Kind = common.TaskListKindPtr(workflow.TaskListKindSticky)
+	if mutableState.GetExecutionInfo().TaskList != taskInfo.TaskList {
+		taskListStickyKind := types.TaskListKindSticky
+		taskList.Kind = &taskListStickyKind
 		timeout = executionInfo.StickyScheduleToStartTimeout
 	}
 
-	return &matching.AddDecisionTaskRequest{
-		DomainUUID:                    common.StringPtr(task.DomainID),
+	return &types.AddDecisionTaskRequest{
+		DomainUUID:                    taskInfo.DomainID,
 		Execution:                     &workflowExecution,
 		TaskList:                      taskList,
-		ScheduleId:                    common.Int64Ptr(task.ScheduleID),
+		ScheduleID:                    taskInfo.ScheduleID,
 		ScheduleToStartTimeoutSeconds: common.Int32Ptr(timeout),
+		PartitionConfig:               executionInfo.PartitionConfig,
 	}
 }
 
-func (s *transferActiveTaskExecutorSuite) createRecordWorkflowExecutionStartedRequest(
+func createRecordWorkflowExecutionStartedRequest(
+	t *testing.T,
 	domainName string,
-	startEvent *workflow.HistoryEvent,
-	task *persistence.TransferTaskInfo,
+	startEvent *types.HistoryEvent,
+	transferTask Task,
 	mutableState execution.MutableState,
-	backoffSeconds int32,
+	numClusters int16,
+	updateTime time.Time,
+	enableContextHeaderInVisibility bool,
 ) *persistence.RecordWorkflowExecutionStartedRequest {
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr(task.WorkflowID),
-		RunId:      common.StringPtr(task.RunID),
+	taskInfo := transferTask.GetInfo().(*persistence.RecordWorkflowStartedTask)
+	workflowExecution := types.WorkflowExecution{
+		WorkflowID: taskInfo.WorkflowID,
+		RunID:      taskInfo.RunID,
 	}
 	executionInfo := mutableState.GetExecutionInfo()
-	executionTimestamp := time.Unix(0, startEvent.GetTimestamp()).Add(time.Duration(backoffSeconds) * time.Second)
+	backoffSeconds := startEvent.WorkflowExecutionStartedEventAttributes.GetFirstDecisionTaskBackoffSeconds()
+	executionTimestamp := int64(0)
+	if backoffSeconds != 0 {
+		executionTimestamp = startEvent.GetTimestamp() + int64(backoffSeconds)*int64(time.Second)
+	}
+	var searchAttributes map[string][]byte
+	if enableContextHeaderInVisibility {
+		contextValueJSONString, err := json.Marshal("contextValue")
+		if err != nil {
+			t.Fatal(err)
+		}
+		searchAttributes = map[string][]byte{
+			"Header_context_key": contextValueJSONString,
+		}
+	}
+	executionStatus, scheduledExecutionTimestamp := determineExecutionStatusForVisibility(startEvent, mutableState, false)
 
 	return &persistence.RecordWorkflowExecutionStartedRequest{
-		Domain:             domainName,
-		DomainUUID:         task.DomainID,
-		Execution:          workflowExecution,
-		WorkflowTypeName:   executionInfo.WorkflowTypeName,
-		StartTimestamp:     startEvent.GetTimestamp(),
-		ExecutionTimestamp: executionTimestamp.UnixNano(),
-		WorkflowTimeout:    int64(executionInfo.WorkflowTimeout),
-		TaskID:             task.TaskID,
-		TaskList:           task.TaskList,
+		Domain:                      domainName,
+		DomainUUID:                  taskInfo.DomainID,
+		Execution:                   workflowExecution,
+		WorkflowTypeName:            executionInfo.WorkflowTypeName,
+		StartTimestamp:              startEvent.GetTimestamp(),
+		ExecutionTimestamp:          executionTimestamp,
+		WorkflowTimeout:             int64(executionInfo.WorkflowTimeout),
+		TaskID:                      taskInfo.TaskID,
+		TaskList:                    executionInfo.TaskList,
+		IsCron:                      len(executionInfo.CronSchedule) > 0,
+		NumClusters:                 numClusters,
+		ClusterAttributeScope:       executionInfo.ActiveClusterSelectionPolicy.GetClusterAttribute().GetScope(),
+		ClusterAttributeName:        executionInfo.ActiveClusterSelectionPolicy.GetClusterAttribute().GetName(),
+		UpdateTimestamp:             updateTime.UnixNano(),
+		SearchAttributes:            searchAttributes,
+		ExecutionStatus:             executionStatus,
+		CronSchedule:                executionInfo.CronSchedule,
+		ScheduledExecutionTimestamp: scheduledExecutionTimestamp,
 	}
 }
 
-func (s *transferActiveTaskExecutorSuite) createRequestCancelWorkflowExecutionRequest(
+func createRecordWorkflowExecutionClosedRequest(
+	t *testing.T,
+	domainName string,
+	startEvent *types.HistoryEvent,
+	transferTask Task,
+	mutableState execution.MutableState,
+	numClusters int16,
+	updateTime time.Time,
+	closeTimestamp *int64,
+	enableContextHeaderInVisibility bool,
+) *persistence.RecordWorkflowExecutionClosedRequest {
+	taskInfo := transferTask.GetInfo().(*persistence.CloseExecutionTask)
+	workflowExecution := types.WorkflowExecution{
+		WorkflowID: taskInfo.WorkflowID,
+		RunID:      taskInfo.RunID,
+	}
+	executionInfo := mutableState.GetExecutionInfo()
+	backoffSeconds := startEvent.WorkflowExecutionStartedEventAttributes.GetFirstDecisionTaskBackoffSeconds()
+	executionTimestamp := int64(0)
+	if backoffSeconds != 0 {
+		executionTimestamp = startEvent.GetTimestamp() + int64(backoffSeconds)*int64(time.Second)
+	}
+	var searchAttributes map[string][]byte
+	if enableContextHeaderInVisibility {
+		contextValueJSONString, err := json.Marshal("contextValue")
+		if err != nil {
+			t.Fatal(err)
+		}
+		searchAttributes = map[string][]byte{
+			"Header_context_key": contextValueJSONString,
+		}
+	}
+	scheduledExecutionTimestamp := int64(0)
+	if executionTimestamp != 0 {
+		scheduledExecutionTimestamp = executionTimestamp
+	}
+
+	// Get completion event to determine execution status
+	// For closed workflows, ExecutionStatus should reflect the close status (COMPLETED, FAILED, etc.)
+	// not the running status (PENDING, STARTED)
+	completionEvent, err := mutableState.GetCompletionEvent(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	executionStatus := getTestWorkflowExecutionStatus(completionEvent)
+
+	return &persistence.RecordWorkflowExecutionClosedRequest{
+		Domain:                      domainName,
+		DomainUUID:                  taskInfo.DomainID,
+		Execution:                   workflowExecution,
+		HistoryLength:               mutableState.GetNextEventID() - 1,
+		WorkflowTypeName:            executionInfo.WorkflowTypeName,
+		StartTimestamp:              startEvent.GetTimestamp(),
+		ExecutionTimestamp:          executionTimestamp,
+		TaskID:                      taskInfo.TaskID,
+		TaskList:                    executionInfo.TaskList,
+		IsCron:                      len(executionInfo.CronSchedule) > 0,
+		NumClusters:                 numClusters,
+		ClusterAttributeScope:       executionInfo.ActiveClusterSelectionPolicy.GetClusterAttribute().GetScope(),
+		ClusterAttributeName:        executionInfo.ActiveClusterSelectionPolicy.GetClusterAttribute().GetName(),
+		UpdateTimestamp:             updateTime.UnixNano(),
+		CloseTimestamp:              *closeTimestamp,
+		RetentionSeconds:            int64(mutableState.GetDomainEntry().GetRetentionDays(taskInfo.GetWorkflowID()) * 24 * 3600),
+		SearchAttributes:            searchAttributes,
+		ExecutionStatus:             executionStatus,
+		CronSchedule:                executionInfo.CronSchedule,
+		ScheduledExecutionTimestamp: scheduledExecutionTimestamp,
+	}
+}
+
+// getTestWorkflowExecutionStatus determines execution status from close event
+// This mirrors the logic in getWorkflowExecutionStatus in transfer_active_task_executor.go
+func getTestWorkflowExecutionStatus(closeEvent *types.HistoryEvent) types.WorkflowExecutionStatus {
+	switch closeEvent.GetEventType() {
+	case types.EventTypeWorkflowExecutionCompleted:
+		return types.WorkflowExecutionStatusCompleted
+	case types.EventTypeWorkflowExecutionFailed:
+		return types.WorkflowExecutionStatusFailed
+	case types.EventTypeWorkflowExecutionCanceled:
+		return types.WorkflowExecutionStatusCanceled
+	case types.EventTypeWorkflowExecutionTerminated:
+		return types.WorkflowExecutionStatusTerminated
+	case types.EventTypeWorkflowExecutionTimedOut:
+		return types.WorkflowExecutionStatusTimedOut
+	case types.EventTypeWorkflowExecutionContinuedAsNew:
+		// For simplicity in tests, return ContinuedAsNew
+		// Production code has more complex logic for cron workflows
+		return types.WorkflowExecutionStatusContinuedAsNew
+	default:
+		return types.WorkflowExecutionStatusCompleted
+	}
+}
+
+func createTestRequestCancelWorkflowExecutionRequest(
 	targetDomainName string,
-	task *persistence.TransferTaskInfo,
-	rci *persistence.RequestCancelInfo,
-) *history.RequestCancelWorkflowExecutionRequest {
+	taskInfo *persistence.CancelExecutionTask,
+	requestID string,
+) *types.HistoryRequestCancelWorkflowExecutionRequest {
 
-	sourceExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr(task.WorkflowID),
-		RunId:      common.StringPtr(task.RunID),
+	sourceExecution := types.WorkflowExecution{
+		WorkflowID: taskInfo.WorkflowID,
+		RunID:      taskInfo.RunID,
 	}
-	targetExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr(task.TargetWorkflowID),
-		RunId:      common.StringPtr(task.TargetRunID),
+	targetExecution := types.WorkflowExecution{
+		WorkflowID: taskInfo.TargetWorkflowID,
+		RunID:      taskInfo.TargetRunID,
 	}
 
-	return &history.RequestCancelWorkflowExecutionRequest{
-		DomainUUID: common.StringPtr(task.TargetDomainID),
-		CancelRequest: &workflow.RequestCancelWorkflowExecutionRequest{
-			Domain:            common.StringPtr(targetDomainName),
+	return &types.HistoryRequestCancelWorkflowExecutionRequest{
+		DomainUUID: taskInfo.TargetDomainID,
+		CancelRequest: &types.RequestCancelWorkflowExecutionRequest{
+			Domain:            targetDomainName,
 			WorkflowExecution: &targetExecution,
-			Identity:          common.StringPtr(identityHistoryService),
+			Identity:          execution.IdentityHistoryService,
 			// Use the same request ID to dedupe RequestCancelWorkflowExecution calls
-			RequestId: common.StringPtr(rci.CancelRequestID),
+			RequestID: requestID,
 		},
-		ExternalInitiatedEventId:  common.Int64Ptr(task.ScheduleID),
+		ExternalInitiatedEventID:  common.Int64Ptr(taskInfo.InitiatedID),
 		ExternalWorkflowExecution: &sourceExecution,
-		ChildWorkflowOnly:         common.BoolPtr(task.TargetChildWorkflowOnly),
+		ChildWorkflowOnly:         taskInfo.TargetChildWorkflowOnly,
 	}
 }
 
-func (s *transferActiveTaskExecutorSuite) createSignalWorkflowExecutionRequest(
+func createTestSignalWorkflowExecutionRequest(
 	targetDomainName string,
-	task *persistence.TransferTaskInfo,
+	taskInfo *persistence.SignalExecutionTask,
 	si *persistence.SignalInfo,
-) *history.SignalWorkflowExecutionRequest {
+) *types.HistorySignalWorkflowExecutionRequest {
 
-	sourceExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr(task.WorkflowID),
-		RunId:      common.StringPtr(task.RunID),
+	sourceExecution := types.WorkflowExecution{
+		WorkflowID: taskInfo.WorkflowID,
+		RunID:      taskInfo.RunID,
 	}
-	targetExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr(task.TargetWorkflowID),
-		RunId:      common.StringPtr(task.TargetRunID),
+	targetExecution := types.WorkflowExecution{
+		WorkflowID: taskInfo.TargetWorkflowID,
+		RunID:      taskInfo.TargetRunID,
 	}
 
-	return &history.SignalWorkflowExecutionRequest{
-		DomainUUID: common.StringPtr(task.TargetDomainID),
-		SignalRequest: &workflow.SignalWorkflowExecutionRequest{
-			Domain:            common.StringPtr(targetDomainName),
+	return &types.HistorySignalWorkflowExecutionRequest{
+		DomainUUID: taskInfo.TargetDomainID,
+		SignalRequest: &types.SignalWorkflowExecutionRequest{
+			Domain:            targetDomainName,
 			WorkflowExecution: &targetExecution,
-			Identity:          common.StringPtr(identityHistoryService),
-			SignalName:        common.StringPtr(si.SignalName),
+			Identity:          execution.IdentityHistoryService,
+			SignalName:        si.SignalName,
 			Input:             si.Input,
-			RequestId:         common.StringPtr(si.SignalRequestID),
+			RequestID:         si.SignalRequestID,
 			Control:           si.Control,
 		},
 		ExternalWorkflowExecution: &sourceExecution,
-		ChildWorkflowOnly:         common.BoolPtr(task.TargetChildWorkflowOnly),
+		ChildWorkflowOnly:         taskInfo.TargetChildWorkflowOnly,
 	}
 }
 
-func (s *transferActiveTaskExecutorSuite) createChildWorkflowExecutionRequest(
+func createTestChildWorkflowExecutionRequest(
 	domainName string,
 	childDomainName string,
-	task *persistence.TransferTaskInfo,
-	mutableState execution.MutableState,
-	ci *persistence.ChildExecutionInfo,
-) *history.StartWorkflowExecutionRequest {
+	taskInfo *persistence.StartChildExecutionTask,
+	attributes *types.StartChildWorkflowExecutionInitiatedEventAttributes,
+	requestID string,
+	now time.Time,
+	partitionConfig map[string]string,
+	activeClusterSelectionPolicy *types.ActiveClusterSelectionPolicy,
+	parentVersionHistoryItems []*types.VersionHistoryItem,
+) (*types.HistoryStartWorkflowExecutionRequest, error) {
 
-	event, err := mutableState.GetChildExecutionInitiatedEvent(context.Background(), task.ScheduleID)
-	s.NoError(err)
-	attributes := event.StartChildWorkflowExecutionInitiatedEventAttributes
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr(task.WorkflowID),
-		RunId:      common.StringPtr(task.RunID),
+	workflowExecution := types.WorkflowExecution{
+		WorkflowID: taskInfo.WorkflowID,
+		RunID:      taskInfo.RunID,
 	}
-	now := time.Now()
-	return &history.StartWorkflowExecutionRequest{
-		DomainUUID: common.StringPtr(task.TargetDomainID),
-		StartRequest: &workflow.StartWorkflowExecutionRequest{
-			Domain:                              common.StringPtr(childDomainName),
-			WorkflowId:                          attributes.WorkflowId,
-			WorkflowType:                        attributes.WorkflowType,
-			TaskList:                            attributes.TaskList,
-			Input:                               attributes.Input,
-			ExecutionStartToCloseTimeoutSeconds: attributes.ExecutionStartToCloseTimeoutSeconds,
-			TaskStartToCloseTimeoutSeconds:      attributes.TaskStartToCloseTimeoutSeconds,
-			// Use the same request ID to dedupe StartWorkflowExecution calls
-			RequestId:             common.StringPtr(ci.CreateRequestID),
-			WorkflowIdReusePolicy: attributes.WorkflowIdReusePolicy,
-		},
-		ParentExecutionInfo: &history.ParentExecutionInfo{
-			DomainUUID:  common.StringPtr(task.DomainID),
-			Domain:      common.StringPtr(constants.TestDomainName),
-			Execution:   &workflowExecution,
-			InitiatedId: common.Int64Ptr(task.ScheduleID),
-		},
-		FirstDecisionTaskBackoffSeconds: common.Int32Ptr(
-			backoff.GetBackoffForNextScheduleInSeconds(attributes.GetCronSchedule(), now, now),
-		),
+	frontendStartReq := &types.StartWorkflowExecutionRequest{
+		Domain:                              childDomainName,
+		WorkflowID:                          attributes.WorkflowID,
+		WorkflowType:                        attributes.WorkflowType,
+		TaskList:                            attributes.TaskList,
+		Input:                               attributes.Input,
+		ExecutionStartToCloseTimeoutSeconds: attributes.ExecutionStartToCloseTimeoutSeconds,
+		TaskStartToCloseTimeoutSeconds:      attributes.TaskStartToCloseTimeoutSeconds,
+		// Use the same request ID to dedupe StartWorkflowExecution calls
+		RequestID:                    requestID,
+		WorkflowIDReusePolicy:        attributes.WorkflowIDReusePolicy,
+		RetryPolicy:                  attributes.RetryPolicy,
+		ActiveClusterSelectionPolicy: activeClusterSelectionPolicy,
 	}
+
+	parentInfo := &types.ParentExecutionInfo{
+		DomainUUID:  taskInfo.DomainID,
+		Domain:      domainName,
+		Execution:   &workflowExecution,
+		InitiatedID: taskInfo.InitiatedID,
+	}
+
+	historyStartReq, err := common.CreateHistoryStartWorkflowRequest(
+		taskInfo.TargetDomainID, frontendStartReq, now, partitionConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	historyStartReq.ParentExecutionInfo = parentInfo
+	historyStartReq.ParentVersionHistoryItems = parentVersionHistoryItems
+	return historyStartReq, nil
 }
 
-func (s *transferActiveTaskExecutorSuite) createUpsertWorkflowSearchAttributesRequest(
+func createUpsertWorkflowSearchAttributesRequest(
+	t *testing.T,
 	domainName string,
-	startEvent *workflow.HistoryEvent,
-	task *persistence.TransferTaskInfo,
+	startEvent *types.HistoryEvent,
+	transferTask Task,
 	mutableState execution.MutableState,
+	numClusters int16,
+	updateTime time.Time,
+	enableContextHeaderInVisibility bool,
 ) *persistence.UpsertWorkflowExecutionRequest {
 
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr(task.WorkflowID),
-		RunId:      common.StringPtr(task.RunID),
+	taskInfo := transferTask.GetInfo().(*persistence.UpsertWorkflowSearchAttributesTask)
+	workflowExecution := types.WorkflowExecution{
+		WorkflowID: taskInfo.WorkflowID,
+		RunID:      taskInfo.RunID,
 	}
 	executionInfo := mutableState.GetExecutionInfo()
+	backoffSeconds := startEvent.WorkflowExecutionStartedEventAttributes.GetFirstDecisionTaskBackoffSeconds()
+	executionTimestamp := int64(0)
+	if backoffSeconds != 0 {
+		executionTimestamp = startEvent.GetTimestamp() + int64(backoffSeconds)*int64(time.Second)
+	}
+	var searchAttributes map[string][]byte
+	if enableContextHeaderInVisibility {
+		contextValueJSONString, err := json.Marshal("contextValue")
+		if err != nil {
+			t.Fatal(err)
+		}
+		searchAttributes = map[string][]byte{
+			"Header_context_key": contextValueJSONString,
+		}
+	}
+
+	executionStatus, scheduledExecutionTimestamp := determineExecutionStatus(startEvent, mutableState)
 
 	return &persistence.UpsertWorkflowExecutionRequest{
-		Domain:           domainName,
-		DomainUUID:       task.DomainID,
-		Execution:        workflowExecution,
-		WorkflowTypeName: executionInfo.WorkflowTypeName,
-		StartTimestamp:   startEvent.GetTimestamp(),
-		WorkflowTimeout:  int64(executionInfo.WorkflowTimeout),
-		TaskID:           task.TaskID,
-		TaskList:         task.TaskList,
+		Domain:                      domainName,
+		DomainUUID:                  taskInfo.DomainID,
+		Execution:                   workflowExecution,
+		WorkflowTypeName:            executionInfo.WorkflowTypeName,
+		StartTimestamp:              startEvent.GetTimestamp(),
+		ExecutionTimestamp:          executionTimestamp,
+		WorkflowTimeout:             int64(executionInfo.WorkflowTimeout),
+		TaskID:                      taskInfo.TaskID,
+		TaskList:                    executionInfo.TaskList,
+		IsCron:                      len(executionInfo.CronSchedule) > 0,
+		NumClusters:                 numClusters,
+		ClusterAttributeScope:       executionInfo.ActiveClusterSelectionPolicy.GetClusterAttribute().GetScope(),
+		ClusterAttributeName:        executionInfo.ActiveClusterSelectionPolicy.GetClusterAttribute().GetName(),
+		UpdateTimestamp:             updateTime.UnixNano(),
+		SearchAttributes:            searchAttributes,
+		ExecutionStatus:             executionStatus,
+		CronSchedule:                executionInfo.CronSchedule,
+		ScheduledExecutionTimestamp: scheduledExecutionTimestamp,
 	}
 }
 
-func (s *transferActiveTaskExecutorSuite) createPersistenceMutableState(
-	ms execution.MutableState,
-	lastEventID int64,
-	lastEventVersion int64,
-) *persistence.WorkflowMutableState {
+func createRecordWorkflowExecutionUninitializedRequest(
+	transferTask Task,
+	mutableState execution.MutableState,
+	updateTime time.Time,
+	shardID int64,
+) *persistence.RecordWorkflowExecutionUninitializedRequest {
+	workflowExecution := types.WorkflowExecution{
+		WorkflowID: transferTask.GetWorkflowID(),
+		RunID:      transferTask.GetRunID(),
+	}
+	executionInfo := mutableState.GetExecutionInfo()
+	return &persistence.RecordWorkflowExecutionUninitializedRequest{
+		DomainUUID:       transferTask.GetDomainID(),
+		Execution:        workflowExecution,
+		WorkflowTypeName: executionInfo.WorkflowTypeName,
+		UpdateTimestamp:  updateTime.UnixNano(),
+		ShardID:          shardID,
+	}
+}
 
-	if ms.GetVersionHistories() != nil {
-		currentVersionHistory, err := ms.GetVersionHistories().GetCurrentVersionHistory()
-		s.NoError(err)
-		err = currentVersionHistory.AddOrUpdateItem(persistence.NewVersionHistoryItem(
-			lastEventID,
-			lastEventVersion,
-		))
-		s.NoError(err)
+// Tests what processReleaseSemaphore sends to Matching and which errors it retries.
+func TestProcessReleaseSemaphore(t *testing.T) {
+	const (
+		domainID = "domain-id"
+		// The owner_id acquire stored for workflow "wid", run "rid" and hold 7.
+		ownerID = "3:wid:rid:7"
+	)
+	task := &persistence.ReleaseSemaphoreTask{
+		WorkflowIdentifier: persistence.WorkflowIdentifier{DomainID: domainID, WorkflowID: "wid", RunID: "rid"},
+		InitiatedID:        7,
+		SemaphoreName:      testSemaphoreName,
+	}
+	metadata := &persistence.GetSemaphoreResponse{Semaphore: &persistence.SemaphoreMetadata{Size: 4, BucketSize: 2}}
+	bucket, err := commonsemaphore.OwnerIDToBucket(ownerID, 2)
+	require.NoError(t, err)
+	matchingErr := &types.ServiceBusyError{Message: "busy"}
+	metadataErr := &types.InternalServiceError{Message: "db down"}
+
+	testCases := []struct {
+		name         string
+		metadataResp *persistence.GetSemaphoreResponse
+		metadataErr  error
+		callMatching bool
+		matchingErr  error
+		wantErr      error
+	}{
+		{
+			name:         "sends the rebuilt owner_id to the owner's bucket",
+			metadataResp: metadata,
+			callMatching: true,
+		},
+		{
+			name:         "Matching error: returned, so the task retries",
+			metadataResp: metadata,
+			callMatching: true,
+			matchingErr:  matchingErr,
+			wantErr:      matchingErr,
+		},
+		{
+			name:        "semaphore not found: completes with no call",
+			metadataErr: &types.EntityNotExistsError{Message: "semaphore not found"},
+		},
+		{
+			name:        "metadata read fails: returned, so the task retries",
+			metadataErr: metadataErr,
+			wantErr:     metadataErr,
+		},
+		{
+			name:         "invalid metadata: returned, so the task retries",
+			metadataResp: &persistence.GetSemaphoreResponse{Semaphore: &persistence.SemaphoreMetadata{Size: 0, BucketSize: 2}},
+			wantErr: &types.InternalServiceError{
+				Message: "semaphore metadata for domain domain-id, semaphore my-semaphore is invalid: size must be positive, got 0",
+			},
+		},
 	}
 
-	return execution.CreatePersistenceMutableState(ms)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			metadataMgr := persistence.NewMockSemaphoreMetadataManager(ctrl)
+			metadataMgr.EXPECT().GetSemaphore(gomock.Any(), &persistence.GetSemaphoreRequest{
+				DomainID:      domainID,
+				SemaphoreName: testSemaphoreName,
+			}).Return(tc.metadataResp, tc.metadataErr)
+			matchingClient := matching.NewMockClient(ctrl)
+			if tc.callMatching {
+				matchingClient.EXPECT().ReleaseSemaphore(gomock.Any(), &types.ReleaseSemaphoreRequest{
+					DomainUUID:    domainID,
+					SemaphoreName: testSemaphoreName,
+					Bucket:        int32(bucket),
+					OwnerID:       ownerID,
+				}).Return(&types.ReleaseSemaphoreResponse{}, tc.matchingErr)
+			}
+			executor := &transferActiveTaskExecutor{
+				transferTaskExecutorBase: &transferTaskExecutorBase{
+					logger:         log.NewNoop(),
+					matchingClient: matchingClient,
+				},
+				semaphoreMetadataManager: metadataMgr,
+			}
+
+			err := executor.processReleaseSemaphore(context.Background(), task)
+			assert.Equal(t, tc.wantErr, err)
+		})
+	}
+}
+
+func TestGetFirstRunStartVersion(t *testing.T) {
+	const (
+		closedRunID          = "closed-run-id"
+		firstRunID           = "first-run-id"
+		closedStartVersion   = int64(20)
+		firstRunStartVersion = int64(10)
+	)
+	clusterAttribute := &types.ActiveClusterSelectionPolicy{ClusterAttribute: &types.ClusterAttribute{Scope: "region", Name: "region1"}}
+	otherClusterAttribute := &types.ActiveClusterSelectionPolicy{ClusterAttribute: &types.ClusterAttribute{Scope: "region", Name: "region2"}}
+	// firstRun returns the response of the read of the first run of the chain
+	firstRun := func(policy *types.ActiveClusterSelectionPolicy, versionHistories *persistence.VersionHistories) *persistence.GetWorkflowExecutionResponse {
+		return &persistence.GetWorkflowExecutionResponse{
+			State: &persistence.WorkflowMutableState{
+				ExecutionInfo:    &persistence.WorkflowExecutionInfo{RunID: firstRunID, ActiveClusterSelectionPolicy: policy},
+				VersionHistories: versionHistories,
+			},
+		}
+	}
+	// the first run started at its first version and was written later at a higher version
+	firstRunBranch := persistence.NewVersionHistories(persistence.NewVersionHistory(
+		[]byte("branch-token"),
+		[]*persistence.VersionHistoryItem{
+			persistence.NewVersionHistoryItem(3, firstRunStartVersion),
+			persistence.NewVersionHistoryItem(8, closedStartVersion),
+		},
+	))
+
+	tests := []struct {
+		name string
+		// firstExecutionRunID is the first run ID of the closed run
+		firstExecutionRunID string
+		// readFirstRun is true when the first run is read
+		readFirstRun bool
+		firstRunResp *persistence.GetWorkflowExecutionResponse
+		firstRunErr  error
+		wantVersion  int64
+		wantErr      error
+	}{
+		{
+			name:                "closed run is the first run of its chain: start version of the closed run",
+			firstExecutionRunID: closedRunID,
+			wantVersion:         closedStartVersion,
+		},
+		{
+			name:        "closed run without a first run ID: start version of the closed run",
+			wantVersion: closedStartVersion,
+		},
+		{
+			name:                "later run of a chain: start version of the first run",
+			firstExecutionRunID: firstRunID,
+			readFirstRun:        true,
+			firstRunResp:        firstRun(clusterAttribute, firstRunBranch),
+			wantVersion:         firstRunStartVersion,
+		},
+		{
+			// for example the retention of the domain deleted the first run
+			name:                "later run of a chain, first run not found: start version of the closed run",
+			firstExecutionRunID: firstRunID,
+			readFirstRun:        true,
+			firstRunErr:         &types.EntityNotExistsError{},
+			wantVersion:         closedStartVersion,
+		},
+		{
+			// the parent compares the versions only with the cluster attribute of the closed run
+			name:                "later run of a chain, first run with another cluster attribute: start version of the closed run",
+			firstExecutionRunID: firstRunID,
+			readFirstRun:        true,
+			firstRunResp:        firstRun(otherClusterAttribute, firstRunBranch),
+			wantVersion:         closedStartVersion,
+		},
+		{
+			name:                "later run of a chain, first run without version histories: start version of the closed run",
+			firstExecutionRunID: firstRunID,
+			readFirstRun:        true,
+			firstRunResp:        firstRun(clusterAttribute, nil),
+			wantVersion:         closedStartVersion,
+		},
+		{
+			name:                "later run of a chain, failed to read the first run: error",
+			firstExecutionRunID: firstRunID,
+			readFirstRun:        true,
+			firstRunErr:         errors.New("some error"),
+			wantErr:             errors.New("some error"),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			task := &persistence.CloseExecutionTask{
+				WorkflowIdentifier: persistence.WorkflowIdentifier{
+					DomainID:   constants.TestDomainID,
+					WorkflowID: "child-workflow-id",
+					RunID:      closedRunID,
+				},
+			}
+			mockShard := shard.NewMockContext(ctrl)
+			if tc.readFirstRun {
+				mockShard.EXPECT().GetWorkflowExecution(gomock.Any(), &persistence.GetWorkflowExecutionRequest{
+					DomainID:   constants.TestDomainID,
+					Execution:  types.WorkflowExecution{WorkflowID: "child-workflow-id", RunID: firstRunID},
+					DomainName: constants.TestDomainName,
+				}).Return(tc.firstRunResp, tc.firstRunErr)
+			}
+			executor := &transferActiveTaskExecutor{
+				transferTaskExecutorBase: &transferTaskExecutorBase{shard: mockShard},
+			}
+
+			version, err := executor.getFirstRunStartVersion(
+				context.Background(),
+				task,
+				constants.TestDomainName,
+				tc.firstExecutionRunID,
+				clusterAttribute,
+				closedStartVersion,
+			)
+			assert.Equal(t, tc.wantErr, err)
+			assert.Equal(t, tc.wantVersion, version)
+		})
+	}
 }

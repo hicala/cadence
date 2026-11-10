@@ -20,9 +20,7 @@
 
 package mocks
 
-import (
-	"github.com/uber/cadence/common/messaging"
-)
+import "github.com/uber/cadence/common/messaging"
 
 type (
 	// MessagingClient is the mock implementation for Service interface
@@ -43,21 +41,11 @@ func NewMockMessagingClient(publisher messaging.Producer, consumer messaging.Con
 }
 
 // NewConsumer generates a dummy implementation of kafka consumer
-func (c *MessagingClient) NewConsumer(appName, consumerName string, concurrency int) (messaging.Consumer, error) {
-	return c.consumerMock, nil
-}
-
-// NewConsumerWithClusterName generates a dummy implementation of kafka consumer
-func (c *MessagingClient) NewConsumerWithClusterName(currentCluster, sourceCluster, consumerName string, concurrency int) (messaging.Consumer, error) {
+func (c *MessagingClient) NewConsumer(appName, consumerName string) (messaging.Consumer, error) {
 	return c.consumerMock, nil
 }
 
 // NewProducer generates a dummy implementation of kafka producer
 func (c *MessagingClient) NewProducer(appName string) (messaging.Producer, error) {
-	return c.publisherMock, nil
-}
-
-// NewProducerWithClusterName generates a dummy implementation of kafka producer
-func (c *MessagingClient) NewProducerWithClusterName(sourceCluster string) (messaging.Producer, error) {
 	return c.publisherMock, nil
 }

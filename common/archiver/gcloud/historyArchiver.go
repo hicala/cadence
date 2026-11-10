@@ -24,9 +24,9 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"math"
 	"path/filepath"
 
-	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/archiver"
 	"github.com/uber/cadence/common/archiver/gcloud/connector"
@@ -34,7 +34,7 @@ import (
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/persistence"
-	"github.com/uber/cadence/common/service/config"
+	"github.com/uber/cadence/common/types"
 )
 
 var (
@@ -44,6 +44,7 @@ var (
 const (
 	// URIScheme is the scheme for the gcloud storage implementation
 	URIScheme = "gs"
+	ConfigKey = "gstorage"
 
 	targetHistoryBlobSize = 2 * 1024 * 1024 // 2MB
 	errEncodeHistory      = "failed to encode history batches"
@@ -74,7 +75,7 @@ type getHistoryToken struct {
 // NewHistoryArchiver creates a new gcloud storage HistoryArchiver
 func NewHistoryArchiver(
 	container *archiver.HistoryBootstrapContainer,
-	config *config.GstorageArchiver,
+	config connector.Config,
 ) (archiver.HistoryArchiver, error) {
 	storage, err := connector.NewClient(context.Background(), config)
 	if err == nil {
@@ -83,7 +84,11 @@ func NewHistoryArchiver(
 	return nil, err
 }
 
-func newHistoryArchiver(container *archiver.HistoryBootstrapContainer, historyIterator archiver.HistoryIterator, storage connector.Client) archiver.HistoryArchiver {
+func newHistoryArchiver(
+	container *archiver.HistoryBootstrapContainer,
+	historyIterator archiver.HistoryIterator,
+	storage connector.Client,
+) archiver.HistoryArchiver {
 	return &historyArchiver{
 		container:       container,
 		gcloudStorage:   storage,
@@ -101,7 +106,7 @@ func newHistoryArchiver(container *archiver.HistoryBootstrapContainer, historyIt
 func (h *historyArchiver) Archive(ctx context.Context, URI archiver.URI, request *archiver.ArchiveHistoryRequest, opts ...archiver.ArchiveOption) (err error) {
 	scope := h.container.MetricsClient.Scope(metrics.HistoryArchiverScope, metrics.DomainTag(request.DomainName))
 	featureCatalog := archiver.GetFeatureCatalog(opts...)
-	sw := scope.StartTimer(metrics.CadenceLatency)
+	sw := scope.StartTimerWithExponentialHistogram(metrics.CadenceLatency, metrics.CadenceLatencyHistogram)
 	defer func() {
 		sw.Stop()
 		if err != nil {
@@ -143,8 +148,17 @@ func (h *historyArchiver) Archive(ctx context.Context, URI archiver.URI, request
 		historyBlob, err := getNextHistoryBlob(ctx, historyIterator)
 
 		if err != nil {
+			if common.IsEntityNotExistsError(err) {
+				// workflow history no longer exists, may due to duplicated archival signal
+				// this may happen even in the middle of iterating history as two archival signals
+				// can be processed concurrently.
+				logger.Info(archiver.ArchiveSkippedInfoMsg)
+				scope.IncCounter(metrics.HistoryArchiverDuplicateArchivalsCount)
+				return nil
+			}
+
 			logger := logger.WithTags(tag.ArchivalArchiveFailReason(archiver.ErrReasonReadHistory), tag.Error(err))
-			if !common.IsPersistenceTransientError(err) {
+			if !persistence.IsTransientError(err) {
 				logger.Error(archiver.ArchiveNonRetriableErrorMsg)
 				return errUploadNonRetriable
 			}
@@ -152,9 +166,11 @@ func (h *historyArchiver) Archive(ctx context.Context, URI archiver.URI, request
 			return err
 		}
 
-		if historyMutated(request, historyBlob.Body, *historyBlob.Header.IsLast) {
-			logger.Error(archiver.ArchiveNonRetriableErrorMsg, tag.ArchivalArchiveFailReason(archiver.ErrReasonHistoryMutated))
-			return archiver.ErrHistoryMutated
+		if archiver.IsHistoryMutated(request, historyBlob.Body, *historyBlob.Header.IsLast, logger) {
+			if !featureCatalog.ArchiveIncompleteHistory() {
+				return archiver.ErrHistoryMutated
+			}
+
 		}
 
 		encodedHistoryPart, err := encode(historyBlob.Body)
@@ -179,6 +195,12 @@ func (h *historyArchiver) Archive(ctx context.Context, URI archiver.URI, request
 
 	scope.AddCounter(metrics.HistoryArchiverTotalUploadSize, totalUploadSize)
 	scope.AddCounter(metrics.HistoryArchiverHistorySize, totalUploadSize)
+	uploadSize := totalUploadSize
+	if uploadSize > math.MaxInt {
+		uploadSize = math.MaxInt
+	}
+	scope.IntExponentialHistogram(metrics.HistoryArchiverTotalUploadSizeHistogram, int(uploadSize))
+	scope.IntExponentialHistogram(metrics.HistoryArchiverHistorySizeHistogram, int(uploadSize))
 	scope.IncCounter(metrics.HistoryArchiverArchiveSuccessCount)
 	return
 }
@@ -190,23 +212,23 @@ func (h *historyArchiver) Get(ctx context.Context, URI archiver.URI, request *ar
 
 	err := h.ValidateURI(URI)
 	if err != nil {
-		return nil, &shared.BadRequestError{Message: archiver.ErrInvalidURI.Error()}
+		return nil, &types.BadRequestError{Message: archiver.ErrInvalidURI.Error()}
 	}
 
 	if err := archiver.ValidateGetRequest(request); err != nil {
-		return nil, &shared.BadRequestError{Message: archiver.ErrInvalidGetHistoryRequest.Error()}
+		return nil, &types.BadRequestError{Message: archiver.ErrInvalidGetHistoryRequest.Error()}
 	}
 
 	var token *getHistoryToken
 	if request.NextPageToken != nil {
 		token, err = deserializeGetHistoryToken(request.NextPageToken)
 		if err != nil {
-			return nil, &shared.BadRequestError{Message: archiver.ErrNextPageTokenCorrupted.Error()}
+			return nil, &types.BadRequestError{Message: archiver.ErrNextPageTokenCorrupted.Error()}
 		}
 	} else {
 		highestVersion, historyhighestPart, historyCurrentPart, err := h.getHighestVersion(ctx, URI, request)
 		if err != nil {
-			return nil, &shared.InternalServiceError{Message: err.Error()}
+			return nil, &types.InternalServiceError{Message: err.Error()}
 		}
 		token = &getHistoryToken{
 			CloseFailoverVersion: *highestVersion,
@@ -217,7 +239,7 @@ func (h *historyArchiver) Get(ctx context.Context, URI archiver.URI, request *ar
 	}
 
 	response := &archiver.GetHistoryResponse{}
-	response.HistoryBatches = []*shared.History{}
+	response.HistoryBatches = []*types.History{}
 	numOfEvents := 0
 
 outer:
@@ -227,16 +249,16 @@ outer:
 		encodedHistoryBatches, err := h.gcloudStorage.Get(ctx, URI, filename)
 
 		if err != nil {
-			return nil, &shared.InternalServiceError{Message: err.Error()}
+			return nil, &types.InternalServiceError{Message: err.Error()}
 		}
 
 		if encodedHistoryBatches == nil {
-			return nil, &shared.InternalServiceError{Message: "Fail retrieving history file: " + URI.String() + "/" + filename}
+			return nil, &types.InternalServiceError{Message: "Fail retrieving history file: " + URI.String() + "/" + filename}
 		}
 
 		batches, err := decodeHistoryBatches(encodedHistoryBatches)
 		if err != nil {
-			return nil, &shared.InternalServiceError{Message: err.Error()}
+			return nil, &types.InternalServiceError{Message: err.Error()}
 		}
 		// trim the batches in the beginning based on token.BatchIdxOffset
 		batches = batches[token.BatchIdxOffset:]
@@ -265,7 +287,7 @@ outer:
 	if token.CurrentPart <= token.HighestPart {
 		nextToken, err := serializeToken(token)
 		if err != nil {
-			return nil, &shared.InternalServiceError{Message: err.Error()}
+			return nil, &types.InternalServiceError{Message: err.Error()}
 		}
 		response.NextPageToken = nextToken
 	}
@@ -297,37 +319,30 @@ func (h *historyArchiver) validateURI(URI archiver.URI) (err error) {
 
 func getNextHistoryBlob(ctx context.Context, historyIterator archiver.HistoryIterator) (*archiver.HistoryBlob, error) {
 	historyBlob, err := historyIterator.Next()
-	op := func() error {
+	op := func(ctx context.Context) error {
 		historyBlob, err = historyIterator.Next()
 		return err
 	}
+	throttleRetry := backoff.NewThrottleRetry(
+		backoff.WithRetryPolicy(common.CreatePersistenceRetryPolicy()),
+		backoff.WithRetryableError(persistence.IsTransientError),
+	)
 	for err != nil {
 		if contextExpired(ctx) {
 			return nil, archiver.ErrContextTimeout
 		}
-		if !common.IsPersistenceTransientError(err) {
+		if !persistence.IsTransientError(err) {
 			return nil, err
 		}
-		err = backoff.Retry(op, common.CreatePersistenceRetryPolicy(), common.IsPersistenceTransientError)
+		err = throttleRetry.Do(ctx, op)
 	}
 	return historyBlob, nil
 }
 
-func historyMutated(request *archiver.ArchiveHistoryRequest, historyBatches []*shared.History, isLast bool) bool {
-	lastBatch := historyBatches[len(historyBatches)-1].Events
-	lastEvent := lastBatch[len(lastBatch)-1]
-	lastFailoverVersion := lastEvent.GetVersion()
-	if lastFailoverVersion > request.CloseFailoverVersion {
-		return true
-	}
-
-	if !isLast {
-		return false
-	}
-	lastEventID := lastEvent.GetEventId()
-	return lastFailoverVersion != request.CloseFailoverVersion || lastEventID+1 != request.NextEventID
-}
-
+// with XDC(global domain) concept, archival may write different history with the same RunID, with different failoverVersion.
+// In that case, the history/runID with the highest failoverVersion wins.
+// getHighestVersion look up all archived files to find the highest failoverVersion.
+// Since a history is written into different parts in this archival implementation, it also returns the highest and lowest partVersionID.
 func (h *historyArchiver) getHighestVersion(ctx context.Context, URI archiver.URI, request *archiver.GetHistoryRequest) (*int64, *int, *int, error) {
 
 	filenames, err := h.gcloudStorage.Query(ctx, URI, constructHistoryFilenamePrefix(request.DomainID, request.WorkflowID, request.RunID))
@@ -364,6 +379,9 @@ func (h *historyArchiver) getHighestVersion(ctx context.Context, URI archiver.UR
 
 	}
 
+	if highestVersion == nil {
+		return nil, nil, nil, archiver.ErrHistoryNotExist
+	}
 	return highestVersion, highestVersionPart, lowestVersionPart, nil
 }
 

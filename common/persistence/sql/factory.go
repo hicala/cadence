@@ -24,25 +24,26 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/uber/cadence/common/persistence/serialization"
-
+	"github.com/uber/cadence/common/config"
 	"github.com/uber/cadence/common/log"
 	p "github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/persistence/serialization"
 	"github.com/uber/cadence/common/persistence/sql/sqlplugin"
-	"github.com/uber/cadence/common/service/config"
 )
 
 type (
 	// Factory vends store objects backed by MySQL
 	Factory struct {
-		cfg         config.SQL
-		dbConn      dbConn
-		clusterName string
-		logger      log.Logger
-		parser      serialization.Parser
+		cfg            config.SQL
+		dbConn         dbConn
+		clusterName    string
+		logger         log.Logger
+		parser         serialization.Parser
+		taskSerializer serialization.TaskSerializer
+		dc             *p.DynamicConfiguration
 	}
 
-	// dbConn represents a logical mysql connection - its a
+	// dbConn represents a logical mysql connection - it's a
 	// wrapper around the standard sql connection pool with
 	// additional reference counting
 	dbConn struct {
@@ -60,13 +61,16 @@ func NewFactory(
 	clusterName string,
 	logger log.Logger,
 	parser serialization.Parser,
+	dc *p.DynamicConfiguration,
 ) *Factory {
 	return &Factory{
-		cfg:         cfg,
-		clusterName: clusterName,
-		logger:      logger,
-		dbConn:      newRefCountedDBConn(&cfg),
-		parser:      parser,
+		cfg:            cfg,
+		clusterName:    clusterName,
+		logger:         logger,
+		dbConn:         newRefCountedDBConn(&cfg),
+		parser:         parser,
+		taskSerializer: serialization.NewTaskSerializer(parser),
+		dc:             dc,
 	}
 }
 
@@ -85,20 +89,20 @@ func (f *Factory) NewShardStore() (p.ShardStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newShardPersistence(conn, f.clusterName, f.logger, f.parser)
+	return NewShardPersistence(conn, f.clusterName, f.logger, f.parser)
 }
 
-// NewHistoryV2Store returns a new history store
-func (f *Factory) NewHistoryV2Store() (p.HistoryStore, error) {
+// NewHistoryStore returns a new history store
+func (f *Factory) NewHistoryStore() (p.HistoryStore, error) {
 	conn, err := f.dbConn.get()
 	if err != nil {
 		return nil, err
 	}
-	return newHistoryV2Persistence(conn, f.logger, f.parser)
+	return NewHistoryV2Persistence(conn, f.logger, f.parser, f.dc)
 }
 
-// NewMetadataStore returns a new metadata store
-func (f *Factory) NewMetadataStore() (p.MetadataStore, error) {
+// NewDomainStore returns a new metadata store
+func (f *Factory) NewDomainStore() (p.DomainStore, error) {
 	conn, err := f.dbConn.get()
 	if err != nil {
 		return nil, err
@@ -106,13 +110,57 @@ func (f *Factory) NewMetadataStore() (p.MetadataStore, error) {
 	return newMetadataPersistenceV2(conn, f.clusterName, f.logger, f.parser)
 }
 
-// NewExecutionStore returns an ExecutionStore for a given shardID
-func (f *Factory) NewExecutionStore(shardID int) (p.ExecutionStore, error) {
+// NewDomainAuditStore returns a domain audit store
+func (f *Factory) NewDomainAuditStore() (p.DomainAuditStore, error) {
 	conn, err := f.dbConn.get()
 	if err != nil {
 		return nil, err
 	}
-	return NewSQLExecutionStore(conn, f.logger, shardID, f.parser)
+	return newSQLDomainAuditStore(conn, f.logger, f.parser)
+}
+
+// NewSemaphoreMetadataStore returns a semaphore metadata store.
+// Distributed semaphore is only supported on NoSQL; this is a not-supported stub.
+func (f *Factory) NewSemaphoreMetadataStore() (p.SemaphoreMetadataStore, error) {
+	conn, err := f.dbConn.get()
+	if err != nil {
+		return nil, err
+	}
+	return newSQLSemaphoreMetadataStore(conn, f.logger, f.parser)
+}
+
+// NewSemaphoreTokenStore returns a semaphore token store.
+// Distributed semaphore is only supported on NoSQL; this is a not-supported stub.
+func (f *Factory) NewSemaphoreTokenStore() (p.SemaphoreTokenStore, error) {
+	conn, err := f.dbConn.get()
+	if err != nil {
+		return nil, err
+	}
+	return newSQLSemaphoreTokenStore(conn, f.logger, f.parser)
+}
+
+// NewSemaphoreTaskStore returns a semaphore task (task queue) store.
+// Distributed semaphore is only supported on NoSQL; this is a not-supported stub.
+func (f *Factory) NewSemaphoreTaskStore() (p.SemaphoreTaskStore, error) {
+	conn, err := f.dbConn.get()
+	if err != nil {
+		return nil, err
+	}
+	return newSQLSemaphoreTaskStore(conn, f.logger, f.parser)
+}
+
+// NewHistoryDLQTaskStore returns a history DLQ task store.
+func (f *Factory) NewHistoryDLQTaskStore() (p.HistoryDLQTaskStore, error) {
+	return &sqlHistoryDLQTaskStore{}, nil
+}
+
+// NewExecutionStore returns an ExecutionStore
+func (f *Factory) NewExecutionStore() (p.ExecutionStore, error) {
+	conn, err := f.dbConn.get()
+	if err != nil {
+		return nil, err
+	}
+	return NewSQLExecutionStore(conn, f.logger, f.parser, f.taskSerializer, f.dc)
 }
 
 // NewVisibilityStore returns a visibility store
@@ -122,13 +170,45 @@ func (f *Factory) NewVisibilityStore(sortByCloseTime bool) (p.VisibilityStore, e
 }
 
 // NewQueue returns a new queue backed by sql
-func (f *Factory) NewQueue(queueType p.QueueType) (p.Queue, error) {
+func (f *Factory) NewQueue(queueType p.QueueType) (p.QueueStore, error) {
 	conn, err := f.dbConn.get()
 	if err != nil {
 		return nil, err
 	}
 
-	return newQueue(conn, f.logger, queueType)
+	return newQueueStore(conn, f.logger, queueType)
+}
+
+// NewConfigStore returns a new config store backed by sql. Not Yet Implemented.
+func (f *Factory) NewConfigStore() (p.ConfigStore, error) {
+	conn, err := f.dbConn.get()
+	if err != nil {
+		return nil, err
+	}
+	return NewSQLConfigStore(conn, f.logger, f.parser)
+}
+
+func (f *Factory) NewAdminDBs(dbType p.DBType) ([]p.AdminDB, error) {
+	plugin, ok := supportedPlugins[f.cfg.PluginName]
+	if !ok {
+		return nil, fmt.Errorf("plugin not supported: %s", f.cfg.PluginName)
+	}
+	schema, err := plugin.GetSchema(dbType)
+	if err != nil {
+		return nil, err
+	}
+	var result []p.AdminDB
+	dbs := f.cfg.SplitMultipleDatabases()
+	for _, db := range dbs {
+		result = append(result, &sqlAdmin{
+			logger: f.logger,
+			plugin: plugin,
+			dbType: dbType,
+			schema: schema,
+			cfg:    db,
+		})
+	}
+	return result, nil
 }
 
 // Close closes the factory

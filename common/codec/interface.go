@@ -18,12 +18,15 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+//go:generate mockgen -package $GOPACKAGE -destination interfaces_mock.go -self_package github.com/uber/cadence/common/codec github.com/uber/cadence/common/codec BinaryEncoder
+
 package codec
 
 import (
+	"go.uber.org/thriftrw/protocol/stream"
 	"go.uber.org/thriftrw/wire"
 
-	"github.com/uber/cadence/.gen/go/shared"
+	"github.com/uber/cadence/common/types"
 )
 
 type (
@@ -37,6 +40,8 @@ type (
 	ThriftObject interface {
 		FromWire(w wire.Value) error
 		ToWire() (wire.Value, error)
+		Encode(stream.Writer) error
+		Decode(stream.Reader) error
 	}
 )
 
@@ -47,9 +52,9 @@ const (
 
 var (
 	// MissingBinaryEncodingVersion indicate that the encoding version is missing
-	MissingBinaryEncodingVersion = &shared.BadRequestError{Message: "Missing binary encoding version."}
+	MissingBinaryEncodingVersion = &types.BadRequestError{Message: "Missing binary encoding version."}
 	// InvalidBinaryEncodingVersion indicate that the encoding version is incorrect
-	InvalidBinaryEncodingVersion = &shared.BadRequestError{Message: "Invalid binary encoding version."}
+	InvalidBinaryEncodingVersion = &types.BadRequestError{Message: "Invalid binary encoding version."}
 	// MsgPayloadNotThriftEncoded indicate message is not thrift encoded
-	MsgPayloadNotThriftEncoded = &shared.BadRequestError{Message: "Message payload is not thrift encoded."}
+	MsgPayloadNotThriftEncoded = &types.BadRequestError{Message: "Message payload is not thrift encoded."}
 )

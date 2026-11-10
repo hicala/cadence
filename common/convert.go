@@ -28,6 +28,12 @@ import (
 	s "github.com/uber/cadence/.gen/go/shared"
 )
 
+// Returns a pointer to the given value.
+// todo (david.porter) Remove the remaining helpers here which are now obsolete
+func Ptr[T any](v T) *T {
+	return &v
+}
+
 // IntPtr makes a copy and returns the pointer to an int.
 func IntPtr(v int) *int {
 	return &v
@@ -76,6 +82,16 @@ func StringPtr(v string) *string {
 // TimeNowNanosPtr returns an int64 ptr to current time in unix nanos
 func TimeNowNanosPtr() *int64 {
 	v := time.Now().UnixNano()
+	return &v
+}
+
+// TimePtr makes a copy and returns the pointer to a time
+func TimePtr(v time.Time) *time.Time {
+	return &v
+}
+
+// DurationPtr makes a copy and returns the pointer to a duration
+func DurationPtr(v time.Duration) *time.Duration {
 	return &v
 }
 

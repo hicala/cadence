@@ -18,13 +18,11 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-//go:generate mockgen -copyright_file ../../LICENSE -package $GOPACKAGE -source $GOFILE -destination interface_mock.go -self_package github.com/uber/cadence/common/task
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination interface_mock.go -self_package github.com/uber/cadence/common/task
 
 package task
 
-import (
-	"github.com/uber/cadence/common"
-)
+import "github.com/uber/cadence/common"
 
 type (
 	// Processor is the generic coroutine pool interface
@@ -36,10 +34,10 @@ type (
 
 	// Scheduler is the generic interface for scheduling tasks with priority
 	// and processing them
-	Scheduler interface {
+	Scheduler[T Task] interface {
 		common.Daemon
-		Submit(task PriorityTask) error
-		TrySubmit(task PriorityTask) (bool, error)
+		Submit(task T) error
+		TrySubmit(task T) (bool, error)
 	}
 
 	// SchedulerType respresents the type of the task scheduler implementation
@@ -59,7 +57,9 @@ type (
 		// Ack marks the task as successful completed
 		Ack()
 		// Nack marks the task as unsuccessful completed
-		Nack()
+		Nack(err error)
+		// Cancel marks the task as canceled
+		Cancel()
 		// State returns the current task state
 		State() State
 	}
@@ -67,7 +67,7 @@ type (
 	// PriorityTask is the interface for tasks which have and can be assigned a priority
 	PriorityTask interface {
 		Task
-		// Priority returns the priority of the task, or NoPriority if no priority was previously assigned
+		// Priority returns the priority of the task, or noPriority if no priority was previously assigned
 		Priority() int
 		// SetPriority sets the priority of the task
 		SetPriority(int)
@@ -82,14 +82,30 @@ type (
 	SequentialTaskQueue interface {
 		// QueueID return the ID of the queue, as well as the tasks inside (same)
 		QueueID() interface{}
-		// Offer push an task to the task set
+		// Add push an task to the task set
 		Add(task Task)
-		// Poll pop an task from the task set
+		// Remove pop an task from the task set
 		Remove() Task
 		// IsEmpty indicate if the task set is empty
 		IsEmpty() bool
 		// Len return the size of the queue
 		Len() int
+	}
+
+	// Schedule represents a stateless schedule definition
+	Schedule[V any] interface {
+		// NewIterator creates a new stateful iterator for this schedule
+		NewIterator() Iterator[V]
+
+		// Len returns the length of the schedule
+		Len() int
+	}
+
+	// Iterator represents a stateful iteration through a schedule
+	Iterator[V any] interface {
+		// Next returns the next value in the iteration
+		// Returns (value, true) if available, (zero value, false) if exhausted
+		TryNext() (V, bool)
 	}
 )
 
@@ -105,6 +121,6 @@ const (
 	TaskStatePending State = iota + 1
 	// TaskStateAcked is the state for a task if it has been successfully completed
 	TaskStateAcked
-	// TaskStateNacked is the state for a task if it can not be processed
-	TaskStateNacked
+	// TaskStateCanceled is the state for a task if it has been canceled
+	TaskStateCanceled
 )

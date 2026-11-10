@@ -18,13 +18,17 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination interface_mock.go -self_package github.com/uber/cadence/common/cache
+
 package cache
 
 import (
 	"time"
 
 	"github.com/uber/cadence/common"
-
+	"github.com/uber/cadence/common/clock"
+	"github.com/uber/cadence/common/dynamicconfig/dynamicproperties"
+	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/metrics"
 )
 
@@ -75,15 +79,38 @@ type Options struct {
 	// It is required option if MaxSize is not provided
 	MaxCount int
 
-	// GetCacheItemSizeFunc is a function called upon adding the item to update the cache size.
+	// MaxSize is an optional flag, but it has to be used along with a value that implements Sizeable() interface
+	// to control the max size in bytes of the cache
+	// It is required option if MaxCount is not provided
+	MaxSize dynamicproperties.IntPropertyFn
+
+	// ActivelyEvict will evict items that has expired TTL at every operation in the cache
+	// This can be expensive if a lot of items expire at the same time
+	// Should be used when it's important for memory that the expired items are evicted as soon as possible
+	// If not set expired items will be evicted when one of these happens
+	// - when the cache is full
+	// - when the item is accessed
+	ActivelyEvict bool
+
+	// TimeSource is used to get the current time
+	// It is optional and defaults to clock.NewRealTimeSource()
+	TimeSource clock.TimeSource
+
+	// IsSizeBased is an optional flag to indicate if the cache is size based
+	// It's default is false, but if set to true, the cache will evict items based on item size instead of count
+	// But the item HAS to be able to cast as a Sizeable interface otherwise the cache will fail
+	IsSizeBased dynamicproperties.BoolPropertyFn
+
+	// MetricsScope is used to emit metrics for internals of the cache
+	MetricsScope metrics.Scope
+
+	// Logger is used to emit logs for internals of the cache
+	Logger log.Logger
+
+	// Deprecated: GetCacheItemSizeFunc is a function called upon adding the item to update the cache size.
 	// It returns 0 by default, assuming the cache is just count based
 	// It is required option if MaxCount is not provided
 	GetCacheItemSizeFunc GetCacheItemSizeFunc
-
-	// MaxSize is an optional and must be set along with GetCacheItemSizeFunc
-	// to control the max size in bytes of the cache
-	// It is required option if MaxCount is not provided
-	MaxSize uint64
 }
 
 // SimpleOptions provides options that can be used to configure SimpleCache
@@ -129,9 +156,15 @@ type GetCacheItemSizeFunc func(interface{}) uint64
 // DomainMetricsScopeCache represents a interface for mapping domainID and scopeIdx to metricsScope
 type DomainMetricsScopeCache interface {
 	// Get retrieves metrics scope for a domainID and scopeIdx
-	Get(domainID string, scopeIdx int) (metrics.Scope, bool)
+	Get(domainID string, scopeIdx metrics.ScopeIdx) (metrics.Scope, bool)
 	// Put adds metrics scope for a domainID and scopeIdx
-	Put(domainID string, scopeIdx int, metricsScope metrics.Scope)
+	Put(domainID string, scopeIdx metrics.ScopeIdx, metricsScope metrics.Scope)
 
 	common.Daemon
+}
+
+// Sizeable is a interface that implements ByteSize() function
+type Sizeable interface {
+	// ByteSize returns an approximate size of the object in bytes
+	ByteSize() uint64
 }

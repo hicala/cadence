@@ -18,7 +18,10 @@ CREATE TYPE shard (
   -- Mapping of cluster to corresponding list of transfer queue processing states
   transfer_processing_queue_states  blob,
   transfer_processing_queue_states_encoding  text,
-  -- Mapping of cluster to corresponding list of transfer queue processing states
+  -- Mapping of cluster to corresponding list of cross-cluster queue processing states
+  cross_cluster_processing_queue_states blob,
+  cross_cluster_processing_queue_states_encoding text,
+  -- Mapping of cluster to corresponding list of timer queue processing states
   timer_processing_queue_states     blob,
   timer_processing_queue_states_encoding     text,
   -- Mapping of (remote) cluster to corresponding replication level (last replicated task_id)
@@ -36,6 +39,7 @@ CREATE TYPE workflow_execution (
   domain_id                        uuid,
   workflow_id                      text,
   run_id                           uuid,
+  first_run_id                     uuid,   -- Run ID of the first run of a ContinuedAsNew workflow
   parent_domain_id                 uuid,   -- Domain ID of parent workflow which started the workflow execution
   parent_workflow_id               text,   -- ID of parent workflow which started the workflow execution
   parent_run_id                    uuid,   -- RunID of parent workflow which started the workflow execution
@@ -74,6 +78,7 @@ CREATE TYPE workflow_execution (
   has_retry_policy                 boolean,-- If there is a retry policy
   init_interval                    int,    -- initial retry interval, in seconds
   backoff_coefficient              double,
+  jitter_coefficient               double,
   max_interval                     int,    -- max retry interval in seconds
   expiration_time                  timestamp, -- retry expiration time
   max_attempts                     int,    -- max number of attempts including initial non-retry attempt
@@ -90,7 +95,12 @@ CREATE TYPE workflow_execution (
   auto_reset_points                blob, -- the resetting points for auto-reset feature
   auto_reset_points_encoding       text, -- encoding for auto_reset_points_data
   search_attributes                map<text, blob>,
-  memo                             map<text, blob>
+  memo                             map<text, blob>,
+  partition_config                 map<text, text>,
+  cron_overlap_policy              int, -- enum CronOverlapPolicy {Skip, BufferOne}
+  task_list_kind                   int, -- enum TaskListKind {Normal, Sticky, Ephemeral},
+  active_cluster_selection_policy blob, -- active cluster selection policy applicable to active-active domains
+  active_cluster_selection_policy_encoding text, -- encoding for active_cluster_selection_policy
 );
 
 -- Replication information for each cluster
@@ -110,20 +120,24 @@ CREATE TYPE replication_state (
 
 -- TODO: Remove fields that are left over from activity and workflow tasks.
 CREATE TYPE transfer_task (
-  domain_id                  uuid,   -- The domain ID that this transfer task belongs to
-  workflow_id                text,   -- The workflow ID that this transfer task belongs to
-  run_id                     uuid,   -- The run ID that this transfer task belongs to
+  domain_id                  uuid,         -- The domain ID that this transfer task belongs to
+  workflow_id                text,         -- The workflow ID that this transfer task belongs to
+  run_id                     uuid,         -- The run ID that this transfer task belongs to
   task_id                    bigint,
-  visibility_ts              timestamp, -- The timestamp when the transfer task is generated
-  target_domain_id           uuid,   -- The external domain ID that this transfer task is doing work for.
-  target_workflow_id         text,   -- The external workflow ID that this transfer task is doing work for.
-  target_run_id              uuid,   -- The external run ID that this transfer task is doing work for.
-  target_child_workflow_only boolean, -- The whether target child workflow only.
+  visibility_ts              timestamp,    -- The timestamp when the transfer task is generated
+  target_domain_id           uuid,         -- The external domain ID that this transfer task is doing work for.
+  target_domain_ids          set<uuid>,    -- The external domain ID that this transfer task is doing work for.
+  target_workflow_id         text,         -- The external workflow ID that this transfer task is doing work for.
+  target_run_id              uuid,         -- The external run ID that this transfer task is doing work for.
+  target_child_workflow_only boolean,      -- The whether target child workflow only.
   task_list                  text,
-  type                       int,    -- enum TaskType {ActivityTask, DecisionTask, DeleteExecution, CancelExecution, StartChildExecution, ReplicationTask}
+  type                       int,          -- enum TaskType For local: {Decision, Activity, CloseExecution, CancelExecution, StartChildExecution, SignalExecution, RecordWorkflowStarted, ResetWorkflow, UpsertWorkflowSearchAttributes}, or for crossCluster {StartChildExecution, CancelExecution, SignalExecution}
   schedule_id                bigint,
-  version                    bigint, -- the failover version when this task is created, used to compare against the mutable state, in case the events got overwritten
-  record_visibility          boolean, -- indicates whether or not to create a visibility record
+  version                    bigint,       -- the failover version when this task is created, used to compare against the mutable state, in case the events got overwritten
+  record_visibility          boolean,      -- indicates whether or not to create a visibility record
+  original_task_list         text,         -- the original task list of the task if the task is a sticky decision task
+  original_task_list_kind    int,          -- enum TaskListKind {Normal, Sticky, Ephemeral},
+  semaphore_name             text,
 );
 
 CREATE TYPE replication_task (
@@ -131,7 +145,7 @@ CREATE TYPE replication_task (
   workflow_id                text,   -- The workflow ID that this replication task belongs to
   run_id                     uuid,   -- The run ID that this replication task belongs to
   task_id                    bigint,
-  type                       int,    -- enum TaskType {History, Heartbeat}
+  type                       int,    -- enum TaskType {History, SyncActivity, FailoverMarker}
   first_event_id             bigint,  -- Used by ReplicationTask to set the first event ID of the applied transaction
   next_event_id              bigint,  -- Used by ReplicationTask to set the next event ID of the applied transaction
   version                    bigint,  -- Used by ReplicationTask to set the failover version of the applied transaction
@@ -156,6 +170,7 @@ CREATE TYPE timer_task (
   event_id         bigint, -- Corresponds to event ID in history that is responsible for this timer.
   schedule_attempt bigint, -- Used to retry failed decision tasks using mutable state
   version          bigint, -- the failover version when this task is created, used to compare against the mutable state, in case the events got overwritten
+  task_list        text, -- the task list associated with the timer task
 );
 
 -- Workflow activity in progress mutable state
@@ -185,6 +200,7 @@ CREATE TYPE activity_info (
   has_retry_policy          boolean,-- If there is a retry policy
   init_interval             int,    -- initial retry interval, in seconds
   backoff_coefficient       double,
+  jitter_coefficient        double,
   max_interval              int,    -- max retry interval in seconds
   expiration_time           timestamp, -- retry expiration time
   max_attempts              int,    -- max number of attempts including initial non-retry attempt
@@ -193,6 +209,9 @@ CREATE TYPE activity_info (
   last_worker_identity      text, -- Worker that returns the last failure reason
   last_failure_details      blob,
   event_data_encoding       text, -- Protocol used for history serialization
+  task_list_kind            int, -- enum TaskListKind {Normal, Sticky, Ephemeral},
+  last_failure_category     int, -- enum FailureCategory {Poll, Normal, Fatal}
+  last_retry_interval_seconds int, -- override for the retry interval from the FailureOptions
 );
 
 -- User timer details
@@ -219,7 +238,8 @@ CREATE TYPE child_execution_info (
   started_event             blob, -- deprecated
   create_request_id         uuid,
   event_data_encoding       text, -- Protocol used for history serialization
-  domain_name               text,
+  domain_id                 uuid,
+  domain_name               text, -- deprecated
   workflow_type_name        text,
   parent_close_policy       int,
 );
@@ -243,14 +263,38 @@ CREATE TYPE signal_info (
   control                   blob,
 );
 
+-- Semaphore hold in progress mutable state
+CREATE TYPE semaphore_info (
+  version                   bigint,
+  initiated_id              bigint,
+  semaphore_name            text,
+  owner_id                  text,
+  token_id                  int,
+  acquire_deadline          timestamp,
+);
+
 -- Activity or workflow task in a task list
 CREATE TYPE task (
   domain_id        uuid,
   workflow_id      text,
   run_id           uuid,
   schedule_id      bigint,
-  created_time     timestamp
+  created_time     timestamp,
+  partition_config map<text, text>
 );
+
+CREATE TYPE task_list_partition (
+    isolation_groups set<text>
+);
+
+CREATE TYPE task_list_partition_config (
+  version              bigint,
+  num_read_partitions  int,
+  num_write_partitions int,
+  read_partitions map<int, frozen<task_list_partition>>,
+  write_partitions map<int, frozen<task_list_partition>>
+);
+
 
 CREATE TYPE task_list (
   domain_id        uuid,
@@ -258,7 +302,8 @@ CREATE TYPE task_list (
   type             int, -- enum TaskRowType {ActivityTask, DecisionTask}
   ack_level        bigint, -- task_id of the last acknowledged message
   kind             int, -- enum TaskListKind {Normal, Sticky}
-  last_updated     timestamp
+  last_updated     timestamp,
+  adaptive_partition_config frozen<task_list_partition_config>
 );
 
 CREATE TYPE domain (
@@ -281,6 +326,10 @@ CREATE TYPE domain_config (
   visibility_archival_uri text,
   bad_binaries    blob,
   bad_binaries_encoding blob,
+  isolation_groups blob,
+  isolation_groups_encoding text,
+  async_workflow_config blob,
+  async_workflow_config_encoding text,
 );
 
 CREATE TYPE cluster_replication_config (
@@ -289,7 +338,9 @@ CREATE TYPE cluster_replication_config (
 
 CREATE TYPE domain_replication_config (
   active_cluster_name text,
-  clusters            list<frozen<cluster_replication_config>>
+  clusters            list<frozen<cluster_replication_config>>,
+  active_clusters_config blob,
+  active_clusters_config_encoding text,
 );
 
 CREATE TYPE serialized_event_batch (
@@ -321,27 +372,39 @@ CREATE TYPE checksum (
   value   blob, -- checksum bytes
 );
 
+-- A queued semaphore acquire waiting for a token in a bucket
+CREATE TYPE semaphore_task (
+    workflow_id  text,
+    run_id       uuid,
+    hold_id      bigint  -- identifies this hold
+);
+
 CREATE TABLE executions (
   shard_id                       int,
-  type                           int, -- enum RowType { Shard, Execution, TransferTask, TimerTask, ReplicationTask}
+  type                           int, -- enum RowType { Shard, Execution, TransferTask, TimerTask, ReplicationTask, CrossClusterTask}
   domain_id                      uuid,
   workflow_id                    text,
   run_id                         uuid,
   current_run_id                 uuid,
   visibility_ts                  timestamp, -- unique identifier for timer tasks for an execution
   task_id                        bigint, -- unique identifier for transfer and timer tasks for an execution
+  data                           blob, -- this column will be used by Shard, Execution, TransferTask, TimerTask, ReplicationTask row types
+  data_encoding                  text,
   shard                          frozen<shard>,
   execution                      frozen<workflow_execution>,
   transfer                       frozen<transfer_task>,
+  cross_cluster                  frozen<transfer_task>, -- reuse the transfer_task type
   replication                    frozen<replication_task>,
   timer                          frozen<timer_task>,
   next_event_id                  bigint,  -- This is needed to make conditional updates on session history
   range_id                       bigint, -- Increasing sequence identifier for transfer queue, checkpointed into shard info
   activity_map                   map<bigint, frozen<activity_info>>,
   timer_map                      map<text, frozen<timer_info>>,
+  workflow_timer_tasks           set<frozen<tuple<timestamp, bigint>>>,
   child_executions_map           map<bigint, frozen<child_execution_info>>,
   request_cancel_map             map<bigint, frozen<request_cancel_info>>,
   signal_map                     map<bigint, frozen<signal_info>>,
+  semaphore_map                  map<bigint, frozen<semaphore_info>>,
   signal_requested               set<uuid>,
   buffered_events_list           list<frozen<serialized_event_batch>>,
   replication_state              frozen<replication_state>, -- Replication information part of mutable state
@@ -351,6 +414,8 @@ CREATE TABLE executions (
   version_histories              blob, -- the metadata of history branching
   version_histories_encoding     text,
   checksum                       frozen<checksum>,
+  created_time                   timestamp,
+  last_updated_time              timestamp,
   PRIMARY KEY  (shard_id, type, domain_id, workflow_id, run_id, visibility_ts, task_id)
 ) WITH COMPACTION = {
     'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
@@ -363,6 +428,7 @@ CREATE TABLE history_node (
   txn_id            bigint, -- for override the same node_id: bigger txn_id wins
   data                blob, -- Batch of workflow execution history events as a blob
   data_encoding       text, -- Protocol used for history serialization
+  created_time      timestamp,
   PRIMARY KEY ((tree_id), branch_id, node_id, txn_id )
   ) WITH CLUSTERING ORDER BY (branch_id ASC, node_id ASC, txn_id DESC)
     AND COMPACTION = {
@@ -375,6 +441,7 @@ CREATE TABLE history_tree (
   ancestors         list<frozen<branch_range>>,
   fork_time         timestamp, -- For fork operation to prevent race condition to leak event data when forking branches
   info              text, -- For background cleanup when fork operation cannot finish self cleanup due to crash
+  created_time      timestamp,
   PRIMARY KEY ((tree_id), branch_id )
 ) WITH COMPACTION = {
     'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
@@ -390,6 +457,8 @@ CREATE TABLE tasks (
   range_id         bigint, -- Used to ensure that only one process can write to the table
   task             frozen<task>,
   task_list        frozen<task_list>,
+  created_time       timestamp,
+  last_updated_time  timestamp,
   PRIMARY KEY ((domain_id, task_list_name, task_list_type), type, task_id)
 ) WITH COMPACTION = {
     'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
@@ -400,6 +469,7 @@ CREATE TABLE domains (
   id     uuid,
   domain frozen<domain>,
   config frozen<domain_config>,
+  created_time       timestamp,
   PRIMARY KEY (id)
 ) WITH COMPACTION = {
     'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
@@ -419,6 +489,7 @@ CREATE TABLE domains_by_name_v2 (
   failover_end_time             bigint, -- indicating domain failover state
   last_updated_time             bigint, -- indicating the domain last update timestamp
   notification_version          bigint,
+  created_time                  timestamp,
   PRIMARY KEY (domains_partition, name)
 )  WITH COMPACTION = {
      'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
@@ -468,6 +539,7 @@ CREATE TABLE queue (
   queue_type      int,
   message_id      bigint,
   message_payload blob,
+  created_time    timestamp,
   PRIMARY KEY  (queue_type, message_id)
 ) WITH COMPACTION = {
     'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
@@ -477,7 +549,144 @@ CREATE TABLE queue_metadata (
   queue_type        int,
   cluster_ack_level map<text, bigint>,
   version           bigint,
+  created_time      timestamp,
+  last_updated_time timestamp,
 PRIMARY KEY (queue_type)
 )  WITH COMPACTION = {
      'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
    };
+
+CREATE TABLE cluster_config (
+  row_type int,
+  version int,
+  timestamp timestamp,
+  values blob,
+  encoding text,
+PRIMARY KEY (row_type, version)
+) WITH CLUSTERING ORDER BY (version DESC);
+
+CREATE TABLE domain_audit_log (
+    domain_id uuid,
+    event_id uuid, -- event_id is the unique identifier for this change to the domain
+
+    state_before blob, -- state_before stores the domain state before the request
+    state_before_encoding text, -- the encoding type used for state_before
+
+    state_after blob, -- state_after stores the domain state after the request
+    state_after_encoding text, -- the encoding type used for state_after
+
+    operation_type int, -- operation_type stores the type of operation that was performed. It is deserialized as an enum and can be used to customize the serialization/deserialization strategy.
+
+    created_time timestamp, -- created_time the time this row was inserted
+    last_updated_time timestamp,
+
+    identity text, -- the unique identifier of the user that made the change
+    identity_type text, -- identity_type can be used to delineate between service, user, or other identities
+
+    comment text, -- comment can be used when manual updates or creates are performed on the database as an audit trail
+
+    PRIMARY KEY ((domain_id, operation_type), created_time, event_id)
+) WITH CLUSTERING ORDER BY (created_time DESC, event_id ASC)
+  AND COMPACTION = {
+      'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
+  };
+
+
+-- History Task DLQ table
+-- This table can be used to store unprocessable history tasks.
+-- The primary key is at a shard/domain/cluster_attribute level to allow processing of the tasks for a given domain/cluster attribute during failover.
+CREATE TABLE history_task_dlq (
+    shard_id                  int,
+    domain_id                 text, -- Used to pull tasks on failover
+    cluster_attribute_scope   text, -- Used to pull tasks by cluster attribute on failover, cluster_attribute_scope should be an empty string for tasks in the 'default' active cluster
+    cluster_attribute_name    text, -- Used to pull tasks by cluster attribute on failover, cluster_attribute_name should be an empty string for tasks in the 'default' active cluster
+    task_category             int, -- the category of task, used for deserialization of the task payload
+    visibility_ts             timestamp, -- used for task ordering when pulling from the DLQ
+    task_id                   bigint, -- used for task ordering 
+    workflow_id               text, 
+    run_id                    text,
+    task_payload              blob, -- the full serialized payload of the task 
+    task_payload_encoding     text, -- the encoding type used for task_payload
+    version                   bigint,
+    created_at                timestamp,
+    PRIMARY KEY ((shard_id, domain_id, cluster_attribute_scope, cluster_attribute_name), task_category, visibility_ts, task_id)
+) WITH CLUSTERING ORDER BY (task_category ASC, visibility_ts ASC, task_id ASC)
+    AND compaction = {
+        'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
+    };
+
+-- History Task DLQ Ack level table.
+-- This table is used to fetch the current ack level for a given domain_id + cluster_attribute_pair when a cluster attribute scoped failover occurs.
+-- The primary key is shard_id to allow a shard-level processor to pull all ack levels for the shard during background processing. 
+CREATE TABLE history_task_dlq_ack_level (
+    shard_id                  int,
+    domain_id                 text,
+    cluster_attribute_scope   text,
+    cluster_attribute_name    text,
+    task_category             int,
+    ack_level_visibility_ts   timestamp,
+    ack_level_task_id         bigint,
+    last_updated_at           timestamp,
+    PRIMARY KEY ((shard_id), domain_id, cluster_attribute_scope, cluster_attribute_name, task_category)
+) WITH compaction = {
+    'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
+};
+
+-- Distributed semaphore metadata: capacity and configuration for a regional counting semaphore.
+-- Partitioned by domain_id so all semaphores in a domain list together; clustered by semaphore_name.
+-- Source of truth for size and bucket_size (which derive N = ceil(size / bucket_size)).
+CREATE TABLE semaphore_metadata (
+    domain_id         uuid,
+    semaphore_name    text,
+    size              int,       -- total capacity (max concurrent tokens)
+    bucket_size       int,       -- tokens per bucket (per-host budget); sets N = ceil(size / bucket_size)
+    created_time      timestamp,
+    PRIMARY KEY ((domain_id), semaphore_name)
+) WITH compaction = {
+    'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
+};
+
+-- Distributed semaphore token ownership, with the reverse index inline.
+--
+-- One partition per bucket (domain_id, semaphore_name, bucket), written by the single Matching
+-- host that owns it. `type` gives the partition two row shapes over the same columns: a token
+-- row keyed by token_id ("who holds this slot?") and an owner row keyed by owner_id ("which
+-- slot does this hold own?"). A key column that does not apply to a shape carries a sentinel,
+-- since a key cannot be null; the other columns are simply left unset.
+--
+-- Grant and release write both rows in one atomic batch, so the two cannot diverge.
+CREATE TABLE semaphore_tokens (
+    domain_id       uuid,
+    semaphore_name  text,
+    bucket          int,        -- static bucket = f(owner_id)
+    type            int,        -- rowType {token, owner}: forward row vs reverse-index row
+    token_id        int,        -- token row: slot id [1,size]; owner row: TOKEN_NONE sentinel
+    owner_id        text,       -- owner row: the holder's identity; token row: OWNER_NONE sentinel
+    holder          text,       -- token row: current holder or FREE (LWT-guarded); owner row: unset
+    held_token      int,        -- owner row: the token this owner holds; token row: unset
+    updated_time    timestamp,
+    PRIMARY KEY ((domain_id, semaphore_name, bucket), type, token_id, owner_id)
+) WITH compaction = {
+    'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
+};
+
+-- Distributed semaphore: per-bucket FIFO queue of ungranted acquires, ordered by task_id.
+-- Each bucket (domain_id, semaphore_name, bucket) is owned by a single Matching host that
+-- drains the head on each release, reusing the tasks range_id fence.
+CREATE TABLE semaphore_tasks (
+    domain_id         uuid,
+    semaphore_name    text,
+    bucket            int,                    -- static bucket = f(owner_id); one queue per bucket
+    type              int,                    -- rowType: 0 = waiter (queued acquire), 1 = control row (range_id fence)
+    task_id           bigint,
+    range_id          bigint,                 -- single-writer fence, carried on the control row
+    ack_level         bigint,                 -- control row: waiters with task_id <= this are granted/expired and
+                                              -- range-deleted; the reader reads above it, never scanning acked tombstones
+    task              frozen<semaphore_task>,
+    acquire_deadline  timestamp,              -- the time this waiter gives up if still not granted
+                                              -- No deadline means no skip and no TTL
+    created_time      timestamp,
+    PRIMARY KEY ((domain_id, semaphore_name, bucket), type, task_id)
+) WITH compaction = {
+    'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
+};

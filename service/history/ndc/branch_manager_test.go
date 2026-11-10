@@ -24,18 +24,17 @@ import (
 	ctx "context"
 	"testing"
 
-	"github.com/golang/mock/gomock"
 	"github.com/pborman/uuid"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"go.uber.org/mock/gomock"
 
-	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
-	"github.com/uber/cadence/common/cluster"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/mocks"
 	"github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/service/history/config"
 	"github.com/uber/cadence/service/history/execution"
 	"github.com/uber/cadence/service/history/shard"
@@ -46,11 +45,10 @@ type (
 		suite.Suite
 		*require.Assertions
 
-		controller          *gomock.Controller
-		mockShard           *shard.TestContext
-		mockContext         *execution.MockContext
-		mockMutableState    *execution.MockMutableState
-		mockClusterMetadata *cluster.MockMetadata
+		controller       *gomock.Controller
+		mockShard        *shard.TestContext
+		mockContext      *execution.MockContext
+		mockMutableState *execution.MockMutableState
 
 		mockHistoryV2Manager *mocks.HistoryV2Manager
 
@@ -78,6 +76,7 @@ func (s *branchManagerSuite) SetupTest() {
 	s.mockMutableState = execution.NewMockMutableState(s.controller)
 
 	s.mockShard = shard.NewTestContext(
+		s.T(),
 		s.controller,
 		&persistence.ShardInfo{
 			ShardID:          10,
@@ -88,8 +87,6 @@ func (s *branchManagerSuite) SetupTest() {
 	)
 
 	s.mockHistoryV2Manager = s.mockShard.Resource.HistoryMgr
-	s.mockClusterMetadata = s.mockShard.Resource.ClusterMetadata
-	s.mockClusterMetadata.EXPECT().GetCurrentClusterName().Return(cluster.TestCurrentClusterName).AnyTimes()
 
 	s.logger = s.mockShard.GetLogger()
 
@@ -113,6 +110,7 @@ func (s *branchManagerSuite) TestCreateNewBranch() {
 	baseBranchLCAEventID := int64(1394)
 	baseBranchLastEventVersion := int64(400)
 	baseBranchLastEventID := int64(2333)
+	domainName := "test-domain-name"
 	versionHistory := persistence.NewVersionHistory(baseBranchToken, []*persistence.VersionHistoryItem{
 		persistence.NewVersionHistoryItem(10, 0),
 		persistence.NewVersionHistoryItem(50, 100),
@@ -133,7 +131,7 @@ func (s *branchManagerSuite) TestCreateNewBranch() {
 		WorkflowID: s.workflowID,
 		RunID:      s.runID,
 	}).AnyTimes()
-
+	s.mockShard.Resource.DomainCache.EXPECT().GetDomainName(gomock.Any()).Return(domainName, nil).AnyTimes()
 	s.mockHistoryV2Manager.On("ForkHistoryBranch", mock.Anything, mock.MatchedBy(func(input *persistence.ForkHistoryBranchRequest) bool {
 		input.Info = ""
 		s.Equal(&persistence.ForkHistoryBranchRequest{
@@ -141,6 +139,7 @@ func (s *branchManagerSuite) TestCreateNewBranch() {
 			ForkNodeID:      baseBranchLCAEventID + 1,
 			Info:            "",
 			ShardID:         common.IntPtr(s.mockShard.GetShardID()),
+			DomainName:      domainName,
 		}, input)
 		return true
 	})).Return(&persistence.ForkHistoryBranchResponse{
@@ -189,11 +188,11 @@ func (s *branchManagerSuite) TestFlushBufferedEvents() {
 	}
 	s.mockMutableState.EXPECT().GetInFlightDecision().Return(decisionInfo, true).Times(1)
 	// GetExecutionInfo's return value is not used by this test
-	s.mockMutableState.EXPECT().GetExecutionInfo().Return(&persistence.WorkflowExecutionInfo{}).Times(1)
+	s.mockMutableState.EXPECT().GetExecutionInfo().Return(&persistence.WorkflowExecutionInfo{}).AnyTimes()
 	s.mockMutableState.EXPECT().AddDecisionTaskFailedEvent(
 		decisionInfo.ScheduleID,
 		decisionInfo.StartedID,
-		shared.DecisionTaskFailedCauseFailoverCloseDecision,
+		types.DecisionTaskFailedCauseFailoverCloseDecision,
 		[]byte(nil),
 		execution.IdentityHistoryService,
 		"",
@@ -201,17 +200,18 @@ func (s *branchManagerSuite) TestFlushBufferedEvents() {
 		"",
 		"",
 		int64(0),
-	).Return(&shared.HistoryEvent{}, nil).Times(1)
+		"",
+	).Return(&types.HistoryEvent{}, nil).Times(1)
 	s.mockMutableState.EXPECT().FlushBufferedEvents().Return(nil).Times(1)
-
-	s.mockClusterMetadata.EXPECT().ClusterNameForFailoverVersion(lastWriteVersion).Return(cluster.TestCurrentClusterName).AnyTimes()
-	s.mockClusterMetadata.EXPECT().GetCurrentClusterName().Return(cluster.TestCurrentClusterName).AnyTimes()
+	s.mockMutableState.EXPECT().HasPendingDecision().Return(false).Times(1)
+	s.mockMutableState.EXPECT().AddDecisionTaskScheduledEvent(false).Return(&execution.DecisionInfo{}, nil).Times(1)
 
 	s.mockContext.EXPECT().UpdateWorkflowExecutionAsActive(gomock.Any(), gomock.Any()).Return(nil).Times(1)
 
 	ctx := ctx.Background()
 
 	_, _, err = s.branchManager.flushBufferedEvents(ctx, incomingVersionHistory)
+	s.NoError(err)
 }
 
 func (s *branchManagerSuite) TestPrepareVersionHistory_BranchAppendable_NoMissingEventInBetween() {
@@ -274,13 +274,14 @@ func (s *branchManagerSuite) TestPrepareVersionHistory_BranchAppendable_MissingE
 		incomingVersionHistory,
 		150+2,
 		300)
-	s.IsType(&shared.RetryTaskV2Error{}, err)
+	s.IsType(&types.RetryTaskV2Error{}, err)
 }
 
 func (s *branchManagerSuite) TestPrepareVersionHistory_BranchNotAppendable_NoMissingEventInBetween() {
 	baseBranchToken := []byte("some random base branch token")
 	baseBranchLCAEventID := int64(85)
 	baseBranchLCAEventVersion := int64(200)
+	domainName := "test-domainName"
 
 	versionHistory := persistence.NewVersionHistory(baseBranchToken, []*persistence.VersionHistoryItem{
 		persistence.NewVersionHistoryItem(10, 0),
@@ -306,7 +307,7 @@ func (s *branchManagerSuite) TestPrepareVersionHistory_BranchNotAppendable_NoMis
 		WorkflowID: s.workflowID,
 		RunID:      s.runID,
 	}).AnyTimes()
-
+	s.mockShard.Resource.DomainCache.EXPECT().GetDomainName(gomock.Any()).Return(domainName, nil).AnyTimes()
 	s.mockHistoryV2Manager.On("ForkHistoryBranch", mock.Anything, mock.MatchedBy(func(input *persistence.ForkHistoryBranchRequest) bool {
 		input.Info = ""
 		s.Equal(&persistence.ForkHistoryBranchRequest{
@@ -314,6 +315,7 @@ func (s *branchManagerSuite) TestPrepareVersionHistory_BranchNotAppendable_NoMis
 			ForkNodeID:      baseBranchLCAEventID + 1,
 			Info:            "",
 			ShardID:         common.IntPtr(s.mockShard.GetShardID()),
+			DomainName:      domainName,
 		}, input)
 		return true
 	})).Return(&persistence.ForkHistoryBranchResponse{
@@ -368,5 +370,5 @@ func (s *branchManagerSuite) TestPrepareVersionHistory_BranchNotAppendable_Missi
 		baseBranchLCAEventID+2,
 		baseBranchLCAEventVersion,
 	)
-	s.IsType(&shared.RetryTaskV2Error{}, err)
+	s.IsType(&types.RetryTaskV2Error{}, err)
 }

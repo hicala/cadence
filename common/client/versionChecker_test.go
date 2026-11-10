@@ -26,14 +26,15 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
+	apiv1 "github.com/uber/cadence-idl/go/proto/api/v1"
+	"go.uber.org/yarpc"
 	"go.uber.org/yarpc/api/encoding"
 	"go.uber.org/yarpc/api/transport"
 
-	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
-
-	"github.com/stretchr/testify/require"
-	"github.com/stretchr/testify/suite"
+	"github.com/uber/cadence/common/types"
 )
 
 type (
@@ -113,7 +114,7 @@ func (s *VersionCheckerSuite) TestClientSupported() {
 		err := versionChecker.ClientSupported(tc.callContext, tc.enableClientVersionCheck)
 		if tc.expectErr {
 			s.Error(err)
-			s.IsType(&shared.ClientVersionNotSupportedError{}, err)
+			s.IsType(&types.ClientVersionNotSupportedError{}, err)
 		} else {
 			s.NoError(err)
 		}
@@ -191,7 +192,7 @@ func (s *VersionCheckerSuite) TestSupportsStickyQuery() {
 		if tc.expectErr {
 			err := vc.SupportsStickyQuery(tc.clientImpl, tc.clientFeatureVersion)
 			s.Error(err)
-			s.IsType(&shared.ClientVersionNotSupportedError{}, err)
+			s.IsType(&types.ClientVersionNotSupportedError{}, err)
 		} else {
 			s.NoError(vc.SupportsStickyQuery(tc.clientImpl, tc.clientFeatureVersion))
 		}
@@ -224,7 +225,7 @@ func (s *VersionCheckerSuite) TestSupportsConsistentQuery() {
 		},
 		{
 			clientImpl:           JavaSDK,
-			clientFeatureVersion: "1.5.0",
+			clientFeatureVersion: "1.4.0",
 			expectErr:            true,
 		},
 		{
@@ -254,7 +255,7 @@ func (s *VersionCheckerSuite) TestSupportsConsistentQuery() {
 		if tc.expectErr {
 			err := vc.SupportsConsistentQuery(tc.clientImpl, tc.clientFeatureVersion)
 			s.Error(err)
-			s.IsType(&shared.ClientVersionNotSupportedError{}, err)
+			s.IsType(&types.ClientVersionNotSupportedError{}, err)
 		} else {
 			s.NoError(vc.SupportsConsistentQuery(tc.clientImpl, tc.clientFeatureVersion))
 		}
@@ -292,6 +293,11 @@ func (s *VersionCheckerSuite) TestSupportsRawHistoryQuery() {
 		},
 		{
 			clientImpl:           JavaSDK,
+			clientFeatureVersion: "1.7.0",
+			expectErr:            false,
+		},
+		{
+			clientImpl:           JavaSDK,
 			clientFeatureVersion: "1.2.0",
 			expectErr:            true,
 		},
@@ -322,7 +328,7 @@ func (s *VersionCheckerSuite) TestSupportsRawHistoryQuery() {
 		},
 		{
 			clientImpl:           CLI,
-			clientFeatureVersion: "1.6.0",
+			clientFeatureVersion: "1.7.0",
 			expectErr:            false,
 		},
 	}
@@ -332,9 +338,91 @@ func (s *VersionCheckerSuite) TestSupportsRawHistoryQuery() {
 		if tc.expectErr {
 			err := vc.SupportsRawHistoryQuery(tc.clientImpl, tc.clientFeatureVersion)
 			s.Error(err)
-			s.IsType(&shared.ClientVersionNotSupportedError{}, err)
+			s.IsType(&types.ClientVersionNotSupportedError{}, err)
 		} else {
 			s.NoError(vc.SupportsRawHistoryQuery(tc.clientImpl, tc.clientFeatureVersion))
+		}
+	}
+}
+
+func (s *VersionCheckerSuite) TestSupportsWorkflowAlreadyCompletedError() {
+	testCases := []struct {
+		clientImpl           string
+		clientFeatureVersion string
+		expectErr            bool
+	}{
+		{
+			clientImpl: "",
+			expectErr:  true,
+		},
+		{
+			clientImpl:           "",
+			clientFeatureVersion: GoWorkerWorkflowAlreadyCompletedVersion,
+			expectErr:            true,
+		},
+		{
+			clientImpl: GoSDK,
+			expectErr:  true,
+		},
+		{
+			clientImpl:           "unknown",
+			clientFeatureVersion: "0.0.0",
+			expectErr:            true,
+		},
+		{
+			clientImpl:           JavaSDK,
+			clientFeatureVersion: "1.4.0",
+			expectErr:            false,
+		},
+		{
+			clientImpl:           JavaSDK,
+			clientFeatureVersion: "1.3.0",
+			expectErr:            true,
+		},
+		{
+			clientImpl:           GoSDK,
+			clientFeatureVersion: "malformed-feature-version",
+			expectErr:            true,
+		},
+		{
+			clientImpl:           GoSDK,
+			clientFeatureVersion: GoWorkerWorkflowAlreadyCompletedVersion,
+			expectErr:            false,
+		},
+		{
+			clientImpl:           GoSDK,
+			clientFeatureVersion: "1.4.0",
+			expectErr:            true,
+		},
+		{
+			clientImpl:           GoSDK,
+			clientFeatureVersion: "2.0.0",
+			expectErr:            false,
+		},
+		{
+			clientImpl:           CLI,
+			clientFeatureVersion: "1.5.0",
+			expectErr:            true,
+		},
+		{
+			clientImpl:           CLI,
+			clientFeatureVersion: "1.7.0",
+			expectErr:            false,
+		},
+	}
+
+	featureFlags := apiv1.FeatureFlags{
+		WorkflowExecutionAlreadyCompletedErrorEnabled: true,
+	}
+
+	for _, tc := range testCases {
+		vc := NewVersionChecker()
+		if tc.expectErr {
+			err := vc.SupportsWorkflowAlreadyCompletedError(tc.clientImpl, tc.clientFeatureVersion, featureFlags)
+			s.Error(err)
+			s.IsType(&types.ClientVersionNotSupportedError{}, err)
+		} else {
+			s.NoError(vc.SupportsWorkflowAlreadyCompletedError(tc.clientImpl, tc.clientFeatureVersion, featureFlags))
 		}
 	}
 }
@@ -353,4 +441,75 @@ func (s *VersionCheckerSuite) constructCallContext(clientImpl string, featureVer
 	})
 	s.NoError(err)
 	return ctx
+}
+
+func TestGetFeatureFlagsFromHeader(t *testing.T) {
+	tests := []struct {
+		name              string
+		featureFlagsValue string // use "" to omit header
+		want              apiv1.FeatureFlags
+	}{
+		{
+			name:              "no header",
+			featureFlagsValue: "",
+			want:              apiv1.FeatureFlags{},
+		},
+		{
+			name:              "valid JSON with WorkflowExecutionAlreadyCompletedErrorEnabled true",
+			featureFlagsValue: `{"WorkflowExecutionAlreadyCompletedErrorEnabled":true}`,
+			want: apiv1.FeatureFlags{
+				WorkflowExecutionAlreadyCompletedErrorEnabled: true,
+			},
+		},
+		{
+			name:              "valid JSON with WorkflowExecutionAlreadyCompletedErrorEnabled false",
+			featureFlagsValue: `{"WorkflowExecutionAlreadyCompletedErrorEnabled":false}`,
+			want: apiv1.FeatureFlags{
+				WorkflowExecutionAlreadyCompletedErrorEnabled: false,
+			},
+		},
+		{
+			name:              "invalid JSON returns empty",
+			featureFlagsValue: `{invalid}`,
+			want:              apiv1.FeatureFlags{},
+		},
+		{
+			name:              "empty JSON object",
+			featureFlagsValue: `{}`,
+			want:              apiv1.FeatureFlags{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			ctx, inboundCall := encoding.NewInboundCall(ctx)
+			headers := transport.NewHeaders()
+			if tt.featureFlagsValue != "" {
+				headers = headers.With(common.ClientFeatureFlagsHeaderName, tt.featureFlagsValue)
+			}
+			err := inboundCall.ReadFromRequest(&transport.Request{Headers: headers})
+			require.NoError(t, err)
+			call := yarpc.CallFromContext(ctx)
+			got := GetFeatureFlagsFromHeader(call)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestGetFeatureFlagsFromHeader_RoundTrip(t *testing.T) {
+	flags := apiv1.FeatureFlags{
+		WorkflowExecutionAlreadyCompletedErrorEnabled: true,
+	}
+	serialized := FeatureFlagsHeader(flags)
+	require.NotEmpty(t, serialized)
+
+	ctx := context.Background()
+	ctx, inboundCall := encoding.NewInboundCall(ctx)
+	err := inboundCall.ReadFromRequest(&transport.Request{
+		Headers: transport.NewHeaders().With(common.ClientFeatureFlagsHeaderName, serialized),
+	})
+	require.NoError(t, err)
+	call := yarpc.CallFromContext(ctx)
+	got := GetFeatureFlagsFromHeader(call)
+	require.Equal(t, flags, got)
 }

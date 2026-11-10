@@ -3,118 +3,151 @@ ARG TARGET=server
 # Can be used in case a proxy is necessary
 ARG GOPROXY
 
-# Build tcheck binary
-FROM golang:1.13.6-alpine AS tcheck
-
-RUN apk add --update --no-cache ca-certificates git curl
-
-ENV GO111MODULE=off
-
-RUN curl https://glide.sh/get | sh
-
-ENV TCHECK_VERSION=v1.1.0
-
-RUN go get -d github.com/uber/tcheck
-RUN cd /go/src/github.com/uber/tcheck && git checkout ${TCHECK_VERSION}
-
-WORKDIR /go/src/github.com/uber/tcheck
-
-RUN glide install
-
-RUN go install
-
-
 # Build Cadence binaries
-FROM golang:1.13.6-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine3.23 AS builder
 
-RUN apk add --update --no-cache ca-certificates make git curl mercurial bzr
+ARG RELEASE_VERSION
+
+RUN apk add --no-cache ca-certificates make git curl mercurial unzip bash && \
+    apk upgrade --no-cache zlib
 
 WORKDIR /cadence
 
 # Making sure that dependency is not touched
 ENV GOFLAGS="-mod=readonly"
 
-# Copy go mod dependencies and build cache
+# Copy go mod dependencies and try to share the module download cache
 COPY go.* ./
+COPY cmd/server/go.* ./cmd/server/
+COPY common/archiver/gcloud/go.* ./common/archiver/gcloud/
+COPY common/dynamicconfig/openfeatureprovider/unleash/go.* ./common/dynamicconfig/openfeatureprovider/unleash/
+COPY common/persistence/sql/sqlplugin/cloudsql-mysql/go.* ./common/persistence/sql/sqlplugin/cloudsql-mysql/
+# go.work means this downloads everything, not just the top module
 RUN go mod download
 
 COPY . .
+RUN rm -fr .bin .build idls
 
-RUN CGO_ENABLED=0 make copyright cadence-cassandra-tool cadence-sql-tool cadence cadence-server
+ENV CADENCE_RELEASE_VERSION=$RELEASE_VERSION
+
+# don't do anything fancy, just build.  must be run separately, before building things.
+RUN make .just-build
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH make cadence-cassandra-tool cadence-sql-tool cadence cadence-server cadence-bench cadence-canary
 
 
 # Download dockerize
-FROM alpine:3.11 AS dockerize
+FROM --platform=$BUILDPLATFORM alpine:3.24 AS dockerize
 
-RUN apk add --no-cache openssl
+# appears to require `docker buildx` or an explicit `--platform` at build time
+ARG TARGETARCH
 
-ENV DOCKERIZE_VERSION v0.6.1
-RUN wget https://github.com/jwilder/dockerize/releases/download/$DOCKERIZE_VERSION/dockerize-alpine-linux-amd64-$DOCKERIZE_VERSION.tar.gz \
-    && tar -C /usr/local/bin -xzvf dockerize-alpine-linux-amd64-$DOCKERIZE_VERSION.tar.gz \
-    && rm dockerize-alpine-linux-amd64-$DOCKERIZE_VERSION.tar.gz \
+RUN apk add --no-cache openssl && \
+    apk upgrade --no-cache zlib
+
+ENV DOCKERIZE_VERSION=v0.9.3
+RUN wget https://github.com/jwilder/dockerize/releases/download/$DOCKERIZE_VERSION/dockerize-linux-$TARGETARCH-$DOCKERIZE_VERSION.tar.gz \
+    && tar -C /usr/local/bin -xzvf dockerize-linux-$TARGETARCH-$DOCKERIZE_VERSION.tar.gz \
+    && rm dockerize-linux-$TARGETARCH-$DOCKERIZE_VERSION.tar.gz \
     && echo "**** fix for host id mapping error ****" \
     && chown root:root /usr/local/bin/dockerize
 
 
 # Alpine base image
-FROM alpine:3.11 AS alpine
+FROM alpine:3.24 AS alpine
 
-RUN apk add --update --no-cache ca-certificates tzdata bash curl
+RUN apk add --update --no-cache ca-certificates tzdata bash curl && \
+    apk upgrade --no-cache zlib
 
 # set up nsswitch.conf for Go's "netgo" implementation
 # https://github.com/gliderlabs/docker-alpine/issues/367#issuecomment-424546457
-RUN test ! -e /etc/nsswitch.conf && echo 'hosts: files dns' > /etc/nsswitch.conf
+RUN [ -e /etc/nsswitch.conf ] && grep '^hosts: files dns' /etc/nsswitch.conf
 
 SHELL ["/bin/bash", "-c"]
 
 
-# Cadence server
-FROM alpine AS cadence-server
+# Alpine base with non-root user
+FROM alpine AS alpine-nonroot
 
-ENV CADENCE_HOME /etc/cadence
+# Create non-root user (reused across all stages)
+RUN addgroup -g 1000 cadence && \
+    adduser -u 1000 -G cadence -s /bin/sh -D cadence
+
+
+# Cadence server
+FROM alpine-nonroot AS cadence-server
+
+ENV CADENCE_HOME=/etc/cadence
 RUN mkdir -p /etc/cadence
 
-COPY --from=tcheck /go/bin/tcheck /usr/local/bin
-COPY --from=dockerize /usr/local/bin/dockerize /usr/local/bin
-COPY --from=builder /cadence/cadence-cassandra-tool /usr/local/bin
-COPY --from=builder /cadence/cadence-sql-tool /usr/local/bin
-COPY --from=builder /cadence/cadence /usr/local/bin
-COPY --from=builder /cadence/cadence-server /usr/local/bin
-COPY --from=builder /cadence/schema /etc/cadence/schema
+COPY --from=dockerize --chown=cadence:cadence /usr/local/bin/dockerize /usr/local/bin
+COPY --from=builder --chown=cadence:cadence /cadence/cadence-cassandra-tool /usr/local/bin
+COPY --from=builder --chown=cadence:cadence /cadence/cadence-sql-tool /usr/local/bin
+COPY --from=builder --chown=cadence:cadence /cadence/cadence /usr/local/bin
+COPY --from=builder --chown=cadence:cadence /cadence/cadence-server /usr/local/bin
+COPY --from=builder --chown=cadence:cadence /cadence/schema /etc/cadence/schema
 
-COPY docker/entrypoint.sh /docker-entrypoint.sh
-COPY config/dynamicconfig /etc/cadence/config/dynamicconfig
-COPY docker/config_template.yaml /etc/cadence/config
-COPY docker/start-cadence.sh /start-cadence.sh
+COPY --chown=cadence:cadence docker/entrypoint.sh /docker-entrypoint.sh
+COPY --chown=cadence:cadence docker/start-cadence.sh /start-cadence.sh
+
+# Separate read-only configs from writable runtime config directory
+COPY --chown=cadence:cadence config/dynamicconfig /etc/cadence/dynamicconfig
+COPY --chown=cadence:cadence config/credentials /etc/cadence/credentials
+COPY --chown=cadence:cadence docker/config_template.yaml /etc/cadence/config_template.yaml
+
+# Create writable config directory for runtime-generated files
+RUN mkdir -p /etc/cadence/config && \
+    chown cadence:cadence /etc/cadence/config && \
+    chmod 0700 /docker-entrypoint.sh /start-cadence.sh
 
 WORKDIR /etc/cadence
 
 ENV SERVICES="history,matching,frontend,worker"
+
+# Run as non-root user
+USER cadence
 
 EXPOSE 7933 7934 7935 7939
 ENTRYPOINT ["/docker-entrypoint.sh"]
 CMD /start-cadence.sh
 
 
-# All-in-one Cadence server
+# All-in-one Cadence server (~450mb)
 FROM cadence-server AS cadence-auto-setup
 
-RUN apk add --update --no-cache ca-certificates py-pip mysql-client
-RUN pip install cqlsh
-
-COPY docker/start.sh /start.sh
-
-CMD /start.sh
-
+ENV CADENCE_AUTO_SETUP=true
+# In case we're using Cassandra
+ENV CADENCE_SETUP_OPTION_REPLICATION_FACTOR=1
 
 # Cadence CLI
-FROM alpine AS cadence-cli
+FROM alpine-nonroot AS cadence-cli
 
-COPY --from=tcheck /go/bin/tcheck /usr/local/bin
-COPY --from=builder /cadence/cadence /usr/local/bin
+COPY --from=builder --chown=cadence:cadence /cadence/cadence /usr/local/bin
+
+USER cadence
 
 ENTRYPOINT ["cadence"]
 
+# Cadence Canary
+FROM alpine-nonroot AS cadence-canary
+
+COPY --from=builder --chown=cadence:cadence /cadence/cadence-canary /usr/local/bin
+COPY --from=builder --chown=cadence:cadence /cadence/cadence /usr/local/bin
+
+USER cadence
+
+CMD ["/usr/local/bin/cadence-canary", "--root", "/etc/cadence-canary", "start"]
+
+# Cadence Bench
+FROM alpine-nonroot AS cadence-bench
+
+COPY --from=builder --chown=cadence:cadence /cadence/cadence-bench /usr/local/bin
+COPY --from=builder --chown=cadence:cadence /cadence/cadence /usr/local/bin
+
+USER cadence
+
+CMD ["/usr/local/bin/cadence-bench", "--root", "/etc/cadence-bench", "start"]
 
 # Final image
 FROM cadence-${TARGET}

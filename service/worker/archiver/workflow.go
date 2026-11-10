@@ -26,7 +26,6 @@ import (
 	"go.uber.org/cadence/workflow"
 
 	"github.com/uber/cadence/common/log"
-	"github.com/uber/cadence/common/log/loggerimpl"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/metrics"
 )
@@ -52,14 +51,20 @@ func archivalWorkflowHelper(
 ) error {
 	metricsClient = NewReplayMetricsClient(metricsClient, ctx)
 	metricsClient.IncCounter(metrics.ArchiverArchivalWorkflowScope, metrics.ArchiverWorkflowStartedCount)
-	sw := metricsClient.StartTimer(metrics.ArchiverArchivalWorkflowScope, metrics.CadenceLatency)
+	archivalLatencyStart := workflow.Now(ctx)
+	archivalScope := metricsClient.Scope(metrics.ArchiverArchivalWorkflowScope, metrics.NonDomainTag())
+	sw := archivalScope.StartTimer(metrics.CadenceLatency)
+	stopTimers := func() {
+		sw.Stop()
+		archivalScope.ExponentialHistogram(metrics.CadenceLatencyHistogram, workflow.Now(ctx).Sub(archivalLatencyStart))
+	}
 	workflowInfo := workflow.GetInfo(ctx)
 	logger = logger.WithTags(
 		tag.WorkflowID(workflowInfo.WorkflowExecution.ID),
 		tag.WorkflowRunID(workflowInfo.WorkflowExecution.RunID),
 		tag.WorkflowTaskListName(workflowInfo.TaskListName),
 		tag.WorkflowType(workflowInfo.WorkflowType.Name))
-	logger = loggerimpl.NewReplayLogger(logger, ctx, false)
+	logger = log.NewReplayLogger(logger, ctx, false)
 
 	logger.Info("archival system workflow started")
 	var dcResult dynamicConfigResult
@@ -99,7 +104,7 @@ func archivalWorkflowHelper(
 	if pumpResult.TimeoutWithoutSignals {
 		logger.Info("workflow stopping because pump did not get any signals within timeout threshold")
 		metricsClient.IncCounter(metrics.ArchiverArchivalWorkflowScope, metrics.ArchiverWorkflowStoppingCount)
-		sw.Stop()
+		stopTimers()
 		return nil
 	}
 	for {
@@ -112,6 +117,6 @@ func archivalWorkflowHelper(
 	logger.Info("archival system workflow continue as new")
 	ctx = workflow.WithExecutionStartToCloseTimeout(ctx, workflowStartToCloseTimeout)
 	ctx = workflow.WithWorkflowTaskStartToCloseTimeout(ctx, workflowTaskStartToCloseTimeout)
-	sw.Stop()
+	stopTimers()
 	return workflow.NewContinueAsNewError(ctx, archivalWorkflowFnName, pumpResult.UnhandledCarryover)
 }

@@ -23,93 +23,140 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 
+	"github.com/VividCortex/mysqlerr"
 	"github.com/go-sql-driver/mysql"
-	"github.com/jmoiron/sqlx"
 
+	"github.com/uber/cadence/common/persistence/sql/sqldriver"
 	"github.com/uber/cadence/common/persistence/sql/sqlplugin"
 )
 
 type (
-	db struct {
-		db        *sqlx.DB
-		tx        *sqlx.Tx
-		converter DataConverter
-		conn      conn
-	}
-
-	conn interface {
-		ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
-		NamedExecContext(ctx context.Context, query string, arg interface{}) (sql.Result, error)
-		GetContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
-		SelectContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
+	DB struct {
+		converter   DataConverter
+		driver      sqldriver.Driver
+		numDBShards int
 	}
 )
 
-var _ sqlplugin.AdminDB = (*db)(nil)
-var _ sqlplugin.DB = (*db)(nil)
-var _ sqlplugin.Tx = (*db)(nil)
-
-// ErrDupEntry MySQL Error 1062 indicates a duplicate primary key i.e. the row already exists,
-// so we don't do the insert and return a ConditionalUpdate error.
-const ErrDupEntry = 1062
-
-func (mdb *db) IsDupEntryError(err error) bool {
-	sqlErr, ok := err.(*mysql.MySQLError)
-	return ok && sqlErr.Number == ErrDupEntry
+// NewDB returns an instance of DB, which is a logical
+// connection to the underlying mysql database
+// dbShardID is needed when tx is not nil
+func NewDB(driver sqldriver.Driver, numDBShards int, converter DataConverter) *DB {
+	return &DB{
+		converter:   converter,
+		driver:      driver,
+		numDBShards: numDBShards,
+	}
 }
 
-// newDB returns an instance of DB, which is a logical
-// connection to the underlying mysql database
-func newDB(xdb *sqlx.DB, tx *sqlx.Tx) *db {
-	db := &db{
-		db:        xdb,
-		tx:        tx,
-		converter: &converter{},
-		conn:      xdb,
+func (mdb *DB) GetTotalNumDBShards() int {
+	return mdb.numDBShards
+}
+
+var _ sqlplugin.AdminDB = (*DB)(nil)
+var _ sqlplugin.DB = (*DB)(nil)
+var _ sqlplugin.Tx = (*DB)(nil)
+
+func (mdb *DB) IsDupEntryError(err error) bool {
+	sqlErr, ok := err.(*mysql.MySQLError)
+	// ErrDupEntry MySQL Error 1062 indicates a duplicate primary key i.e. the row already exists,
+	// so we don't do the insert and return a ConditionalUpdate error.
+	return ok && sqlErr.Number == mysqlerr.ER_DUP_ENTRY
+}
+
+// IsSchemaElementExistsError returns true if a DDL statement failed because the table, column, or index already exists
+func (mdb *DB) IsSchemaElementExistsError(err error) bool {
+	var sqlErr *mysql.MySQLError
+	if !errors.As(err, &sqlErr) {
+		return false
 	}
-	if tx != nil {
-		db.conn = tx
+	switch sqlErr.Number {
+	case mysqlerr.ER_TABLE_EXISTS_ERROR, mysqlerr.ER_DUP_FIELDNAME, mysqlerr.ER_DUP_KEYNAME:
+		return true
 	}
-	return db
+	return false
+}
+
+func (mdb *DB) IsNotFoundError(err error) bool {
+	return err == sql.ErrNoRows
+}
+
+func (mdb *DB) IsTimeoutError(err error) bool {
+	if err == context.DeadlineExceeded {
+		return true
+	}
+	sqlErr, ok := err.(*mysql.MySQLError)
+	if ok {
+		if sqlErr.Number == mysqlerr.ER_NET_READ_INTERRUPTED ||
+			sqlErr.Number == mysqlerr.ER_NET_WRITE_INTERRUPTED ||
+			sqlErr.Number == mysqlerr.ER_LOCK_WAIT_TIMEOUT ||
+			sqlErr.Number == mysqlerr.ER_XA_RBTIMEOUT ||
+			sqlErr.Number == mysqlerr.ER_QUERY_TIMEOUT ||
+			sqlErr.Number == mysqlerr.ER_LOCKING_SERVICE_TIMEOUT ||
+			sqlErr.Number == mysqlerr.ER_REGEXP_TIME_OUT {
+			return true
+		}
+	}
+	return false
+}
+
+func (mdb *DB) IsThrottlingError(err error) bool {
+	sqlErr, ok := err.(*mysql.MySQLError)
+	if ok {
+		if sqlErr.Number == mysqlerr.ER_CON_COUNT_ERROR ||
+			sqlErr.Number == mysqlerr.ER_TOO_MANY_USER_CONNECTIONS ||
+			sqlErr.Number == mysqlerr.ER_TOO_MANY_CONCURRENT_TRXS ||
+			sqlErr.Number == mysqlerr.ER_CLONE_TOO_MANY_CONCURRENT_CLONES {
+			return true
+		}
+	}
+	return false
 }
 
 // BeginTx starts a new transaction and returns a reference to the Tx object
-func (mdb *db) BeginTx(ctx context.Context) (sqlplugin.Tx, error) {
-	xtx, err := mdb.db.BeginTxx(ctx, nil)
+func (mdb *DB) BeginTx(ctx context.Context, dbShardID int) (sqlplugin.Tx, error) {
+	driver, err := mdb.driver.BeginTransaction(ctx, dbShardID, nil)
 	if err != nil {
 		return nil, err
 	}
-	return newDB(mdb.db, xtx), nil
+
+	return NewDB(driver, mdb.numDBShards, mdb.converter), nil
 }
 
 // Commit commits a previously started transaction
-func (mdb *db) Commit() error {
-	return mdb.tx.Commit()
+func (mdb *DB) Commit() error {
+	return mdb.driver.Commit()
 }
 
 // Rollback triggers rollback of a previously started transaction
-func (mdb *db) Rollback() error {
-	return mdb.tx.Rollback()
+func (mdb *DB) Rollback() error {
+	return mdb.driver.Rollback()
 }
 
 // Close closes the connection to the mysql db
-func (mdb *db) Close() error {
-	return mdb.db.Close()
+func (mdb *DB) Close() error {
+	return mdb.driver.Close()
 }
 
 // PluginName returns the name of the mysql plugin
-func (mdb *db) PluginName() string {
+func (mdb *DB) PluginName() string {
 	return PluginName
 }
 
 // SupportsTTL returns weather MySQL supports TTL
-func (mdb *db) SupportsTTL() bool {
+func (mdb *DB) SupportsTTL() bool {
 	return false
 }
 
 // MaxAllowedTTL returns the max allowed ttl MySQL supports
-func (mdb *db) MaxAllowedTTL() (*time.Duration, error) {
+func (mdb *DB) MaxAllowedTTL() (*time.Duration, error) {
 	return nil, sqlplugin.ErrTTLNotSupported
+}
+
+// SupportsTTL returns weather MySQL supports Asynchronous transaction
+func (mdb *DB) SupportsAsyncTransaction() bool {
+	return false
 }

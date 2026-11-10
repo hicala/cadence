@@ -18,47 +18,79 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination interfaces_mock.go -self_package github.com/uber/cadence/common/persistence/nosql/nosqlplugin
+
 package nosqlplugin
 
 import (
 	"context"
+	"time"
 
-	"github.com/uber/cadence/common/types"
-
-	"github.com/uber/cadence/.gen/go/shared"
+	"github.com/uber/cadence/common/config"
+	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/persistence"
 )
 
 type (
+	// Plugin defines the interface for any NoSQL database that needs to implement
+	Plugin interface {
+		CreateDB(cfg *config.NoSQL, logger log.Logger, dc *persistence.DynamicConfiguration) (DB, error)
+		SetupDB(cfg *config.NoSQL, logger log.Logger, dc *persistence.DynamicConfiguration) (persistence.SetupDB, error)
+		SchemaDB(dbType persistence.DBType, cfg *config.NoSQL, logger log.Logger, dc *persistence.DynamicConfiguration) (persistence.SchemaDB, error)
+	}
+
 	// DB defines the API for regular NoSQL operations of a Cadence server
 	DB interface {
 		PluginName() string
-		IsNotFoundError(err error) bool
-		IsTimeoutError(err error) bool
-		IsThrottlingError(err error) bool
-		IsConditionFailedError(err error) bool
 		Close()
 
+		ClientErrorChecker
 		tableCRUD
 	}
 	// tableCRUD defines the API for interacting with the database tables
-	// NOTE: All SELECT interfaces require strong consistency. Using eventual consistency will not work.
+	// NOTE 1: All SELECT interfaces require strong consistency (eventual consistency will not work) unless specify in the method.
+	//
+	// NOTE 2: About schema: only the columns that need to be used directly in queries are considered 'significant',
+	// including partition key, range key or index key and conditional columns, are required to be in the schema.
+	// All other non 'significant' columns are opaque for implementation.
+	// Therefore, it's recommended to use a data blob to store all the other columns, so that adding new
+	// column will not require schema changes. This approach has been proved very successful in MySQL/Postgres implementation of SQL interfaces.
+	// Cassandra implementation cannot do it due to backward-compatibility. Any other NoSQL implementation should use datablob for non-significant columns.
+	// Follow the comment for each tableCRUD for what are 'significant' columns.
 	tableCRUD interface {
-		historyEventsCRUD
-		messageQueueCRUD
-		domainCRUD
+		HistoryEventsCRUD
+		MessageQueueCRUD
+		DomainCRUD
+		ShardCRUD
+		VisibilityCRUD
+		TaskCRUD
+		WorkflowCRUD
+		ConfigStoreCRUD
+		DomainAuditLogCRUD
+		SemaphoreMetadataCRUD
+		SemaphoreTaskCRUD
+		SemaphoreTokenCRUD
+		HistoryDLQTaskCRUD
 	}
 
-	// historyEventsCRUD is for History events storage system
-	historyEventsCRUD interface {
-		/**
-		* It can be implemented with two tables(history_tree for branch records and history_node for node records)
-		* ShardID is passed from application layer as the same shardID of the workflow. But it is not required for History events
-		* to be in the same shard as workflows. The pro of being the same shard is that when one DB partition goes down, the impact is lower.
-		* However, being in the same shard can cause some hot partition issue. Because sometimes history can grow very large, this could be worse.
-		* Therefore, Cadence built-in Cassandra plugin doesn't take use of ShardID at all.
-		**/
+	// ClientErrorChecker checks for common nosql errors on client
+	ClientErrorChecker interface {
+		IsTimeoutError(error) bool
+		IsNotFoundError(error) bool
+		IsThrottlingError(error) bool
+		IsDBUnavailableError(error) bool
+	}
 
+	/**
+	 * HistoryEventsCRUD is for History events storage system
+	 * Recommendation: use two tables: history_tree for branch records and history_node for node records
+	 * if a single update query can operate on two tables.
+	 *
+	 * Significant columns:
+	 * history_tree partition key: (shardID, treeID), range key: (branchID)
+	 * history_node partition key: (shardID, treeID), range key: (branchID, nodeID ASC, txnID DESC)
+	 */
+	HistoryEventsCRUD interface {
 		// InsertIntoHistoryTreeAndNode inserts one or two rows: tree row and node row(at least one of them)
 		InsertIntoHistoryTreeAndNode(ctx context.Context, treeRow *HistoryTreeRow, nodeRow *HistoryNodeRow) error
 
@@ -77,10 +109,17 @@ type (
 		SelectFromHistoryTree(ctx context.Context, filter *HistoryTreeFilter) ([]*HistoryTreeRow, error)
 	}
 
-	// messageQueueCRUD is for the message queue storage system
-	// Typically two tables(queue_message,and queue_metadata) are needed to implement this interface
-	messageQueueCRUD interface {
-		//Insert message into queue, return error if failed or already exists
+	/***
+	 * MessageQueueCRUD is for the message queue storage system
+	 *
+	 * Recommendation: use two tables(queue_message,and queue_metadata) to implement this interface
+	 *
+	 * Significant columns:
+	 * queue_message partition key: (queueType), range key: (messageID)
+	 * queue_metadata partition key: (queueType), range key: N/A, query condition column(version)
+	 */
+	MessageQueueCRUD interface {
+		// Insert message into queue, return error if failed or already exists
 		// Must return conditionFailed error if row already exists
 		InsertIntoQueue(ctx context.Context, row *QueueMessageRow) error
 		// Get the ID of last message inserted into the queue
@@ -97,31 +136,47 @@ type (
 		DeleteMessage(ctx context.Context, queueType persistence.QueueType, messageID int64) error
 
 		// Insert an empty metadata row, starting from a version
-		InsertQueueMetadata(ctx context.Context, queueType persistence.QueueType, version int64) error
+		InsertQueueMetadata(ctx context.Context, row QueueMetadataRow) error
 		// **Conditionally** update a queue metadata row, if current version is matched(meaning current == row.Version - 1),
 		// then the current version will increase by one when updating the metadata row
 		// Must return conditionFailed error if the condition is not met
 		UpdateQueueMetadataCas(ctx context.Context, row QueueMetadataRow) error
 		// Read a QueueMetadata
 		SelectQueueMetadata(ctx context.Context, queueType persistence.QueueType) (*QueueMetadataRow, error)
+		// GetQueueSize return the queue size
+		GetQueueSize(ctx context.Context, queueType persistence.QueueType) (int64, error)
 	}
 
-	// domainCRUD is for domain + domain metadata storage system
-	// Ideally a domain operation should be implemented in transaction to be atomic if using multiple tables.
-	// For example, Cassandra uses two table, domains and domains_by_name_v2.
-	// But it is okay if not, as the nosqlMetadataManager will handle the edge cases.
-	//
-	// However, there is a special record as "domain metadata". Right now it is an integer number as notification version.
-	// The main purpose of it is to notify clusters that there is some changes in domains, so domain cache needs to refresh.
-	// It always increase by one, whenever a domain is updated or inserted.
-	// Updating this failover metadata with domain insert/update needs to be atomic.
-	// Because Batch LWTs is only allowed within one table and same partition.
-	// The Cassandra implementation stores it in the same table as domain in domains_by_name_v2.
-	domainCRUD interface {
-		// Insert a new record to domain, return error if failed or already exists
-		// Must return conditionFailed error if domainName already exists
+	/***
+	* DomainCRUD is for domain + domain metadata storage system
+	*
+	* Recommendation: two tables(domain, domain_metadata) to implement if conditional updates on two tables is supported
+	*
+	* Significant columns:
+	* domain: partition key( a constant value), range key(domainName), local secondary index(domainID)
+	* domain_metadata: partition key( a constant value), range key(N/A), query condition column(notificationVersion)
+	*
+	* Note 1: About Cassandra's implementation: Because of historical reasons, Cassandra uses two table,
+	* domains and domains_by_name_v2. Therefore, Cassandra implementation lost the atomicity causing some edge cases,
+	* and the implementation is more complicated than it should be.
+	*
+	* Note 2: Cassandra doesn't support conditional updates on multiple tables. Hence the domain_metadata table is implemented
+	* as a special record as "domain metadata". It is an integer number as notification version.
+	* The main purpose of it is to notify clusters that there is some changes in domains, so domain cache needs to refresh.
+	* It always increase by one, whenever a domain is updated or inserted.
+	* Updating this failover metadata with domain insert/update needs to be atomic.
+	* Because Batch LWTs is only allowed within one table and same partition.
+	* The Cassandra implementation stores it in the same table as domain in domains_by_name_v2.
+	*
+	* Note 3: It's okay to use a constant value for partition key because domain table is serving very small volume of traffic.
+	 */
+	DomainCRUD interface {
+		// Insert a new record to domain
+		// return types.DomainAlreadyExistsError error if failed or already exists
+		// Must return ConditionFailure error if other condition doesn't match
 		InsertDomain(ctx context.Context, row *DomainRow) error
 		// Update domain data
+		// Must return ConditionFailure error if update condition doesn't match
 		UpdateDomain(ctx context.Context, row *DomainRow) error
 		// Get one domain data, either by domainID or domainName
 		SelectDomain(ctx context.Context, domainID *string, domainName *string) (*DomainRow, error)
@@ -133,105 +188,491 @@ type (
 		SelectDomainMetadata(ctx context.Context) (int64, error)
 	}
 
-	// DomainRow defines the row struct for queue message
-	DomainRow struct {
-		Info                        *persistence.DomainInfo
-		Config                      *NoSQLInternalDomainConfig
-		ReplicationConfig           *persistence.DomainReplicationConfig
-		ConfigVersion               int64
-		FailoverVersion             int64
-		FailoverNotificationVersion int64
-		PreviousFailoverVersion     int64
-		FailoverEndTime             int64
-		NotificationVersion         int64
-		LastUpdatedTime             int64
-		IsGlobalDomain              bool
+	/**
+	* ShardCRUD is for shard storage of workflow execution.
+	* Recommendation: use one table if database support batch conditional update on multiple tables, otherwise combine with WorkflowCRUD (likeCassandra)
+	*
+	* Significant columns:
+	* domain: partition key(shardID), range key(N/A), local secondary index(domainID), query condition column(rangeID)
+	*
+	* Note 1: shard will be required to run conditional update with WorkflowCRUD. So in some nosql database like Cassandra,
+	* ShardCRUD and WorkflowCRUD must be implemented within the same table. Because Cassandra only allows LightWeight transaction
+	* executed within a single table.
+	* Note 2: unlike Cassandra, most NoSQL databases don't return the previous rows when conditional write fails. In this case,
+	* an extra read query is needed to get the previous row.
+	 */
+	ShardCRUD interface {
+		// InsertShard creates a new shard.
+		// Return error is there is any thing wrong
+		// Return the ShardOperationConditionFailure when doesn't meet the condition
+		InsertShard(ctx context.Context, row *ShardRow) error
+		// SelectShard gets a shard, rangeID is the current rangeID in shard row
+		SelectShard(ctx context.Context, shardID int, currentClusterName string) (rangeID int64, shard *ShardRow, err error)
+		// UpdateRangeID updates the rangeID
+		// Return error is there is any thing wrong
+		// Return the ShardOperationConditionFailure when doesn't meet the condition
+		UpdateRangeID(ctx context.Context, shardID int, rangeID int64, previousRangeID int64) error
+		// UpdateShard updates a shard
+		// Return error is there is any thing wrong
+		// Return the ShardOperationConditionFailure when doesn't meet the condition
+		UpdateShard(ctx context.Context, row *ShardRow, previousRangeID int64) error
 	}
 
-	// NoSQLInternalDomainConfig defines the struct for the domainConfig
-	NoSQLInternalDomainConfig struct {
-		// NOTE: this retention is in days, not in seconds
-		Retention                int32
-		EmitMetric               bool                 // deprecated
-		ArchivalBucket           string               // deprecated
-		ArchivalStatus           types.ArchivalStatus // deprecated
-		HistoryArchivalStatus    types.ArchivalStatus
-		HistoryArchivalURI       string
-		VisibilityArchivalStatus types.ArchivalStatus
-		VisibilityArchivalURI    string
-		BadBinaries              *persistence.DataBlob
+	/**
+	* VisibilityCRUD is for visibility using database.
+	* Database visibility usually is no longer recommended. AdvancedVisibility(with Kafka+ElasticSearch) is more powerful and scalable.
+	* Feel free to skip this interface for any NoSQL plugin(use TODO() in the implementation)
+	*
+	* Recommendation: use one table with multiple indexes
+	*
+	* Significant columns:
+	* domain: partition key(domainID), range key(workflowID, runID),
+	*         local secondary index #1(startTime),
+	*         local secondary index #2(closedTime),
+	*         local secondary index #3(workflowType, startTime),
+	*         local secondary index #4(workflowType, closedTime),
+	*         local secondary index #5(workflowID, startTime),
+	*         local secondary index #6(workflowID, closedTime),
+	*         local secondary index #7(closeStatus, closedTime),
+	*
+	* NOTE 1: Cassandra implementation of visibility uses three tables: open_executions, closed_executions and closed_executions_v2,
+	* because Cassandra doesn't support cross-partition indexing.
+	* Records in open_executions and closed_executions are clustered by start_time. Records in  closed_executions_v2 are by close_time.
+	* This optimizes the performance, but introduce a lot of complexity.
+	* In some other databases, this may be be necessary. Please refer to MySQL/Postgres implementation which uses only
+	* one table with multiple indexes.
+	*
+	* NOTE 2: TTL(time to live records) is for auto-deleting expired records in visibility. For databases that don't support TTL,
+	* please implement DeleteVisibility method. If TTL is supported, then DeleteVisibility can be a noop.
+	 */
+	VisibilityCRUD interface {
+		InsertVisibility(ctx context.Context, ttlSeconds int64, row *VisibilityRowForInsert) error
+		UpdateVisibility(ctx context.Context, ttlSeconds int64, row *VisibilityRowForUpdate) error
+		SelectVisibility(ctx context.Context, filter *VisibilityFilter) (*SelectVisibilityResponse, error)
+		DeleteVisibility(ctx context.Context, domainID, workflowID, runID string) error
+		// TODO deprecated this in the future in favor of SelectVisibility
+		// Special case: return nil,nil if not found(since we will deprecate it, it's not worth refactor to be consistent)
+		SelectOneClosedWorkflow(ctx context.Context, domainID, workflowID, runID string) (*VisibilityRow, error)
 	}
 
-	// SelectMessagesBetweenRequest is a request struct for SelectMessagesBetween
-	SelectMessagesBetweenRequest struct {
-		QueueType               persistence.QueueType
-		ExclusiveBeginMessageID int64
-		InclusiveEndMessageID   int64
-		PageSize                int
-		NextPageToken           []byte
+	VisibilityRowForInsert struct {
+		VisibilityRow
+		DomainID string
 	}
 
-	// SelectMessagesBetweenResponse is a response struct for SelectMessagesBetween
-	SelectMessagesBetweenResponse struct {
-		Rows          []QueueMessageRow
+	VisibilityRowForUpdate struct {
+		VisibilityRow
+		DomainID string
+		// NOTE: this is only for some implementation (e.g. Cassandra) that uses multiple tables,
+		// they needs to delete record from the open execution table. Ignore this field if not need it
+		UpdateOpenToClose bool
+		//  Similar as UpdateOpenToClose
+		UpdateCloseToOpen bool
+	}
+
+	// TODO separate in the future when need it
+	VisibilityRow = persistence.InternalVisibilityWorkflowExecutionInfo
+
+	SelectVisibilityResponse struct {
+		Executions    []*VisibilityRow
 		NextPageToken []byte
 	}
 
-	// QueueMessageRow defines the row struct for queue message
-	QueueMessageRow struct {
-		QueueType persistence.QueueType
-		ID        int64
-		Payload   []byte
-	}
-
-	// QueueMetadataRow defines the row struct for metadata
-	QueueMetadataRow struct {
-		QueueType        persistence.QueueType
-		ClusterAckLevels map[string]int64
-		Version          int64
-	}
-
-	// HistoryNodeRow represents a row in history_node table
-	HistoryNodeRow struct {
-		ShardID  int
-		TreeID   string
-		BranchID string
-		NodeID   int64
-		// Note: use pointer so that it's easier to multiple by -1 if needed
-		TxnID        *int64
-		Data         []byte
-		DataEncoding string
-	}
-
-	// HistoryNodeFilter contains the column names within history_node table that
+	// VisibilityFilter contains the column names within executions_visibility table that
 	// can be used to filter results through a WHERE clause
-	HistoryNodeFilter struct {
-		ShardID  int
-		TreeID   string
-		BranchID string
-		// Inclusive
-		MinNodeID int64
-		// Exclusive
-		MaxNodeID     int64
-		NextPageToken []byte
-		PageSize      int
+	VisibilityFilter struct {
+		ListRequest  persistence.InternalListWorkflowExecutionsRequest
+		FilterType   VisibilityFilterType
+		SortType     VisibilitySortType
+		WorkflowType string
+		WorkflowID   string
+		CloseStatus  int32
 	}
 
-	// HistoryTreeRow represents a row in history_tree table
-	HistoryTreeRow struct {
-		ShardID                     int
-		TreeID                      string
-		BranchID                    string
-		Ancestors                   []*shared.HistoryBranchRange
-		CreateTimestampMilliseconds int64
-		Info                        string
+	VisibilityFilterType int
+	VisibilitySortType   int
+
+	/**
+	* TaskCRUD is for tasklist and worker tasks storage
+	* The task here is only referred to workflow/activity worker tasks. `Task` is a overloaded term in Cadence.
+	* There is another 'task' storage which is for internal purpose only in WorkflowCRUD.
+	*
+	* Recommendation: use two tables(tasklist + task) to implement
+	* tasklist table stores the metadata mainly for
+	*   * rangeID: ownership management, and taskID management  everytime a matching host claim ownership of a tasklist,
+	*              it must increase the value succesfully . also used as base section of the taskID. E.g, if rangeID is 1,
+	*              then allowed taskID ranged will be [100K, 2*100K-1].
+	*   * ackLevel: max taskID that can be safely deleted.
+	* Any task record is associated with a tasklist. Any updates on a task should use rangeID of the associated tasklist as condition.
+	*
+	* Significant columns:
+	* tasklist: partition key(domainID, taskListName, taskListType), range key(N/A), query condition column(rangeID)
+	* task:partition key(domainID, taskListName, taskListType), range key(taskID), query condition column(rangeID)
+	*
+	* NOTE 1: Cassandra implementation uses the same table for tasklist and task, because Cassandra only allows
+	*        batch conditional updates(LightWeight transaction) executed within a single table.
+	* NOTE 2: TTL(time to live records) is for auto-deleting task and some tasklists records. For databases that don't
+	*        support TTL, please implement ListTaskList method, and allows TaskListScavenger like MySQL/Postgres.
+	*        If TTL is supported, then ListTaskList can be a noop.
+	 */
+	TaskCRUD interface {
+		// SelectTaskList returns a single tasklist row.
+		// Return IsNotFoundError if the row doesn't exist
+		SelectTaskList(ctx context.Context, filter *TaskListFilter) (*TaskListRow, error)
+		// InsertTaskList insert a single tasklist row
+		// Return TaskOperationConditionFailure if the row already exists
+		InsertTaskList(ctx context.Context, row *TaskListRow) error
+		// UpdateTaskList updates a single tasklist row
+		// Return TaskOperationConditionFailure if the condition doesn't meet
+		UpdateTaskList(ctx context.Context, row *TaskListRow, previousRangeID int64) error
+		// UpdateTaskList updates a single tasklist row, and set an TTL on the record
+		// Return TaskOperationConditionFailure if the condition doesn't meet
+		// Ignore TTL if it's not supported, which becomes exactly the same as UpdateTaskList, but ListTaskList must be
+		// implemented for TaskListScavenger
+		UpdateTaskListWithTTL(ctx context.Context, ttlSeconds int64, row *TaskListRow, previousRangeID int64) error
+		// ListTaskList returns all tasklists.
+		// Noop if TTL is already implemented in other methods
+		ListTaskList(ctx context.Context, pageSize int, nextPageToken []byte) (*ListTaskListResult, error)
+		// DeleteTaskList deletes a single tasklist row
+		// Return TaskOperationConditionFailure if the condition doesn't meet
+		DeleteTaskList(ctx context.Context, filter *TaskListFilter, previousRangeID int64) error
+		// InsertTasks inserts a batch of tasks
+		// Return TaskOperationConditionFailure if the condition doesn't meet
+		InsertTasks(ctx context.Context, tasksToInsert []*TaskRowForInsert, tasklistCondition *TaskListRow) error
+		// SelectTasks return tasks that associated to a tasklist
+		SelectTasks(ctx context.Context, filter *TasksFilter) ([]*TaskRow, error)
+		// DeleteTask delete a batch of tasks
+		// Also return the number of rows deleted -- if it's not supported then ignore the batchSize, and return persistence.UnknownNumRowsAffected
+		RangeDeleteTasks(ctx context.Context, filter *TasksFilter) (rowsDeleted int, err error)
+		// GetTasksCount return the number of tasks
+		GetTasksCount(ctx context.Context, filter *TasksFilter) (int64, error)
 	}
 
-	// HistoryTreeFilter contains the column names within history_tree table that
-	// can be used to filter results through a WHERE clause
-	HistoryTreeFilter struct {
-		ShardID  int
-		TreeID   string
-		BranchID *string
+	/**
+	* WorkflowCRUD is for core data models of workflow execution.
+	*
+	* Recommendation: If possible, use 8 tables(current_workflow, workflow_execution, transfer_task, replication_task, cross_cluster_task, timer_task, buffered_event_list, replication_dlq_task) to implement
+	* current_workflow is to track the currentRunID of a workflowID for ensuring the ID-Uniqueness of Cadence workflows.
+	* 		Each record is for one workflowID
+	* workflow_execution is to store the core data of workflow execution.
+	*		Each record is for one runID(workflow execution run).
+	* Different from TaskCRUD, transfer_task, replication_task, cross_cluster_task, timer_task are all internal background tasks within Cadence server.
+	* transfer_task is to store the background tasks that need to be processed by historyEngine, right after the transaction.
+	*		There are lots of usage in historyEngine, like creating activity/childWF/etc task, and updating search attributes, etc.
+	* replication_task is to store also background tasks that need to be processed right after the transaction,
+	*		but only for CrossDC(XDC) replication feature. Each record is a replication task generated from a source cluster.
+	*		Replication task stores a reference to a batch of history events(see historyCRUD).
+	* timer_task is to store the durable timers that will fire in the future. Therefore this table should be indexed by the firingTime.
+	*		The durable timers are not only for workflow timers, but also for all kinds of timeouts, and workflow deletion, etc.
+	* cross_cluster_task is to store also background tasks that need to be processed right after the transaction, and only for
+	*		but only for cross cluster feature. Each record is a cross cluster task generated for a target cluster.
+	*		CrossCluster task stores information similar to TransferTask.
+	* buffered_event_list is to store the buffered event of a workflow execution
+	* The above 7 tables will be required to execute transaction write with the condition of shard record from ShardCRUD.
+	* replication_dlq_task is DeadLetterQueue when target cluster pulling and applying replication task. Each record represents
+	*		a task for a target cluster.
+	*
+	* Significant columns:
+	* current_workflow: partition key(shardID), range key(domainID, workflowID), query condition column(currentRunID, lastWriteVersion, state)
+	* workflow_execution: partition key(shardID), range key(domainID, workflowID, runID), query condition column(nextEventID)
+	* transfer_task: partition key(shardID), range key(taskID)
+	* replication_task: partition key(shardID), range key(taskID)
+	* cross_cluster_task: partition key(shardID), range key(clusterName, taskID)
+	* timer_task: partition key(shardID), range key(visibilityTimestamp)
+	* buffered_event_list: partition key(shardID), range key(domainID, workflowID, runID)
+	* replication_dlq_task: partition key(shardID), range key(clusterName, taskID)
+	*
+	* NOTE: Cassandra limits lightweight transaction to execute within one table. So the 6 tables + shard table are implemented
+	*   	via a single table `execution` in Cassandra, using `rowType` to differentiate the 7 tables, and using `permanentRunID`
+	*		to differentiate current_workflow and workflow_execution
+	* NOTE: Cassandra implementation uses 6 maps to store activityInfo, timerInfo, childWorkflowInfo, requestCancels,
+	*		signalInfo and signalRequestedInfo.Those should be fine to be stored in the same record as its workflow_execution.
+	*		However, signalInfo stores the in progress signal data. It may be too big for a single record. For example, DynamoDB
+	*		requires 400KB of a record. In that case, it may be better to have a separate table for signalInfo.
+	* NOTE: Cassandra implementation of workflow_execution uses maps without "frozen". This has the advantage of deleting activity/timer/childWF/etc
+	*		by keys. The equivalent of this may require a read before overwriting the existing. Eg. [ "act1": <some data>, "act2": <some data>]
+	*		When deleting "act1", Cassandra implementation can delete without read. If storing in the same record of workflwo_execution,
+	*		it will require to read the whole activityInfo map for deleting.
+	* NOTE: Optional optimization: taskID that are writing into internal tasks(transfer/replication/crossCluster) are immutable and always increasing.
+	*		So it is possible to write the tasks in a single record, indexing by the lowest or highest taskID.
+	*		This approach can't be used by timerTasks as timers are ordered by visibilityTimestamp.
+	*		This is useful for DynamoDB because a transaction cannot contain more than 25 unique items.
+	*
+	 */
+	WorkflowCRUD interface {
+		// InsertWorkflowExecutionWithTasks is for creating a new workflow execution record. Within a transaction, it also:
+		// 1. Create or update the record of current_workflow with the same workflowID, based on CurrentWorkflowExecutionWriteMode,
+		//		and also check if the condition is met.
+		// 2. Create the workflow_execution record, including basic info and 6 maps(activityInfoMap, timerInfoMap,
+		//		childWorkflowInfoMap, signalInfoMap and signalRequestedIDs)
+		// 3. Create history tasks
+		// 4. Create workflow requests for requests deduplication
+		// 5. Check if the condition of shard rangeID is met
+		// The API returns error if there is any. If any of the condition is not met, returns WorkflowOperationConditionFailure
+		InsertWorkflowExecutionWithTasks(
+			ctx context.Context,
+			requests *WorkflowRequestsWriteRequest,
+			currentWorkflowRequest *CurrentWorkflowWriteRequest,
+			execution *WorkflowExecutionRequest,
+			tasksByCategory map[persistence.HistoryTaskCategory][]*HistoryMigrationTask,
+			activeClusterSelectionPolicyRow *ActiveClusterSelectionPolicyRow,
+			shardCondition *ShardCondition,
+		) error
+
+		// UpdateWorkflowExecutionWithTasks is for updating a new workflow execution record.
+		// Within a transaction, it also:
+		// 1. If currentWorkflowRequest is not nil, Update the record of current_workflow with the same workflowID, based on CurrentWorkflowExecutionWriteMode,
+		//		and also check if the condition is met.
+		// 2. Update mutatedExecution as workflow_execution record, including basic info and 6 maps(activityInfoMap, timerInfoMap,
+		//		childWorkflowInfoMap, signalInfoMap and signalRequestedIDs)
+		// 3. if insertedExecution is not nil, then also insert a new workflow_execution record including basic info and add to 6 maps:
+		// 		(activityInfoMap, timerInfoMap, childWorkflowInfoMap, signalInfoMap and signalRequestedIDs)
+		//      Also insert activeClusterSelectionPolicyRow if it is not nil corresponding to the new execution
+		// 4. if resetExecution is not nil, then also update the workflow_execution record including basic info and reset/override 6 maps(activityInfoMap, timerInfoMap,
+		//		childWorkflowInfoMap, signalInfoMap and signalRequestedIDs
+		// 5. Create history tasks
+		// 6. Create workflow requests for requests deduplication
+		// 7. Check if the condition of shard rangeID is met
+		// The API returns error if there is any. If any of the condition is not met, returns WorkflowOperationConditionFailure
+		UpdateWorkflowExecutionWithTasks(
+			ctx context.Context,
+			requests *WorkflowRequestsWriteRequest,
+			currentWorkflowRequest *CurrentWorkflowWriteRequest,
+			mutatedExecution *WorkflowExecutionRequest,
+			insertedExecution *WorkflowExecutionRequest,
+			activeClusterSelectionPolicyRow *ActiveClusterSelectionPolicyRow,
+			resetExecution *WorkflowExecutionRequest,
+			tasksByCategory map[persistence.HistoryTaskCategory][]*HistoryMigrationTask,
+			shardCondition *ShardCondition,
+		) error
+
+		// current_workflow table
+		// Return the current_workflow row
+		SelectCurrentWorkflow(ctx context.Context, shardID int, domainID, workflowID string) (*CurrentWorkflowRow, error)
+		// Paging through all current_workflow rows in a shard
+		SelectAllCurrentWorkflows(ctx context.Context, shardID int, pageToken []byte, pageSize int) ([]*persistence.CurrentWorkflowExecution, []byte, error)
+		// Delete the current_workflow row, if currentRunIDCondition is met
+		DeleteCurrentWorkflow(ctx context.Context, shardID int, domainID, workflowID, currentRunIDCondition string) error
+
+		// workflow_execution table
+		// Return the workflow execution row
+		SelectWorkflowExecution(ctx context.Context, shardID int, domainID, workflowID, runID string) (*WorkflowExecution, error)
+		// Paging through all  workflow execution rows in a shard
+		SelectAllWorkflowExecutions(ctx context.Context, shardID int, pageToken []byte, pageSize int) ([]*persistence.InternalListConcreteExecutionsEntity, []byte, error)
+		// Return whether or not an execution is existing.
+		IsWorkflowExecutionExists(ctx context.Context, shardID int, domainID, workflowID, runID string) (bool, error)
+		// Delete the workflow execution row
+		DeleteWorkflowExecution(ctx context.Context, shardID int, domainID, workflowID, runID string) error
+		// Read the workflow_timer_tasks set from the execution row
+		SelectWorkflowTimerTasks(ctx context.Context, shardID int, domainID, workflowID, runID string) ([]persistence.HistoryTaskKey, error)
+
+		// transfer_task table
+		// within a shard, paging through transfer tasks order by taskID(ASC), filtered by minTaskID(inclusive) and maxTaskID(exclusive)
+		SelectTransferTasksOrderByTaskID(ctx context.Context, shardID, pageSize int, pageToken []byte, inclusiveMinTaskID, exclusiveMaxTaskID int64) ([]*HistoryMigrationTask, []byte, error)
+		// delete one or more transfer tasks; multi-task calls are batched into a single LoggedBatch
+		DeleteTransferTask(ctx context.Context, shardID int, keys []persistence.HistoryTaskKey) error
+		// delete a range of transfer tasks
+		RangeDeleteTransferTasks(ctx context.Context, shardID int, inclusiveBeginTaskID, exclusiveEndTaskID int64) error
+
+		// timer_task table
+		// within a shard, paging through timer tasks order by taskID(ASC), filtered by visibilityTimestamp
+		SelectTimerTasksOrderByVisibilityTime(ctx context.Context, shardID, pageSize int, pageToken []byte, inclusiveMinTime, exclusiveMaxTime time.Time) ([]*HistoryMigrationTask, []byte, error)
+		// delete one or more timer tasks; multi-task calls are batched into a single LoggedBatch
+		DeleteTimerTask(ctx context.Context, shardID int, keys []persistence.HistoryTaskKey) error
+		// delete a range of timer tasks
+		RangeDeleteTimerTasks(ctx context.Context, shardID int, inclusiveMinTime, exclusiveMaxTime time.Time) error
+
+		// replication_task table
+		// within a shard, paging through replication tasks order by taskID(ASC), filtered by minTaskID(inclusive) and maxTaskID(exclusive)
+		SelectReplicationTasksOrderByTaskID(ctx context.Context, shardID, pageSize int, pageToken []byte, inclusiveMinTaskID, exclusiveMaxTaskID int64) ([]*HistoryMigrationTask, []byte, error)
+		// delete one or more replication tasks; multi-task calls are batched into a single LoggedBatch
+		DeleteReplicationTask(ctx context.Context, shardID int, keys []persistence.HistoryTaskKey) error
+		// delete a range of replication tasks
+		RangeDeleteReplicationTasks(ctx context.Context, shardID int, exclusiveEndTaskID int64) error
+		// insert replication task with shard condition check
+		InsertReplicationTask(ctx context.Context, tasks []*HistoryMigrationTask, condition ShardCondition) error
+		// insert history tasks (e.g. transfer/timer) by category, chunked into CAS batches with shard condition check
+		InsertHistoryTasks(ctx context.Context, tasksByCategory map[persistence.HistoryTaskCategory][]*HistoryMigrationTask, currentTimeStamp time.Time, condition ShardCondition) error
+
+		// cross_cluster_task table
+		// delete a single transfer task
+		DeleteCrossClusterTask(ctx context.Context, shardID int, targetCluster string, taskID int64) error
+
+		// replication_dlq_task
+		// insert a new replication task to DLQ
+		InsertReplicationDLQTask(ctx context.Context, shardID int, sourceCluster string, task *HistoryMigrationTask) error
+		// within a shard, for a sourceCluster, paging through replication tasks order by taskID(ASC), filtered by minTaskID(inclusive) and maxTaskID(exclusive)
+		SelectReplicationDLQTasksOrderByTaskID(ctx context.Context, shardID int, sourceCluster string, pageSize int, pageToken []byte, inclusiveMinTaskID, exclusiveMaxTaskID int64) ([]*HistoryMigrationTask, []byte, error)
+		// return the DLQ size
+		SelectReplicationDLQTasksCount(ctx context.Context, shardID int, sourceCluster string) (int64, error)
+		// delete a single replication DLQ task
+		DeleteReplicationDLQTask(ctx context.Context, shardID int, sourceCluster string, taskID int64) error
+		// delete a range of replication DLQ tasks
+		RangeDeleteReplicationDLQTasks(ctx context.Context, shardID int, sourceCluster string, inclusiveBeginTaskID, exclusiveEndTaskID int64) error
+
+		// select the active cluster selection policy
+		SelectActiveClusterSelectionPolicy(ctx context.Context, shardID int, domainID, wfID, rID string) (*ActiveClusterSelectionPolicyRow, error)
+		// delete the active cluster selection policy row
+		DeleteActiveClusterSelectionPolicy(ctx context.Context, shardID int, domainID, workflowID, runID string) error
+	}
+
+	/***
+	* ConfigStoreCRUD is for storing dynamic configuration parameters
+	*
+	* Recommendation: one table
+	*
+	* Significant columns:
+	* domain: partition key(row_type), range key(version)
+	 */
+	ConfigStoreCRUD interface {
+		// InsertConfig insert a config entry with version. Return nosqlplugin.NewConditionFailure if the same version of the row_type is existing
+		InsertConfig(ctx context.Context, row *persistence.InternalConfigStoreEntry) error
+		// SelectLatestConfig returns the config entry of the row_type with the largest(latest) version value
+		SelectLatestConfig(ctx context.Context, rowType int) (*persistence.InternalConfigStoreEntry, error)
+	}
+
+	/***
+	* DomainAuditLogCRUD is for domain audit log storage system
+	*
+	* Recommendation: use one table
+	*
+	* Significant columns:
+	* domain_audit_log: partition key(domainID, operationType), range key(createdTime DESC, eventID ASC)
+	*
+	* Note: This table is used for audit trail of domain changes, storing the before/after state
+	* of domains along with metadata about who made the change and when.
+	 */
+	DomainAuditLogCRUD interface {
+		// InsertDomainAuditLog inserts a new audit log entry for a domain operation
+		// Return error if there is any failure
+		InsertDomainAuditLog(ctx context.Context, row *DomainAuditLogRow) error
+
+		// SelectDomainAuditLogs returns audit log entries for a domain and operation type
+		// Returns paginated results ordered by created_time DESC, event_id ASC
+		SelectDomainAuditLogs(ctx context.Context, filter *DomainAuditLogFilter) ([]*DomainAuditLogRow, []byte, error)
+	}
+
+	/***
+	* SemaphoreMetadataCRUD is for distributed semaphore metadata (config) storage
+	*
+	* Recommendation: use one table
+	*
+	* Significant columns:
+	* semaphore_metadata: partition key(domainID), range key(semaphoreName)
+	 */
+	SemaphoreMetadataCRUD interface {
+		// InsertSemaphoreMetadata creates a semaphore's metadata with a conflict-detecting
+		// INSERT ... IF NOT EXISTS; it must return a ConditionFailure if the semaphore already exists.
+		// Returns a ConditionFailure if the semaphore already exists.
+		InsertSemaphoreMetadata(ctx context.Context, row *SemaphoreMetadataRow) error
+
+		// SelectSemaphoreMetadata returns a single semaphore's metadata by (domainID, semaphoreName).
+		SelectSemaphoreMetadata(ctx context.Context, domainID, semaphoreName string) (*SemaphoreMetadataRow, error)
+
+		// SelectSemaphoreMetadataByDomain returns the semaphores in a domain, paginated.
+		SelectSemaphoreMetadataByDomain(ctx context.Context, filter *SemaphoreMetadataFilter) ([]*SemaphoreMetadataRow, []byte, error)
+	}
+
+	/***
+	* SemaphoreTokenCRUD is for the per-token ownership of distributed semaphores.
+	*
+	* Significant columns:
+	* semaphore_tokens: partition key(domainID, semaphoreName, bucket), range key(type, tokenID, ownerID)
+	 */
+	SemaphoreTokenCRUD interface {
+		// GrantSemaphoreToken gives a token to an owner with one atomic write that:
+		//   - sets the token row's holder to the owner, only if the token is free or has no row yet
+		//     (a token's first grant creates its row)
+		//   - adds the owner row, only if the owner holds no token yet
+		//
+		// A refused grant is not an error. The returned Outcome is one of:
+		//   - SemaphoreGrantApplied: the owner now holds the token
+		//   - SemaphoreGrantAlreadyHeld: the owner already holds a token, named by HeldToken
+		//   - SemaphoreGrantSlotTaken: another owner holds the token
+		//
+		// The caller must pass a token id the bucket owns. A missing row is created, not refused,
+		// so a token id outside the bucket's range is not caught here.
+		GrantSemaphoreToken(ctx context.Context, row *SemaphoreOwnershipRow) (SemaphoreGrantResult, error)
+
+		// ReleaseSemaphoreToken frees a slot via a guarded batch: it clears the
+		// token row's holder only if the slot is still held by this owner, and
+		// deletes the matching owner row in the same atomic batch. Returns
+		// applied == false (not an error) for a best-effort no-op.
+		ReleaseSemaphoreToken(ctx context.Context, row *SemaphoreOwnershipRow) (bool, error)
+
+		// SelectSemaphoreOwnershipByToken reads a slot's forward row (holder) by token id.
+		SelectSemaphoreOwnershipByToken(ctx context.Context, domainID, semaphoreName string, bucket, tokenID int) (*SemaphoreOwnershipRow, error)
+
+		// SelectSemaphoreOwnershipByOwner reads a hold's reverse row (held token) by owner id.
+		SelectSemaphoreOwnershipByOwner(ctx context.Context, domainID, semaphoreName string, bucket int, ownerID string) (*SemaphoreOwnershipRow, error)
+
+		// SelectSemaphoreOwnershipsByBucket scans a bucket partition (both row kinds), paginated.
+		SelectSemaphoreOwnershipsByBucket(ctx context.Context, filter *SemaphoreOwnershipFilter) ([]*SemaphoreOwnershipRow, []byte, error)
+	}
+
+	/***
+	* SemaphoreTaskCRUD is the per-bucket FIFO task queue of a distributed semaphore.
+	*
+	* It mirrors the base tasks table: a control row (type=1, sentinel task_id) carries the
+	* range_id single-writer fence and the ack_level cursor; task rows (type=0) are the queued
+	* acquire requests, ordered by task_id.
+	*
+	* Significant columns:
+	* control row: partition key(domainID, semaphoreName, bucket), condition column(range_id), carries ack_level
+	* task row:  partition key(domainID, semaphoreName, bucket), range key(task_id)
+	 */
+	SemaphoreTaskCRUD interface {
+		// SelectSemaphoreTaskControlRow returns a bucket's control row (range_id, ack_level).
+		// Returns IsNotFoundError if the bucket has no control row yet.
+		SelectSemaphoreTaskControlRow(ctx context.Context, filter *SemaphoreTaskControlFilter) (*SemaphoreTaskControlRow, error)
+
+		// InsertSemaphoreTaskControlRow inserts the control row with INSERT ... IF NOT EXISTS.
+		// Returns a TaskOperationConditionFailure if the control row already exists.
+		InsertSemaphoreTaskControlRow(ctx context.Context, row *SemaphoreTaskControlRow) error
+
+		// UpdateSemaphoreTaskControlRow updates range_id and ack_level, fenced by previousRangeID (LWT CAS).
+		// Returns a TaskOperationConditionFailure if range_id no longer equals previousRangeID.
+		UpdateSemaphoreTaskControlRow(ctx context.Context, row *SemaphoreTaskControlRow, previousRangeID int64) error
+
+		// InsertSemaphoreTasks inserts a batch of task rows in a single LWT batch fenced by the
+		// control row's range_id. Returns a TaskOperationConditionFailure on fence mismatch.
+		// All tasks must belong to the bucket named by controlCondition: a conditional batch
+		// can only span one partition. An empty slice is a no-op and does not check the fence.
+		InsertSemaphoreTasks(ctx context.Context, tasks []*SemaphoreTaskRow, controlCondition *SemaphoreTaskControlRow) error
+
+		// SelectSemaphoreTasks returns task rows in (ExclusiveMinTaskID, InclusiveMaxTaskID], paged by BatchSize.
+		SelectSemaphoreTasks(ctx context.Context, filter *SemaphoreTasksFilter) ([]*SemaphoreTaskRow, error)
+
+		// RangeDeleteSemaphoreTasks deletes task rows in (ExclusiveMinTaskID, InclusiveMaxTaskID].
+		// Returns persistence.UnknownNumRowsAffected when the backend cannot report the count.
+		RangeDeleteSemaphoreTasks(ctx context.Context, filter *SemaphoreTasksFilter) (rowsDeleted int, err error)
+
+		// GetSemaphoreTasksCount returns the number of task rows with task_id > ExclusiveMinTaskID.
+		GetSemaphoreTasksCount(ctx context.Context, filter *SemaphoreTasksFilter) (int64, error)
+	}
+
+	/***
+	 * HistoryDLQTaskCRUD is for the history task dead-letter queue.
+	 *
+	 * Recommendation: use a dedicated history_task_dlq table, partitioned by
+	 * (shard_id, domain_id, cluster_attribute_scope, cluster_attribute_name).
+	 */
+	HistoryDLQTaskCRUD interface {
+		// InsertHistoryDLQTaskRow writes a task to the history DLQ.
+		InsertHistoryDLQTaskRow(ctx context.Context, task *HistoryDLQTaskRow) error
+		// SelectHistoryDLQTaskRows reads paginated tasks from the history DLQ within the given bounds.
+		// Returns the rows and a next-page token (nil when no more pages remain).
+		SelectHistoryDLQTaskRows(ctx context.Context, filter HistoryDLQTaskFilter) ([]*HistoryDLQTaskRow, []byte, error)
+		// RangeDeleteHistoryDLQTaskRows deletes all tasks up to and including the given ack-level bounds.
+		RangeDeleteHistoryDLQTaskRows(ctx context.Context, filter HistoryDLQTaskRangeDeleteFilter) error
+		// SelectHistoryDLQAckLevelRows reads ack-level rows for a shard.
+		// Optional filter fields (DomainID, ClusterAttributeScope, ClusterAttributeName) narrow the result when non-empty.
+		SelectHistoryDLQAckLevelRows(ctx context.Context, filter HistoryDLQAckLevelFilter) ([]*HistoryDLQAckLevelRow, error)
+		// InsertOrUpdateHistoryDLQAckLevelRow upserts a single ack-level row.
+		InsertOrUpdateHistoryDLQAckLevelRow(ctx context.Context, row *HistoryDLQAckLevelRow) error
+		// InsertHistoryDLQAckLevelIfNotExistsRow writes a sentinel ack-level row only when
+		// no row for this (shard, domain, scope, name, task_category) already exists.
+		// Both outcomes (created or already present) are successful.
+		InsertHistoryDLQAckLevelIfNotExistsRow(ctx context.Context, row *HistoryDLQAckLevelRow) error
 	}
 )

@@ -24,30 +24,50 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/uber/cadence/common/log"
+	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/service/history/task"
 )
 
-type (
-	processingQueueCollection struct {
-		level       int
-		queues      []ProcessingQueue
-		activeQueue ProcessingQueue
-	}
-)
+type processingQueueCollection struct {
+	level       int
+	queues      []ProcessingQueue
+	activeQueue ProcessingQueue
+}
 
 // NewProcessingQueueCollection creates a new collection for non-overlapping queues
-func NewProcessingQueueCollection(
-	level int,
-	queues []ProcessingQueue,
-) ProcessingQueueCollection {
+func NewProcessingQueueCollection(level int, queues []ProcessingQueue) ProcessingQueueCollection {
 	sortProcessingQueue(queues)
 	queueCollection := &processingQueueCollection{
 		level:  level,
 		queues: queues,
 	}
 	queueCollection.resetActiveQueue()
-
 	return queueCollection
+}
+
+func newProcessingQueueCollections(
+	processingQueueStates []ProcessingQueueState,
+	logger log.Logger,
+	metricsClient metrics.Client,
+) []ProcessingQueueCollection {
+	processingQueuesMap := make(map[int][]ProcessingQueue) // level -> state
+	for _, queueState := range processingQueueStates {
+		processingQueuesMap[queueState.Level()] = append(processingQueuesMap[queueState.Level()], NewProcessingQueue(
+			queueState,
+			logger,
+			metricsClient,
+		))
+	}
+	processingQueueCollections := make([]ProcessingQueueCollection, 0, len(processingQueuesMap))
+	for level, queues := range processingQueuesMap {
+		processingQueueCollections = append(processingQueueCollections, NewProcessingQueueCollection(
+			level,
+			queues,
+		))
+	}
+
+	return processingQueueCollections
 }
 
 func (c *processingQueueCollection) Level() int {
@@ -62,16 +82,30 @@ func (c *processingQueueCollection) ActiveQueue() ProcessingQueue {
 	return c.activeQueue
 }
 
-func (c *processingQueueCollection) AddTasks(
-	tasks map[task.Key]task.Task,
-	newReadLevel task.Key,
-) {
+func (c *processingQueueCollection) AddTasks(tasks map[task.Key]task.Task, newReadLevel task.Key) {
 	activeQueue := c.ActiveQueue()
 	activeQueue.AddTasks(tasks, newReadLevel)
 
 	if taskKeyEquals(activeQueue.State().ReadLevel(), activeQueue.State().MaxLevel()) {
 		c.resetActiveQueue()
 	}
+}
+
+func (c *processingQueueCollection) GetTask(key task.Key) (task.Task, error) {
+	for _, queue := range c.Queues() {
+		if task, err := queue.GetTask(key); err == nil {
+			return task, nil
+		}
+	}
+	return nil, errTaskNotFound
+}
+
+func (c *processingQueueCollection) GetTasks() []task.Task {
+	var outstandingTask []task.Task
+	for _, queue := range c.Queues() {
+		outstandingTask = append(outstandingTask, queue.GetTasks()...)
+	}
+	return outstandingTask
 }
 
 func (c *processingQueueCollection) UpdateAckLevels() (task.Key, int) {
@@ -102,9 +136,7 @@ func (c *processingQueueCollection) UpdateAckLevels() (task.Key, int) {
 	return minAckLevel, totalPendingTasks
 }
 
-func (c *processingQueueCollection) Split(
-	policy ProcessingQueueSplitPolicy,
-) []ProcessingQueue {
+func (c *processingQueueCollection) Split(policy ProcessingQueueSplitPolicy) []ProcessingQueue {
 	if len(c.queues) == 0 {
 		return nil
 	}
@@ -131,9 +163,7 @@ func (c *processingQueueCollection) Split(
 	return nextLevelQueues
 }
 
-func (c *processingQueueCollection) Merge(
-	incomingQueues []ProcessingQueue,
-) {
+func (c *processingQueueCollection) Merge(incomingQueues []ProcessingQueue) {
 	sortProcessingQueue(incomingQueues)
 
 	newQueues := make([]ProcessingQueue, 0, len(c.queues)+len(incomingQueues))
@@ -198,9 +228,7 @@ func (c *processingQueueCollection) resetActiveQueue() {
 	c.activeQueue = nil
 }
 
-func sortProcessingQueue(
-	queues []ProcessingQueue,
-) {
+func sortProcessingQueue(queues []ProcessingQueue) {
 	sort.Slice(queues, func(i, j int) bool {
 		if queues[i].State().Level() == queues[j].State().Level() {
 			return queues[i].State().AckLevel().Less(queues[j].State().AckLevel())

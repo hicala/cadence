@@ -34,11 +34,14 @@ import (
 	"github.com/iancoleman/strcase"
 	"github.com/jmoiron/sqlx"
 
+	"github.com/uber/cadence/common/config"
+	"github.com/uber/cadence/common/persistence"
 	pt "github.com/uber/cadence/common/persistence/persistence-tests"
 	"github.com/uber/cadence/common/persistence/sql"
+	"github.com/uber/cadence/common/persistence/sql/sqldriver"
 	"github.com/uber/cadence/common/persistence/sql/sqlplugin"
-	"github.com/uber/cadence/common/service/config"
 	"github.com/uber/cadence/environment"
+	schemamysql "github.com/uber/cadence/schema/mysql"
 )
 
 const (
@@ -66,31 +69,36 @@ func init() {
 	sql.RegisterPlugin(PluginName, &plugin{})
 }
 
-// CreateDB initialize the db object
+// CreateDB initialize the DB object
 func (p *plugin) CreateDB(cfg *config.SQL) (sqlplugin.DB, error) {
-	conn, err := p.createDBConnection(cfg)
-	if err != nil {
-		return nil, err
-	}
-	db := newDB(conn, nil)
-	return db, nil
+	return p.createDB(cfg)
 }
 
-// CreateAdminDB initialize the db object
+// CreateAdminDB initialize the adminDb object
 func (p *plugin) CreateAdminDB(cfg *config.SQL) (sqlplugin.AdminDB, error) {
-	conn, err := p.createDBConnection(cfg)
+	return p.createDB(cfg)
+}
+
+func (p *plugin) GetSchema(dbType persistence.DBType) (persistence.Schema, error) {
+	switch dbType {
+	case persistence.DBTypeDefault:
+		return schemamysql.DefaultSchema, nil
+	case persistence.DBTypeVisibility:
+		return schemamysql.VisibilitySchema, nil
+	default:
+		return nil, fmt.Errorf("unknown db type: %v", dbType)
+	}
+}
+
+func (p *plugin) createDB(cfg *config.SQL) (*DB, error) {
+	driver, err := sqldriver.CreateDBConnections(cfg, p.createSingleDBConn, sqldriver.NoopClose)
 	if err != nil {
 		return nil, err
 	}
-	db := newDB(conn, nil)
-	return db, nil
+	return NewDB(driver, cfg.NumShards, NewConverter()), nil
 }
 
-// CreateDBConnection creates a returns a reference to a logical connection to the
-// underlying SQL database. The returned object is to tied to a single
-// SQL database and the object can be used to perform CRUD operations on
-// the tables in the database
-func (p *plugin) createDBConnection(cfg *config.SQL) (*sqlx.DB, error) {
+func (p *plugin) createSingleDBConn(cfg *config.SQL) (*sqlx.DB, error) {
 	err := registerTLSConfig(cfg)
 	if err != nil {
 		return nil, err
@@ -110,7 +118,7 @@ func (p *plugin) createDBConnection(cfg *config.SQL) (*sqlx.DB, error) {
 		db.SetConnMaxLifetime(cfg.MaxConnLifetime)
 	}
 
-	// Maps struct names in CamelCase to snake without need for db struct tags.
+	// Maps struct names in CamelCase to snake without need for DB struct tags.
 	db.MapperFunc(strcase.ToSnake)
 	return db, nil
 }
@@ -127,7 +135,8 @@ func registerTLSConfig(cfg *config.SQL) error {
 
 	// TODO: create a way to set MinVersion and CipherSuites via cfg.
 	tlsConfig := &tls.Config{
-		ServerName: host,
+		ServerName:         host,
+		InsecureSkipVerify: !cfg.TLS.EnableHostVerification,
 	}
 
 	if cfg.TLS.CaFile != "" {
@@ -169,7 +178,11 @@ func registerTLSConfig(cfg *config.SQL) error {
 	// If no `tls` connect attribute is provided then we override it to our newly registered tls config automatically.
 	// This allows users to simply provide a tls config without needing to remember to also set the connect attribute
 	if cfg.ConnectAttributes["tls"] == "" {
-		cfg.ConnectAttributes["tls"] = customTLSName
+		if cfg.TLS.SSLMode != "" {
+			cfg.ConnectAttributes["tls"] = cfg.TLS.SSLMode
+		} else {
+			cfg.ConnectAttributes["tls"] = customTLSName
+		}
 	}
 
 	return nil
@@ -235,21 +248,19 @@ func sanitizeAttr(inkey string, invalue string) (string, string) {
 	}
 }
 
-const (
-	testUser      = "uber"
-	testPassword  = "uber"
-	testSchemaDir = "schema/mysql/v57"
-)
-
-// GetTestClusterOption return test options
-func GetTestClusterOption() *pt.TestBaseOptions {
-	return &pt.TestBaseOptions{
-		SQLDBPluginName: PluginName,
-		DBUsername:      testUser,
-		DBPassword:      testPassword,
-		DBHost:          environment.GetMySQLAddress(),
-		DBPort:          environment.GetMySQLPort(),
-		SchemaDir:       testSchemaDir,
-		StoreType:       config.StoreTypeSQL,
+func GetTestConfig() (config.DataStore, error) {
+	port, err := environment.GetMySQLPort()
+	if err != nil {
+		return config.DataStore{}, err
 	}
+	return config.DataStore{
+		SQL: &config.SQL{
+			PluginName:   PluginName,
+			User:         environment.GetMySQLUser(),
+			Password:     environment.GetMySQLPassword(),
+			ConnectAddr:  fmt.Sprintf("%s:%d", environment.GetMySQLAddress(), port),
+			DatabaseName: pt.GenerateRandomDBName(),
+			NumShards:    4,
+		},
+	}, nil
 }

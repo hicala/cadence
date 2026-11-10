@@ -25,18 +25,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"github.com/uber-go/tally"
+	"go.uber.org/mock/gomock"
 
-	h "github.com/uber/cadence/.gen/go/history"
-	"github.com/uber/cadence/common/collection"
+	"github.com/uber/cadence/common/dynamicconfig/dynamicproperties"
 	"github.com/uber/cadence/common/log"
-	"github.com/uber/cadence/common/log/loggerimpl"
+	"github.com/uber/cadence/common/log/testlogger"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/persistence"
-	"github.com/uber/cadence/common/service/dynamicconfig"
+	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/service/history/config"
 	"github.com/uber/cadence/service/history/shard"
 	"github.com/uber/cadence/service/history/task"
@@ -51,10 +50,9 @@ type (
 		mockShard         *shard.TestContext
 		mockTaskProcessor *task.MockProcessor
 
-		redispatchQueue collection.Queue
-		logger          log.Logger
-		metricsClient   metrics.Client
-		metricsScope    metrics.Scope
+		logger        log.Logger
+		metricsClient metrics.Client
+		metricsScope  metrics.Scope
 	}
 )
 
@@ -68,6 +66,7 @@ func (s *processorBaseSuite) SetupTest() {
 
 	s.controller = gomock.NewController(s.T())
 	s.mockShard = shard.NewTestContext(
+		s.T(),
 		s.controller,
 		&persistence.ShardInfo{
 			ShardID:          10,
@@ -78,9 +77,8 @@ func (s *processorBaseSuite) SetupTest() {
 	)
 	s.mockTaskProcessor = task.NewMockProcessor(s.controller)
 
-	s.redispatchQueue = collection.NewConcurrentQueue()
-	s.logger = loggerimpl.NewDevelopmentForTest(s.Suite)
-	s.metricsClient = metrics.NewClient(tally.NoopScope, metrics.History)
+	s.logger = testlogger.New(s.Suite.T())
+	s.metricsClient = metrics.NewClient(tally.NoopScope, metrics.History, metrics.MigrationConfig{})
 	s.metricsScope = s.metricsClient.Scope(metrics.TransferQueueProcessorScope)
 }
 
@@ -207,8 +205,9 @@ func (s *processorBaseSuite) TestUpdateAckLevel_Transfer_ProcessedFinished() {
 		queueShutdownFn,
 	)
 
-	processFinished, err := processorBase.updateAckLevel()
+	processFinished, ackLevel, err := processorBase.updateAckLevel()
 	s.NoError(err)
+	s.Nil(ackLevel)
 	s.True(processFinished)
 	s.True(queueShutdown)
 }
@@ -248,10 +247,11 @@ func (s *processorBaseSuite) TestUpdateAckLevel_Tranfer_ProcessNotFinished() {
 		nil,
 	)
 
-	processFinished, err := processorBase.updateAckLevel()
+	processFinished, ackLevel, err := processorBase.updateAckLevel()
 	s.NoError(err)
 	s.False(processFinished)
 	s.Equal(int64(2), updateAckLevel)
+	s.Equal(int64(2), ackLevel.(transferTaskKey).taskID)
 }
 
 func (s *processorBaseSuite) TestUpdateAckLevel_Timer_UpdateAckLevel() {
@@ -283,11 +283,12 @@ func (s *processorBaseSuite) TestUpdateAckLevel_Timer_UpdateAckLevel() {
 	}
 
 	timerQueueProcessBase := s.newTestProcessorBase(processingQueueStates, nil, updateTransferAckLevelFn, nil, nil)
-	timerQueueProcessBase.options.EnablePersistQueueStates = dynamicconfig.GetBoolPropertyFn(true)
-	processFinished, err := timerQueueProcessBase.updateAckLevel()
+	timerQueueProcessBase.options.EnablePersistQueueStates = dynamicproperties.GetBoolPropertyFn(true)
+	processFinished, ackLevel, err := timerQueueProcessBase.updateAckLevel()
 	s.NoError(err)
 	s.False(processFinished)
 	s.Equal(now.Add(-5*time.Second), updateAckLevel)
+	s.Equal(now.Add(-5*time.Second), ackLevel.(timerTaskKey).visibilityTimestamp)
 }
 
 func (s *processorBaseSuite) TestUpdateAckLevel_Timer_UpdateQueueStates() {
@@ -313,18 +314,72 @@ func (s *processorBaseSuite) TestUpdateAckLevel_Timer_UpdateQueueStates() {
 		),
 	}
 
-	var pState []*h.ProcessingQueueState
+	var pState []*types.ProcessingQueueState
 	updateProcessingQueueStates := func(states []ProcessingQueueState) error {
 		pState = convertToPersistenceTimerProcessingQueueStates(states)
 		return nil
 	}
 
 	timerQueueProcessBase := s.newTestProcessorBase(processingQueueStates, nil, nil, updateProcessingQueueStates, nil)
-	timerQueueProcessBase.options.EnablePersistQueueStates = dynamicconfig.GetBoolPropertyFn(true)
-	processFinished, err := timerQueueProcessBase.updateAckLevel()
+	timerQueueProcessBase.options.EnablePersistQueueStates = dynamicproperties.GetBoolPropertyFn(true)
+	processFinished, ackLevel, err := timerQueueProcessBase.updateAckLevel()
 	s.NoError(err)
 	s.False(processFinished)
 	s.Equal(len(processingQueueStates), len(pState))
+	s.Equal(now.Add(-5*time.Second), ackLevel.(timerTaskKey).visibilityTimestamp)
+}
+
+func (s *processorBaseSuite) TestInitializeSplitPolicy_Disabled() {
+	processorBase := s.newTestProcessorBase(
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+
+	splitPolicy := processorBase.initializeSplitPolicy(nil)
+	s.Nil(splitPolicy, "got non-nil split policy, want nil because it's disabled")
+}
+
+func (s *processorBaseSuite) TestInitializeSplitPolicy_Enabled() {
+	processorBase := s.newTestProcessorBase(nil, nil, nil, nil, nil)
+
+	processorBase.options.EnableSplit = dynamicproperties.GetBoolPropertyFn(true)
+
+	splitPolicy := processorBase.initializeSplitPolicy(nil)
+	s.NotNil(splitPolicy, "got nil split policy, want non-nil")
+	aggPolicy, ok := splitPolicy.(*aggregatedSplitPolicy)
+	s.True(ok, "got %T, want *aggregatedSplitPolicy", splitPolicy)
+	s.Equal(3, len(aggPolicy.policies), "got %v policies, want 3: pending task policy, stuck task policy and random split policy", len(aggPolicy.policies))
+}
+
+func (s *processorBaseSuite) TestResetProcessingQueueStates() {
+	processingQueueStates := []ProcessingQueueState{
+		NewProcessingQueueState(
+			0,
+			newTransferTaskKey(0),
+			newTransferTaskKey(100),
+			NewDomainFilter(map[string]struct{}{"testDomain1": {}}, true),
+		),
+		NewProcessingQueueState(
+			1,
+			newTransferTaskKey(0),
+			newTransferTaskKey(100),
+			NewDomainFilter(map[string]struct{}{"testDomain1": {}}, false),
+		),
+		NewProcessingQueueState(
+			0,
+			newTransferTaskKey(100),
+			newTransferTaskKey(1000),
+			NewDomainFilter(map[string]struct{}{}, true),
+		),
+	}
+	processorBase := s.newTestProcessorBase(processingQueueStates, nil, nil, nil, nil)
+
+	res, err := processorBase.resetProcessingQueueStates()
+	s.NoError(err, "no error expected")
+	s.Equal(ActionTypeReset, res.ActionType, "got action type %v, want %v", res.ActionType, ActionTypeReset)
 }
 
 func (s *processorBaseSuite) newTestProcessorBase(

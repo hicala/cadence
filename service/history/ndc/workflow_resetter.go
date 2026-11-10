@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-//go:generate mockgen -copyright_file ../../../LICENSE -package $GOPACKAGE -source $GOFILE -destination workflow_resetter_mock.go
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination workflow_resetter_mock.go
 
 package ndc
 
@@ -119,7 +119,11 @@ func (r *workflowResetterImpl) ResetWorkflow(
 		return nil, err
 	}
 
-	resetBranchToken, err := r.getResetBranchToken(ctx, baseBranchToken, baseLastEventID)
+	resetBranchTokenFn := func() ([]byte, error) {
+		resetBranchToken, err := r.getResetBranchToken(ctx, baseBranchToken, baseLastEventID)
+
+		return resetBranchToken, err
+	}
 
 	requestID := uuid.New()
 	rebuildMutableState, rebuiltHistorySize, err := r.stateRebuilder.Rebuild(
@@ -138,7 +142,7 @@ func (r *workflowResetterImpl) ResetWorkflow(
 			r.workflowID,
 			r.newRunID,
 		),
-		resetBranchToken,
+		resetBranchTokenFn,
 		requestID,
 	)
 	if err != nil {
@@ -171,31 +175,36 @@ func (r *workflowResetterImpl) getBaseBranchToken(
 		baseWorkflow.GetReleaseFn()(retError)
 	}()
 
-	baseVersionHistories := baseWorkflow.GetMutableState().GetVersionHistories()
-	index, err := baseVersionHistories.FindFirstVersionHistoryIndexByItem(
-		persistence.NewVersionHistoryItem(baseLastEventID, baseLastEventVersion),
-	)
-	if err != nil {
-		// the base event and incoming event are from different branch
-		// only re-replicate the gap on the incoming branch
-		// the base branch event will eventually arrived
-		return nil, newNDCRetryTaskErrorWithHint(
-			resendOnResetWorkflowMessage,
-			r.domainID,
-			r.workflowID,
-			r.newRunID,
-			nil,
-			nil,
-			common.Int64Ptr(incomingFirstEventID),
-			common.Int64Ptr(incomingFirstEventVersion),
-		)
-	}
-
-	baseVersionHistory, err := baseVersionHistories.GetVersionHistory(index)
+	mutableState := baseWorkflow.GetMutableState()
+	branchToken, err := mutableState.GetCurrentBranchToken()
 	if err != nil {
 		return nil, err
 	}
-	return baseVersionHistory.GetBranchToken(), nil
+	baseVersionHistories := mutableState.GetVersionHistories()
+	if baseVersionHistories != nil {
+
+		_, baseVersionHistory, err := baseVersionHistories.FindFirstVersionHistoryByItem(
+			persistence.NewVersionHistoryItem(baseLastEventID, baseLastEventVersion),
+		)
+		if err != nil {
+			// the base event and incoming event are from different branch
+			// only re-replicate the gap on the incoming branch
+			// the base branch event will eventually arrived
+			return nil, newNDCRetryTaskErrorWithHint(
+				resendOnResetWorkflowMessage,
+				r.domainID,
+				r.workflowID,
+				r.newRunID,
+				nil,
+				nil,
+				common.Int64Ptr(incomingFirstEventID),
+				common.Int64Ptr(incomingFirstEventVersion),
+			)
+		}
+
+		branchToken = baseVersionHistory.GetBranchToken()
+	}
+	return branchToken, nil
 }
 
 func (r *workflowResetterImpl) getResetBranchToken(
@@ -206,6 +215,10 @@ func (r *workflowResetterImpl) getResetBranchToken(
 
 	// fork a new history branch
 	shardID := r.shard.GetShardID()
+	domainName, err := r.shard.GetDomainCache().GetDomainName(r.domainID)
+	if err != nil {
+		return nil, err
+	}
 	resp, err := r.historyV2Manager.ForkHistoryBranch(
 		ctx,
 		&persistence.ForkHistoryBranchRequest{
@@ -213,6 +226,7 @@ func (r *workflowResetterImpl) getResetBranchToken(
 			ForkNodeID:      baseLastEventID + 1,
 			Info:            persistence.BuildHistoryGarbageCleanupInfo(r.domainID, r.workflowID, r.newRunID),
 			ShardID:         common.IntPtr(shardID),
+			DomainName:      domainName,
 		},
 	)
 	if err != nil {

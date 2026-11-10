@@ -23,12 +23,13 @@ package archiver
 import (
 	"context"
 
-	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common/cache"
 	"github.com/uber/cadence/common/cluster"
+	"github.com/uber/cadence/common/dynamicconfig"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/types"
 )
 
 type (
@@ -56,17 +57,18 @@ type (
 
 	// GetHistoryResponse is the response of Get archived history
 	GetHistoryResponse struct {
-		HistoryBatches []*shared.History
+		HistoryBatches []*types.History
 		NextPageToken  []byte
 	}
 
 	// HistoryBootstrapContainer contains components needed by all history Archiver implementations
 	HistoryBootstrapContainer struct {
-		HistoryV2Manager persistence.HistoryManager
-		Logger           log.Logger
-		MetricsClient    metrics.Client
-		ClusterMetadata  cluster.Metadata
-		DomainCache      cache.DomainCache
+		HistoryV2Manager  persistence.HistoryManager
+		Logger            log.Logger
+		MetricsClient     metrics.Client
+		ClusterMetadata   cluster.Metadata
+		DomainCache       cache.DomainCache
+		DynamicCollection *dynamicconfig.Collection
 	}
 
 	// HistoryArchiver is used to archive history and read archived history
@@ -78,10 +80,11 @@ type (
 
 	// VisibilityBootstrapContainer contains components needed by all visibility Archiver implementations
 	VisibilityBootstrapContainer struct {
-		Logger          log.Logger
-		MetricsClient   metrics.Client
-		ClusterMetadata cluster.Metadata
-		DomainCache     cache.DomainCache
+		Logger            log.Logger
+		MetricsClient     metrics.Client
+		ClusterMetadata   cluster.Metadata
+		DomainCache       cache.DomainCache
+		DynamicCollection *dynamicconfig.Collection
 	}
 
 	// ArchiveVisibilityRequest is request to Archive single workflow visibility record
@@ -94,9 +97,9 @@ type (
 		StartTimestamp     int64
 		ExecutionTimestamp int64
 		CloseTimestamp     int64
-		CloseStatus        shared.WorkflowExecutionCloseStatus
+		CloseStatus        types.WorkflowExecutionCloseStatus
 		HistoryLength      int64
-		Memo               *shared.Memo
+		Memo               *types.Memo
 		SearchAttributes   map[string]string
 		HistoryArchivalURI string
 	}
@@ -111,7 +114,7 @@ type (
 
 	// QueryVisibilityResponse is the response of querying archived visibility records
 	QueryVisibilityResponse struct {
-		Executions    []*shared.WorkflowExecutionInfo
+		Executions    []*types.WorkflowExecutionInfo
 		NextPageToken []byte
 	}
 

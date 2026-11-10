@@ -18,17 +18,22 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+//go:generate mockgen -package $GOPACKAGE -destination versionChecker_mock.go -self_package github.com/uber/cadence/common/client github.com/uber/cadence/common/client VersionChecker
+
 package client
 
 import (
 	"context"
 	"fmt"
 
+	"github.com/gogo/protobuf/jsonpb"
 	"github.com/hashicorp/go-version"
+	apiv1 "github.com/uber/cadence-idl/go/proto/api/v1"
 	"go.uber.org/yarpc"
 
 	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
+	"github.com/uber/cadence/common/types"
 )
 
 const (
@@ -40,11 +45,11 @@ const (
 	CLI = "cli"
 
 	// SupportedGoSDKVersion indicates the highest go sdk version server will accept requests from
-	SupportedGoSDKVersion = "1.6.0"
+	SupportedGoSDKVersion = "1.7.0"
 	// SupportedJavaSDKVersion indicates the highest java sdk version server will accept requests from
-	SupportedJavaSDKVersion = "1.6.0"
+	SupportedJavaSDKVersion = "1.5.0"
 	// SupportedCLIVersion indicates the highest cli version server will accept requests from
-	SupportedCLIVersion = "1.6.0"
+	SupportedCLIVersion = "1.7.0"
 
 	// StickyQueryUnknownImplConstraints indicates the minimum client version of an unknown client type which supports StickyQuery
 	StickyQueryUnknownImplConstraints = "1.0.0"
@@ -56,20 +61,34 @@ const (
 	GoWorkerConsistentQueryVersion = "1.5.0"
 	// JavaWorkerRawHistoryQueryVersion indicates the minimum client version of the java worker which supports RawHistoryQuery
 	JavaWorkerRawHistoryQueryVersion = "1.3.0"
+	// JavaWorkerConsistentQueryVersion indicates the minimum client version of the java worker which supports ConsistentQuery
+	JavaWorkerConsistentQueryVersion = "1.5.0"
 	// GoWorkerRawHistoryQueryVersion indicates the minimum client version of the go worker which supports RawHistoryQuery
 	GoWorkerRawHistoryQueryVersion = "1.6.0"
 	// CLIRawHistoryQueryVersion indicates the minimum CLI version of the go worker which supports RawHistoryQuery
 	// Note: cli uses go client feature version
 	CLIRawHistoryQueryVersion = "1.6.0"
+	// Go Client version that supports WorkflowExecutionAlreadyCompleted Error
+	CLIWorkflowAlreadyCompletedVersion = "1.7.0"
+	// Go Client version that supports WorkflowExecutionAlreadyCompleted Error
+	GoWorkerWorkflowAlreadyCompletedVersion = "1.7.0"
+	// Java Client version that supports WorkflowExecutionAlreadyCompleted Error
+	JavaWorkflowAlreadyCompletedVersion = "1.4.0"
 
-	stickyQuery     = "sticky-query"
-	consistentQuery = "consistent-query"
-	rawHistoryQuery = "send-raw-workflow-history"
+	stickyQuery                   = "sticky-query"
+	consistentQuery               = "consistent-query"
+	rawHistoryQuery               = "send-raw-workflow-history"
+	workflowAlreadyCompletedError = "workflow-already-completed"
 )
 
 var (
 	// ErrUnknownFeature indicates that requested feature is not known by version checker
-	ErrUnknownFeature = &shared.BadRequestError{Message: "Unknown feature"}
+	ErrUnknownFeature = &types.BadRequestError{Message: "Unknown feature"}
+
+	// DefaultCLIFeatureFlags is the default FeatureFlags used by Cadence CLI
+	DefaultCLIFeatureFlags = apiv1.FeatureFlags{
+		WorkflowExecutionAlreadyCompletedErrorEnabled: true,
+	}
 )
 
 type (
@@ -80,6 +99,7 @@ type (
 		SupportsStickyQuery(clientImpl string, clientFeatureVersion string) error
 		SupportsConsistentQuery(clientImpl string, clientFeatureVersion string) error
 		SupportsRawHistoryQuery(clientImpl string, clientFeatureVersion string) error
+		SupportsWorkflowAlreadyCompletedError(clientImpl string, clientFeatureVersion string, featureFlags apiv1.FeatureFlags) error
 	}
 
 	versionChecker struct {
@@ -89,20 +109,49 @@ type (
 	}
 )
 
+// FeatureFlagsHeader returns the serialized version of the FeatureFlags
+func FeatureFlagsHeader(featureFlags apiv1.FeatureFlags) string {
+	var marshaler jsonpb.Marshaler
+	serialized, err := marshaler.MarshalToString(&featureFlags)
+	if err != nil {
+		// fail open and return empty feature flags
+		return ""
+	}
+	return serialized
+}
+
+// GetFeatureFlagsFromHeader returns FeatureFlags from yarpc headers
+func GetFeatureFlagsFromHeader(call *yarpc.Call) apiv1.FeatureFlags {
+	featureFlagsSerialized := call.Header(common.ClientFeatureFlagsHeaderName)
+
+	var featureFlags apiv1.FeatureFlags
+	err := jsonpb.UnmarshalString(featureFlagsSerialized, &featureFlags)
+	if err != nil {
+		// fail open and return empty feature flags
+		return apiv1.FeatureFlags{}
+	}
+
+	return featureFlags
+}
+
 // NewVersionChecker constructs a new VersionChecker
 func NewVersionChecker() VersionChecker {
 	supportedFeatures := map[string]map[string]version.Constraints{
 		GoSDK: {
-			stickyQuery:     mustNewConstraint(fmt.Sprintf(">=%v", GoWorkerStickyQueryVersion)),
-			consistentQuery: mustNewConstraint(fmt.Sprintf(">=%v", GoWorkerConsistentQueryVersion)),
-			rawHistoryQuery: mustNewConstraint(fmt.Sprintf(">=%v", GoWorkerRawHistoryQueryVersion)),
+			stickyQuery:                   mustNewConstraint(fmt.Sprintf(">=%v", GoWorkerStickyQueryVersion)),
+			consistentQuery:               mustNewConstraint(fmt.Sprintf(">=%v", GoWorkerConsistentQueryVersion)),
+			rawHistoryQuery:               mustNewConstraint(fmt.Sprintf(">=%v", GoWorkerRawHistoryQueryVersion)),
+			workflowAlreadyCompletedError: mustNewConstraint(fmt.Sprintf(">=%v", GoWorkerWorkflowAlreadyCompletedVersion)),
 		},
 		JavaSDK: {
-			stickyQuery:     mustNewConstraint(fmt.Sprintf(">=%v", JavaWorkerStickyQueryVersion)),
-			rawHistoryQuery: mustNewConstraint(fmt.Sprintf(">=%v", JavaWorkerRawHistoryQueryVersion)),
+			stickyQuery:                   mustNewConstraint(fmt.Sprintf(">=%v", JavaWorkerStickyQueryVersion)),
+			consistentQuery:               mustNewConstraint(fmt.Sprintf(">=%v", JavaWorkerConsistentQueryVersion)),
+			rawHistoryQuery:               mustNewConstraint(fmt.Sprintf(">=%v", JavaWorkerRawHistoryQueryVersion)),
+			workflowAlreadyCompletedError: mustNewConstraint(fmt.Sprintf(">=%v", JavaWorkflowAlreadyCompletedVersion)),
 		},
 		CLI: {
-			rawHistoryQuery: mustNewConstraint(fmt.Sprintf(">=%v", CLIRawHistoryQueryVersion)),
+			rawHistoryQuery:               mustNewConstraint(fmt.Sprintf(">=%v", CLIRawHistoryQueryVersion)),
+			workflowAlreadyCompletedError: mustNewConstraint(fmt.Sprintf(">=%v", CLIWorkflowAlreadyCompletedVersion)),
 		},
 	}
 	supportedClients := map[string]version.Constraints{
@@ -136,12 +185,10 @@ func (vc *versionChecker) ClientSupported(ctx context.Context, enableClientVersi
 		return nil
 	}
 	version, err := version.NewVersion(clientFeatureVersion)
-	if err != nil {
-		return &shared.ClientVersionNotSupportedError{FeatureVersion: clientFeatureVersion, ClientImpl: clientImpl, SupportedVersions: supportedVersions.String()}
+	if err != nil || !supportedVersions.Check(version) {
+		return &types.ClientVersionNotSupportedError{FeatureVersion: clientFeatureVersion, ClientImpl: clientImpl, SupportedVersions: supportedVersions.String()}
 	}
-	if !supportedVersions.Check(version) {
-		return &shared.ClientVersionNotSupportedError{FeatureVersion: clientFeatureVersion, ClientImpl: clientImpl, SupportedVersions: supportedVersions.String()}
-	}
+
 	return nil
 }
 
@@ -154,13 +201,24 @@ func (vc *versionChecker) SupportsStickyQuery(clientImpl string, clientFeatureVe
 // SupportsConsistentQuery returns error if consistent query is not supported otherwise nil.
 // In case client version lookup fails assume the client does not support feature.
 func (vc *versionChecker) SupportsConsistentQuery(clientImpl string, clientFeatureVersion string) error {
+
 	return vc.featureSupported(clientImpl, clientFeatureVersion, consistentQuery)
 }
 
-// SupportsSendRawWorkflowHistory returns error if raw history query is not supported otherwise nil.
+// SupportsRawHistoryQuery returns error if raw history query is not supported otherwise nil.
 // In case client version lookup fails assume the client does not support feature.
 func (vc *versionChecker) SupportsRawHistoryQuery(clientImpl string, clientFeatureVersion string) error {
 	return vc.featureSupported(clientImpl, clientFeatureVersion, rawHistoryQuery)
+}
+
+// Returns error if workflowAlreadyCompletedError is not supported otherwise nil.
+// In case client version lookup fails assume the client does not support feature.
+// NOTE: Enabling this error will break customer code handling the workflow errors in their workflow
+func (vc *versionChecker) SupportsWorkflowAlreadyCompletedError(clientImpl string, clientFeatureVersion string, featureFlags apiv1.FeatureFlags) error {
+	if featureFlags.WorkflowExecutionAlreadyCompletedErrorEnabled {
+		return vc.featureSupported(clientImpl, clientFeatureVersion, workflowAlreadyCompletedError)
+	}
+	return &shared.FeatureNotEnabledError{FeatureFlag: "WorkflowExecutionAlreadyCompletedErrorEnabled"}
 }
 
 func (vc *versionChecker) featureSupported(clientImpl string, clientFeatureVersion string, feature string) error {
@@ -170,15 +228,15 @@ func (vc *versionChecker) featureSupported(clientImpl string, clientFeatureVersi
 	if clientImpl == "" {
 		switch feature {
 		case consistentQuery:
-		case rawHistoryQuery:
-			return &shared.ClientVersionNotSupportedError{FeatureVersion: clientFeatureVersion}
+		case rawHistoryQuery, workflowAlreadyCompletedError:
+			return &types.ClientVersionNotSupportedError{FeatureVersion: clientFeatureVersion}
 		case stickyQuery:
 			version, err := version.NewVersion(clientFeatureVersion)
 			if err != nil {
-				return &shared.ClientVersionNotSupportedError{FeatureVersion: clientFeatureVersion}
+				return &types.ClientVersionNotSupportedError{FeatureVersion: clientFeatureVersion}
 			}
 			if !vc.stickyQueryUnknownImplConstraints.Check(version) {
-				return &shared.ClientVersionNotSupportedError{FeatureVersion: clientFeatureVersion, SupportedVersions: vc.stickyQueryUnknownImplConstraints.String()}
+				return &types.ClientVersionNotSupportedError{FeatureVersion: clientFeatureVersion, SupportedVersions: vc.stickyQueryUnknownImplConstraints.String()}
 			}
 			return nil
 		default:
@@ -186,22 +244,22 @@ func (vc *versionChecker) featureSupported(clientImpl string, clientFeatureVersi
 		}
 	}
 	if clientFeatureVersion == "" {
-		return &shared.ClientVersionNotSupportedError{ClientImpl: clientImpl, FeatureVersion: clientFeatureVersion}
+		return &types.ClientVersionNotSupportedError{ClientImpl: clientImpl, FeatureVersion: clientFeatureVersion}
 	}
 	implMap, ok := vc.supportedFeatures[clientImpl]
 	if !ok {
-		return &shared.ClientVersionNotSupportedError{ClientImpl: clientImpl, FeatureVersion: clientFeatureVersion}
+		return &types.ClientVersionNotSupportedError{ClientImpl: clientImpl, FeatureVersion: clientFeatureVersion}
 	}
 	supportedVersions, ok := implMap[feature]
 	if !ok {
-		return &shared.ClientVersionNotSupportedError{ClientImpl: clientImpl, FeatureVersion: clientFeatureVersion}
+		return &types.ClientVersionNotSupportedError{ClientImpl: clientImpl, FeatureVersion: clientFeatureVersion}
 	}
 	version, err := version.NewVersion(clientFeatureVersion)
 	if err != nil {
-		return &shared.ClientVersionNotSupportedError{FeatureVersion: clientFeatureVersion, ClientImpl: clientImpl, SupportedVersions: supportedVersions.String()}
+		return &types.ClientVersionNotSupportedError{FeatureVersion: clientFeatureVersion, ClientImpl: clientImpl, SupportedVersions: supportedVersions.String()}
 	}
 	if !supportedVersions.Check(version) {
-		return &shared.ClientVersionNotSupportedError{ClientImpl: clientImpl, FeatureVersion: clientFeatureVersion, SupportedVersions: supportedVersions.String()}
+		return &types.ClientVersionNotSupportedError{ClientImpl: clientImpl, FeatureVersion: clientFeatureVersion, SupportedVersions: supportedVersions.String()}
 	}
 	return nil
 }

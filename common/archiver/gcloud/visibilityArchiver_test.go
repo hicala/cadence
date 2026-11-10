@@ -26,20 +26,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
-
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"github.com/uber-go/tally"
-	"go.uber.org/zap"
+	"go.uber.org/mock/gomock"
 
-	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/archiver"
 	"github.com/uber/cadence/common/archiver/gcloud/connector/mocks"
-	"github.com/uber/cadence/common/log/loggerimpl"
+	"github.com/uber/cadence/common/log/testlogger"
 	"github.com/uber/cadence/common/metrics"
+	"github.com/uber/cadence/common/types"
 )
 
 const (
@@ -49,10 +47,9 @@ const (
 
 func (s *visibilityArchiverSuite) SetupTest() {
 	s.Assertions = require.New(s.T())
-	zapLogger := zap.NewNop()
 	s.container = &archiver.VisibilityBootstrapContainer{
-		Logger:        loggerimpl.NewLogger(zapLogger),
-		MetricsClient: metrics.NewClient(tally.NoopScope, metrics.History),
+		Logger:        testlogger.New(s.T()),
+		MetricsClient: metrics.NewClient(tally.NoopScope, metrics.History, metrics.MigrationConfig{}),
 	}
 	s.expectedVisibilityRecords = []*visibilityRecord{
 		{
@@ -63,7 +60,7 @@ func (s *visibilityArchiverSuite) SetupTest() {
 			WorkflowTypeName: testWorkflowTypeName,
 			StartTimestamp:   1580896574804475000,
 			CloseTimestamp:   1580896575946478000,
-			CloseStatus:      shared.WorkflowExecutionCloseStatusCompleted,
+			CloseStatus:      types.WorkflowExecutionCloseStatusCompleted,
 			HistoryLength:    36,
 		},
 	}
@@ -127,8 +124,6 @@ func (s *visibilityArchiverSuite) TestArchive_Fail_InvalidVisibilityURI() {
 	s.NoError(err)
 	storageWrapper := &mocks.Client{}
 	storageWrapper.On("Exist", mock.Anything, URI, "").Return(true, nil).Times(1)
-	mockCtrl := gomock.NewController(s.T())
-	defer mockCtrl.Finish()
 
 	visibilityArchiver := newVisibilityArchiver(s.container, storageWrapper)
 	s.NoError(err)
@@ -149,8 +144,6 @@ func (s *visibilityArchiverSuite) TestQuery_Fail_InvalidVisibilityURI() {
 	s.NoError(err)
 	storageWrapper := &mocks.Client{}
 	storageWrapper.On("Exist", mock.Anything, URI, "").Return(true, nil).Times(1)
-	mockCtrl := gomock.NewController(s.T())
-	defer mockCtrl.Finish()
 
 	visibilityArchiver := newVisibilityArchiver(s.container, storageWrapper)
 	s.NoError(err)
@@ -171,8 +164,6 @@ func (s *visibilityArchiverSuite) TestVisibilityArchive() {
 	storageWrapper := &mocks.Client{}
 	storageWrapper.On("Exist", mock.Anything, URI, mock.Anything).Return(false, nil)
 	storageWrapper.On("Upload", mock.Anything, URI, mock.Anything, mock.Anything).Return(nil)
-	mockCtrl := gomock.NewController(s.T())
-	defer mockCtrl.Finish()
 
 	visibilityArchiver := newVisibilityArchiver(s.container, storageWrapper)
 	s.NoError(err)
@@ -186,7 +177,7 @@ func (s *visibilityArchiverSuite) TestVisibilityArchive() {
 		StartTimestamp:     time.Now().UnixNano(),
 		ExecutionTimestamp: 0, // workflow without backoff
 		CloseTimestamp:     time.Now().UnixNano(),
-		CloseStatus:        shared.WorkflowExecutionCloseStatusFailed,
+		CloseStatus:        types.WorkflowExecutionCloseStatusFailed,
 		HistoryLength:      int64(101),
 	}
 
@@ -203,7 +194,6 @@ func (s *visibilityArchiverSuite) TestQuery_Fail_InvalidQuery() {
 	visibilityArchiver := newVisibilityArchiver(s.container, storageWrapper)
 	s.NoError(err)
 	mockCtrl := gomock.NewController(s.T())
-	defer mockCtrl.Finish()
 
 	mockParser := NewMockQueryParser(mockCtrl)
 	mockParser.EXPECT().Parse(gomock.Any()).Return(nil, errors.New("invalid query"))
@@ -225,7 +215,6 @@ func (s *visibilityArchiverSuite) TestQuery_Fail_InvalidToken() {
 	visibilityArchiver := newVisibilityArchiver(s.container, storageWrapper)
 	s.NoError(err)
 	mockCtrl := gomock.NewController(s.T())
-	defer mockCtrl.Finish()
 
 	mockParser := NewMockQueryParser(mockCtrl)
 	mockParser.EXPECT().Parse(gomock.Any()).Return(&parsedQuery{
@@ -256,7 +245,6 @@ func (s *visibilityArchiverSuite) TestQuery_Success_NoNextPageToken() {
 	visibilityArchiver := newVisibilityArchiver(s.container, storageWrapper)
 	s.NoError(err)
 	mockCtrl := gomock.NewController(s.T())
-	defer mockCtrl.Finish()
 
 	mockParser := NewMockQueryParser(mockCtrl)
 	dayPrecision := string("Day")
@@ -299,7 +287,6 @@ func (s *visibilityArchiverSuite) TestQuery_Success_SmallPageSize() {
 	visibilityArchiver := newVisibilityArchiver(s.container, storageWrapper)
 	s.NoError(err)
 	mockCtrl := gomock.NewController(s.T())
-	defer mockCtrl.Finish()
 
 	mockParser := NewMockQueryParser(mockCtrl)
 	dayPrecision := string("Day")

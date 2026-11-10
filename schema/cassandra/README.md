@@ -4,8 +4,8 @@ This directory contains the cassandra schema for every keyspace that cadence own
 
 ```
 ./schema
-   - keyspace1/
-   - keyspace2/
+   - visibility/           -- Contains schema for visibility data models
+   - cadence/              -- Contains schema for default data models
         - keyspace.cql     -- Contains the keyspace definition
         - schema.cql       -- Contains the latest & greatest snapshot of the schema for the keyspace
         - versioned
@@ -24,7 +24,7 @@ Q: How do I update existing schema ?
 * Create a new schema version directory under ./schema/keyspace/versioned/vx.x
   * Add a manifest.json
   * Add your changes in a cql file
-* Update the unit test within ./tools/cassandra/updateTask_test.go `TestDryrun` with your version x.x
+* Update the unit test within ./tools/common/schema/updatetask_test.go `TestReadSchemaDirFromEmbeddings` with your version x.x
 * Once you are done with these use the ./cadence-cassandra-tool to update the schema
 
 Q: What's the format of manifest.json

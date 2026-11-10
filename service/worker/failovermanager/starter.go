@@ -26,22 +26,24 @@ import (
 	"github.com/opentracing/opentracing-go"
 	"github.com/uber-go/tally"
 	"go.uber.org/cadence/.gen/go/cadence/workflowserviceclient"
+	"go.uber.org/cadence/activity"
 	"go.uber.org/cadence/worker"
+	"go.uber.org/cadence/workflow"
 
 	"github.com/uber/cadence/client"
-	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/cluster"
+	"github.com/uber/cadence/common/constants"
+	"github.com/uber/cadence/common/dynamicconfig/dynamicproperties"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/metrics"
-	"github.com/uber/cadence/common/service/dynamicconfig"
 )
 
 type (
 
 	// Config defines the configuration for failover
 	Config struct {
-		AdminOperationToken dynamicconfig.StringPropertyFn
+		AdminOperationToken dynamicproperties.StringPropertyFn
 		// ClusterMetadata contains the metadata for this cluster
 		ClusterMetadata cluster.Metadata
 	}
@@ -94,7 +96,20 @@ func (s *FailoverManager) Start() error {
 		BackgroundActivityContext: ctx,
 		Tracer:                    opentracing.GlobalTracer(),
 	}
-	failoverWorker := worker.New(s.svcClient, common.SystemLocalDomainName, TaskListName, workerOpts)
+	failoverWorker := worker.New(s.svcClient, constants.SystemLocalDomainName, TaskListName, workerOpts)
+	failoverWorker.RegisterWorkflowWithOptions(FailoverWorkflow, workflow.RegisterOptions{Name: FailoverWorkflowTypeName})
+	failoverWorker.RegisterWorkflowWithOptions(RebalanceWorkflow, workflow.RegisterOptions{Name: RebalanceWorkflowTypeName})
+	failoverWorker.RegisterActivityWithOptions(FailoverActivity, activity.RegisterOptions{Name: failoverActivityName})
+	failoverWorker.RegisterActivityWithOptions(GetDomainsActivity, activity.RegisterOptions{Name: getDomainsActivityName})
+	failoverWorker.RegisterActivityWithOptions(GetDomainsForRebalanceActivity, activity.RegisterOptions{Name: getRebalanceDomainsActivityName})
+
+	// V2 failover/rebalance workflows. These share a single apply activity (FailoverActivityV2) and
+	// differ only in how they collect domains. They run alongside the V1 workflows during migration.
+	failoverWorker.RegisterWorkflowWithOptions(FailoverWorkflowV2, workflow.RegisterOptions{Name: FailoverWorkflowV2TypeName})
+	failoverWorker.RegisterWorkflowWithOptions(RebalanceWorkflowV2, workflow.RegisterOptions{Name: RebalanceWorkflowV2TypeName})
+	failoverWorker.RegisterActivityWithOptions(FailoverActivityV2, activity.RegisterOptions{Name: failoverActivityV2Name})
+	failoverWorker.RegisterActivityWithOptions(GetDomainsForFailoverV2Activity, activity.RegisterOptions{Name: getDomainsForFailoverV2ActivityName})
+	failoverWorker.RegisterActivityWithOptions(GetDomainsForRebalanceV2Activity, activity.RegisterOptions{Name: getDomainsForRebalanceV2ActivityName})
 	s.worker = failoverWorker
 	return failoverWorker.Start()
 }

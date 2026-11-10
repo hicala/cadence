@@ -26,16 +26,16 @@ import (
 	"fmt"
 	"time"
 
-	workflow "github.com/uber/cadence/.gen/go/shared"
-	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/ndc"
 	"github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/service/history/config"
 	"github.com/uber/cadence/service/history/execution"
 	"github.com/uber/cadence/service/history/shard"
+	"github.com/uber/cadence/service/history/simulation"
 	"github.com/uber/cadence/service/worker/archiver"
 )
 
@@ -48,8 +48,10 @@ type (
 	timerStandbyTaskExecutor struct {
 		*timerTaskExecutorBase
 
-		clusterName     string
-		historyResender ndc.HistoryResender
+		clusterName            string
+		historyResender        ndc.HistoryResender
+		getRemoteClusterNameFn func(context.Context, persistence.Task) (string, error)
+		dlqWriter              TaskDLQWriter
 	}
 )
 
@@ -57,12 +59,13 @@ type (
 func NewTimerStandbyTaskExecutor(
 	shard shard.Context,
 	archiverClient archiver.Client,
-	executionCache *execution.Cache,
+	executionCache execution.Cache,
 	historyResender ndc.HistoryResender,
 	logger log.Logger,
 	metricsClient metrics.Client,
 	clusterName string,
 	config *config.Config,
+	dlqWriter TaskDLQWriter,
 ) Executor {
 	return &timerStandbyTaskExecutor{
 		timerTaskExecutorBase: newTimerTaskExecutorBase(
@@ -75,59 +78,89 @@ func NewTimerStandbyTaskExecutor(
 		),
 		clusterName:     clusterName,
 		historyResender: historyResender,
+		getRemoteClusterNameFn: func(ctx context.Context, taskInfo persistence.Task) (string, error) {
+			if shard.GetConfig().EnableTimerQueueV2(shard.GetShardID()) {
+				return getRemoteClusterName(ctx, shard.GetClusterMetadata().GetCurrentClusterName(), shard.GetActiveClusterManager(), taskInfo)
+			}
+			return clusterName, nil
+		},
+		dlqWriter: dlqWriter,
 	}
 }
 
-func (t *timerStandbyTaskExecutor) Execute(
-	taskInfo Info,
-	shouldProcessTask bool,
-) error {
-
-	timerTask, ok := taskInfo.(*persistence.TimerTaskInfo)
-	if !ok {
-		return errUnexpectedTask
+func (t *timerStandbyTaskExecutor) Execute(task Task) (ExecuteResponse, error) {
+	simulation.LogEvents(simulation.E{
+		EventName:  simulation.EventNameExecuteHistoryTask,
+		Host:       t.shard.GetConfig().HostName,
+		ShardID:    t.shard.GetShardID(),
+		DomainID:   task.GetDomainID(),
+		WorkflowID: task.GetWorkflowID(),
+		RunID:      task.GetRunID(),
+		Payload: map[string]any{
+			"task_category": persistence.HistoryTaskCategoryTimer.Name(),
+			"task_type":     task.GetTaskType(),
+			"task_key":      task.GetTaskKey(),
+		},
+	})
+	scope := getOrCreateDomainTaggedScope(t.shard, GetTimerTaskMetricScope(task.GetTaskType(), false), task.GetDomainID(), t.logger)
+	executeResponse := ExecuteResponse{
+		Scope:        scope,
+		IsActiveTask: false,
 	}
-
-	if !shouldProcessTask &&
-		timerTask.TaskType != persistence.TaskTypeWorkflowTimeout &&
-		timerTask.TaskType != persistence.TaskTypeDeleteHistoryEvent {
-		// guarantee the processing of workflow execution history deletion
-		return nil
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), taskDefaultTimeout)
-	defer cancel()
-
-	switch timerTask.TaskType {
-	case persistence.TaskTypeUserTimer:
-		return t.executeUserTimerTimeoutTask(ctx, timerTask)
-	case persistence.TaskTypeActivityTimeout:
-		return t.executeActivityTimeoutTask(ctx, timerTask)
-	case persistence.TaskTypeDecisionTimeout:
-		return t.executeDecisionTimeoutTask(ctx, timerTask)
-	case persistence.TaskTypeWorkflowTimeout:
-		return t.executeWorkflowTimeoutTask(ctx, timerTask)
-	case persistence.TaskTypeActivityRetryTimer:
-		// retry backoff timer should not get created on passive cluster
-		// TODO: add error logs
-		return nil
-	case persistence.TaskTypeWorkflowBackoffTimer:
-		return t.executeWorkflowBackoffTimerTask(ctx, timerTask)
-	case persistence.TaskTypeDeleteHistoryEvent:
-		return t.executeDeleteHistoryEventTask(ctx, timerTask)
+	switch timerTask := task.GetInfo().(type) {
+	case *persistence.UserTimerTask:
+		ctx, cancel := context.WithTimeout(t.ctx, taskDefaultTimeout)
+		defer cancel()
+		return executeResponse, t.executeUserTimerTimeoutTask(ctx, timerTask)
+	case *persistence.ActivityTimeoutTask:
+		ctx, cancel := context.WithTimeout(t.ctx, taskDefaultTimeout)
+		defer cancel()
+		return executeResponse, t.executeActivityTimeoutTask(ctx, timerTask)
+	case *persistence.DecisionTimeoutTask:
+		ctx, cancel := context.WithTimeout(t.ctx, taskDefaultTimeout)
+		defer cancel()
+		return executeResponse, t.executeDecisionTimeoutTask(ctx, timerTask)
+	case *persistence.WorkflowTimeoutTask:
+		ctx, cancel := context.WithTimeout(t.ctx, taskDefaultTimeout)
+		defer cancel()
+		return executeResponse, t.executeWorkflowTimeoutTask(ctx, timerTask)
+	case *persistence.ActivityRetryTimerTask:
+		t.logger.Warn("Activity retry timer task on standby cluster will be dropped",
+			tag.WorkflowDomainID(timerTask.DomainID),
+			tag.WorkflowID(timerTask.WorkflowID),
+			tag.WorkflowRunID(timerTask.RunID),
+			tag.WorkflowScheduleID(timerTask.EventID),
+			tag.ScheduleAttempt(timerTask.Attempt),
+			tag.TaskVisibilityTimestamp(timerTask.VisibilityTimestamp.UnixNano()),
+		)
+		scope.IncCounter(metrics.TaskDiscarded)
+		return executeResponse, nil
+	case *persistence.WorkflowBackoffTimerTask:
+		ctx, cancel := context.WithTimeout(t.ctx, taskDefaultTimeout)
+		defer cancel()
+		return executeResponse, t.executeWorkflowBackoffTimerTask(ctx, timerTask)
+	case *persistence.SemaphoreAcquireTimeoutTask:
+		ctx, cancel := context.WithTimeout(t.ctx, taskDefaultTimeout)
+		defer cancel()
+		return executeResponse, t.executeSemaphoreAcquireTimeoutTask(ctx, timerTask)
+	case *persistence.DeleteHistoryEventTask:
+		// special timeout for delete history event
+		deleteHistoryEventContext, deleteHistoryEventCancel := context.WithTimeout(t.ctx, time.Duration(t.config.DeleteHistoryEventContextTimeout())*time.Second)
+		defer deleteHistoryEventCancel()
+		return executeResponse, t.executeDeleteHistoryEventTask(deleteHistoryEventContext, timerTask)
 	default:
-		return errUnknownTimerTask
+		return executeResponse, errUnknownTimerTask
 	}
 }
 
 func (t *timerStandbyTaskExecutor) executeUserTimerTimeoutTask(
 	ctx context.Context,
-	timerTask *persistence.TimerTaskInfo,
+	timerTask *persistence.UserTimerTask,
 ) error {
 
 	actionFn := func(ctx context.Context, wfContext execution.Context, mutableState execution.MutableState) (interface{}, error) {
 
-		timerSequence := t.getTimerSequence(mutableState)
+		timerSequence := execution.NewTimerSequence(mutableState)
 
 	Loop:
 		for _, timerSequenceID := range timerSequence.LoadAndSortUserTimers() {
@@ -135,10 +168,10 @@ func (t *timerStandbyTaskExecutor) executeUserTimerTimeoutTask(
 			if !ok {
 				errString := fmt.Sprintf("failed to find in user timer event ID: %v", timerSequenceID.EventID)
 				t.logger.Error(errString)
-				return nil, &workflow.InternalServiceError{Message: errString}
+				return nil, &types.InternalServiceError{Message: errString}
 			}
 
-			if isExpired := timerSequence.IsExpired(
+			if _, isExpired := timerSequence.IsExpired(
 				timerTask.VisibilityTimestamp,
 				timerSequenceID,
 			); isExpired {
@@ -155,21 +188,23 @@ func (t *timerStandbyTaskExecutor) executeUserTimerTimeoutTask(
 	return t.processTimer(
 		ctx,
 		timerTask,
+		timerTask.EventID,
 		actionFn,
 		getStandbyPostActionFn(
+			t.logger,
 			timerTask,
 			t.getCurrentTime,
 			t.config.StandbyTaskMissingEventsResendDelay(),
 			t.config.StandbyTaskMissingEventsDiscardDelay(),
 			t.fetchHistoryFromRemote,
-			standbyTimerTaskPostActionTaskDiscarded,
+			standbyTaskPostActionWriteToDLQ(t.dlqWriter, t.shard, t.config.HistoryTaskDLQMode),
 		),
 	)
 }
 
 func (t *timerStandbyTaskExecutor) executeActivityTimeoutTask(
 	ctx context.Context,
-	timerTask *persistence.TimerTaskInfo,
+	timerTask *persistence.ActivityTimeoutTask,
 ) error {
 
 	// activity heartbeat timer task is a special snowflake.
@@ -186,7 +221,7 @@ func (t *timerStandbyTaskExecutor) executeActivityTimeoutTask(
 
 	actionFn := func(ctx context.Context, wfContext execution.Context, mutableState execution.MutableState) (interface{}, error) {
 
-		timerSequence := t.getTimerSequence(mutableState)
+		timerSequence := execution.NewTimerSequence(mutableState)
 		updateMutableState := false
 
 	Loop:
@@ -195,10 +230,10 @@ func (t *timerStandbyTaskExecutor) executeActivityTimeoutTask(
 			if !ok {
 				errString := fmt.Sprintf("failed to find in memory activity timer: %v", timerSequenceID.EventID)
 				t.logger.Error(errString)
-				return nil, &workflow.InternalServiceError{Message: errString}
+				return nil, &types.InternalServiceError{Message: errString}
 			}
 
-			if isExpired := timerSequence.IsExpired(
+			if _, isExpired := timerSequence.IsExpired(
 				timerTask.VisibilityTimestamp,
 				timerSequenceID,
 			); isExpired {
@@ -223,7 +258,7 @@ func (t *timerStandbyTaskExecutor) executeActivityTimeoutTask(
 		// one heartbeat task was persisted multiple times with different taskIDs due to the retry logic
 		// for updating workflow execution. In that case, only one new heartbeat timeout task should be
 		// created.
-		isHeartBeatTask := timerTask.TimeoutType == int(workflow.TimeoutTypeHeartbeat)
+		isHeartBeatTask := timerTask.TimeoutType == int(types.TimeoutTypeHeartbeat)
 		activityInfo, ok := mutableState.GetActivityInfo(timerTask.EventID)
 		if isHeartBeatTask && ok && activityInfo.LastHeartbeatTimeoutVisibilityInSeconds <= timerTask.VisibilityTimestamp.Unix() {
 			activityInfo.TimerTaskStatus = activityInfo.TimerTaskStatus &^ execution.TimerTaskStatusCreatedHeartbeat
@@ -248,6 +283,8 @@ func (t *timerStandbyTaskExecutor) executeActivityTimeoutTask(
 		// we need to handcraft some of the variables
 		// since the job being done here is update the activity and possibly write a timer task to DB
 		// also need to reset the current version.
+		t.logger.Debugf("executeActivityTimeoutTask calling UpdateCurrentVersion for domain %s, wfID %v, lastWriteVersion %v",
+			timerTask.DomainID, timerTask.WorkflowID, lastWriteVersion)
 		if err := mutableState.UpdateCurrentVersion(lastWriteVersion, true); err != nil {
 			return nil, err
 		}
@@ -259,27 +296,35 @@ func (t *timerStandbyTaskExecutor) executeActivityTimeoutTask(
 	return t.processTimer(
 		ctx,
 		timerTask,
+		timerTask.EventID,
 		actionFn,
 		getStandbyPostActionFn(
+			t.logger,
 			timerTask,
 			t.getCurrentTime,
 			t.config.StandbyTaskMissingEventsResendDelay(),
 			t.config.StandbyTaskMissingEventsDiscardDelay(),
 			t.fetchHistoryFromRemote,
-			standbyTimerTaskPostActionTaskDiscarded,
+			standbyTaskPostActionWriteToDLQ(t.dlqWriter, t.shard, t.config.HistoryTaskDLQMode),
 		),
 	)
 }
 
 func (t *timerStandbyTaskExecutor) executeDecisionTimeoutTask(
 	ctx context.Context,
-	timerTask *persistence.TimerTaskInfo,
+	timerTask *persistence.DecisionTimeoutTask,
 ) error {
 
-	// decision schedule to start timer task is a special snowflake.
-	// the schedule to start timer is for sticky decision, which is
-	// not applicable on the passive cluster
-	if timerTask.TimeoutType == int(workflow.TimeoutTypeScheduleToStart) {
+	// decision schedule to start timer won't be generated for sticky decision,
+	// since sticky is cleared when applying events on passive.
+	// for normal decision, we don't know if a schedule to start timeout timer
+	// is generated or not since it's based on a dynamicconfig. On passive cluster,
+	// a timer task will be generated based on passive cluster's config, however, it
+	// may not match the active cluster.
+	// so we simply ignore the schedule to start timer here as the decision task will be
+	// pushed to matching without any timeout if's not started, and the workflow
+	// can continue execution after failover.
+	if timerTask.TimeoutType == int(types.TimeoutTypeScheduleToStart) {
 		return nil
 	}
 
@@ -301,21 +346,23 @@ func (t *timerStandbyTaskExecutor) executeDecisionTimeoutTask(
 	return t.processTimer(
 		ctx,
 		timerTask,
+		timerTask.EventID,
 		actionFn,
 		getStandbyPostActionFn(
+			t.logger,
 			timerTask,
 			t.getCurrentTime,
 			t.config.StandbyTaskMissingEventsResendDelay(),
 			t.config.StandbyTaskMissingEventsDiscardDelay(),
 			t.fetchHistoryFromRemote,
-			standbyTimerTaskPostActionTaskDiscarded,
+			standbyTaskPostActionWriteToDLQ(t.dlqWriter, t.shard, t.config.HistoryTaskDLQMode),
 		),
 	)
 }
 
 func (t *timerStandbyTaskExecutor) executeWorkflowBackoffTimerTask(
 	ctx context.Context,
-	timerTask *persistence.TimerTaskInfo,
+	timerTask *persistence.WorkflowBackoffTimerTask,
 ) error {
 
 	actionFn := func(ctx context.Context, wfContext execution.Context, mutableState execution.MutableState) (interface{}, error) {
@@ -342,21 +389,23 @@ func (t *timerStandbyTaskExecutor) executeWorkflowBackoffTimerTask(
 	return t.processTimer(
 		ctx,
 		timerTask,
+		0,
 		actionFn,
 		getStandbyPostActionFn(
+			t.logger,
 			timerTask,
 			t.getCurrentTime,
 			t.config.StandbyTaskMissingEventsResendDelay(),
 			t.config.StandbyTaskMissingEventsDiscardDelay(),
 			t.fetchHistoryFromRemote,
-			standbyTimerTaskPostActionTaskDiscarded,
+			standbyTaskPostActionWriteToDLQ(t.dlqWriter, t.shard, t.config.HistoryTaskDLQMode),
 		),
 	)
 }
 
 func (t *timerStandbyTaskExecutor) executeWorkflowTimeoutTask(
 	ctx context.Context,
-	timerTask *persistence.TimerTaskInfo,
+	timerTask *persistence.WorkflowTimeoutTask,
 ) error {
 
 	actionFn := func(ctx context.Context, wfContext execution.Context, mutableState execution.MutableState) (interface{}, error) {
@@ -379,14 +428,56 @@ func (t *timerStandbyTaskExecutor) executeWorkflowTimeoutTask(
 	return t.processTimer(
 		ctx,
 		timerTask,
+		0,
 		actionFn,
 		getStandbyPostActionFn(
+			t.logger,
 			timerTask,
 			t.getCurrentTime,
 			t.config.StandbyTaskMissingEventsResendDelay(),
 			t.config.StandbyTaskMissingEventsDiscardDelay(),
 			t.fetchHistoryFromRemote,
-			standbyTimerTaskPostActionTaskDiscarded,
+			standbyTaskPostActionWriteToDLQ(t.dlqWriter, t.shard, t.config.HistoryTaskDLQMode),
+		),
+	)
+}
+
+func (t *timerStandbyTaskExecutor) executeSemaphoreAcquireTimeoutTask(
+	ctx context.Context,
+	timerTask *persistence.SemaphoreAcquireTimeoutTask,
+) error {
+
+	actionFn := func(ctx context.Context, wfContext execution.Context, mutableState execution.MutableState) (interface{}, error) {
+
+		semaphoreInfo, ok := mutableState.GetSemaphoreInfo(timerTask.EventID)
+		if !ok {
+			return nil, nil
+		}
+		ok, err := verifyTaskVersion(t.shard, t.logger, timerTask.DomainID, semaphoreInfo.Version, timerTask.Version, timerTask)
+		if err != nil || !ok {
+			return nil, err
+		}
+		// The active side recorded the grant before this timer ran, so the grant wins and there is nothing to wait for.
+		if semaphoreInfo.HasToken() {
+			return nil, nil
+		}
+
+		return getHistoryResendInfo(mutableState)
+	}
+
+	return t.processTimer(
+		ctx,
+		timerTask,
+		timerTask.EventID,
+		actionFn,
+		getStandbyPostActionFn(
+			t.logger,
+			timerTask,
+			t.getCurrentTime,
+			t.config.StandbyTaskMissingEventsResendDelay(),
+			t.config.StandbyTaskMissingEventsDiscardDelay(),
+			t.fetchHistoryFromRemote,
+			standbyTaskPostActionWriteToDLQ(t.dlqWriter, t.shard, t.config.HistoryTaskDLQMode),
 		),
 	)
 }
@@ -397,40 +488,34 @@ func (t *timerStandbyTaskExecutor) getStandbyClusterTime() time.Time {
 	return t.shard.GetCurrentTime(t.clusterName).Add(t.shard.GetConfig().StandbyClusterDelay())
 }
 
-func (t *timerStandbyTaskExecutor) getTimerSequence(
-	mutableState execution.MutableState,
-) execution.TimerSequence {
-
-	timeSource := clock.NewEventTimeSource()
-	now := t.getStandbyClusterTime()
-	timeSource.Update(now)
-	return execution.NewTimerSequence(timeSource, mutableState)
-}
-
 func (t *timerStandbyTaskExecutor) processTimer(
 	ctx context.Context,
-	timerTask *persistence.TimerTaskInfo,
+	timerTask persistence.Task,
+	eventID int64,
 	actionFn standbyActionFn,
 	postActionFn standbyPostActionFn,
 ) (retError error) {
 
 	wfContext, release, err := t.executionCache.GetOrCreateWorkflowExecutionWithTimeout(
-		timerTask.DomainID,
+		timerTask.GetDomainID(),
 		getWorkflowExecution(timerTask),
 		taskGetExecutionContextTimeout,
 	)
 	if err != nil {
+		if err == context.DeadlineExceeded {
+			return errWorkflowBusy
+		}
 		return err
 	}
 	defer func() {
-		if retError == ErrTaskRedispatch {
+		if isRedispatchErr(retError) {
 			release(nil)
 		} else {
 			release(retError)
 		}
 	}()
 
-	mutableState, err := loadMutableStateForTimerTask(ctx, wfContext, timerTask, t.metricsClient, t.logger)
+	mutableState, err := loadMutableState(ctx, wfContext, timerTask, t.metricsClient.Scope(metrics.TimerQueueProcessorScope), t.logger, eventID)
 	if err != nil {
 		return err
 	}
@@ -439,13 +524,36 @@ func (t *timerStandbyTaskExecutor) processTimer(
 	}
 
 	if !mutableState.IsWorkflowExecutionRunning() {
+		// TODO: Check if workflow timeout timer comes to this point and then discarded.
 		// workflow already finished, no need to process the timer
 		return nil
 	}
 
 	historyResendInfo, err := actionFn(ctx, wfContext, mutableState)
 	if err != nil {
+		if t.logger.DebugOn() {
+			t.logger.Debug("processTimer got error from actionFn",
+				tag.Error(err),
+				tag.WorkflowID(timerTask.GetWorkflowID()),
+				tag.WorkflowRunID(timerTask.GetRunID()),
+				tag.WorkflowDomainID(timerTask.GetDomainID()),
+				tag.TaskID(timerTask.GetTaskID()),
+				tag.TaskType(int(timerTask.GetTaskType())),
+				tag.Timestamp(timerTask.GetVisibilityTimestamp()),
+			)
+		}
 		return err
+	}
+
+	if t.logger.DebugOn() {
+		t.logger.Debug("processTimer got historyResendInfo from actionFn",
+			tag.WorkflowID(timerTask.GetWorkflowID()),
+			tag.WorkflowRunID(timerTask.GetRunID()),
+			tag.WorkflowDomainID(timerTask.GetDomainID()),
+			tag.TaskID(timerTask.GetTaskID()),
+			tag.TaskType(int(timerTask.GetTaskType())),
+			tag.Timestamp(timerTask.GetVisibilityTimestamp()),
+		)
 	}
 
 	release(nil)
@@ -453,55 +561,83 @@ func (t *timerStandbyTaskExecutor) processTimer(
 }
 
 func (t *timerStandbyTaskExecutor) fetchHistoryFromRemote(
-	_ context.Context,
-	taskInfo Info,
+	ctx context.Context,
+	taskInfo persistence.Task,
 	postActionInfo interface{},
-	log log.Logger,
+	_ log.Logger,
 ) error {
 
 	if postActionInfo == nil {
 		return nil
 	}
 
-	timerTask := taskInfo.(*persistence.TimerTaskInfo)
 	resendInfo := postActionInfo.(*historyResendInfo)
 
 	t.metricsClient.IncCounter(metrics.HistoryRereplicationByTimerTaskScope, metrics.CadenceClientRequests)
+	rereplicationLatencyStart := time.Now()
 	stopwatch := t.metricsClient.StartTimer(metrics.HistoryRereplicationByTimerTaskScope, metrics.CadenceClientLatency)
-	defer stopwatch.Stop()
+	defer func() {
+		stopwatch.Stop()
+		t.metricsClient.Scope(metrics.HistoryRereplicationByTimerTaskScope).ExponentialHistogram(metrics.CadenceClientLatencyHistogram, time.Since(rereplicationLatencyStart))
+	}()
 
-	var err error
+	remoteClusterName, err := t.getRemoteClusterNameFn(ctx, taskInfo)
+	if err != nil {
+		return err
+	}
 	if resendInfo.lastEventID != nil && resendInfo.lastEventVersion != nil {
 		// note history resender doesn't take in a context parameter, there's a separate dynamicconfig for
 		// controlling the timeout for resending history.
 		err = t.historyResender.SendSingleWorkflowHistory(
-			timerTask.DomainID,
-			timerTask.WorkflowID,
-			timerTask.RunID,
+			remoteClusterName,
+			taskInfo.GetDomainID(),
+			taskInfo.GetWorkflowID(),
+			taskInfo.GetRunID(),
 			resendInfo.lastEventID,
 			resendInfo.lastEventVersion,
 			nil,
 			nil,
 		)
 	} else {
-		err = &workflow.InternalServiceError{
-			Message: "timerQueueStandbyProcessor encounter empty historyResendInfo",
+		err = &types.InternalServiceError{
+			Message: fmt.Sprintf("incomplete historyResendInfo: %v", resendInfo),
 		}
 	}
 
 	if err != nil {
 		t.logger.Error("Error re-replicating history from remote.",
 			tag.ShardID(t.shard.GetShardID()),
-			tag.WorkflowDomainID(timerTask.DomainID),
-			tag.WorkflowID(timerTask.WorkflowID),
-			tag.WorkflowRunID(timerTask.RunID),
-			tag.ClusterName(t.clusterName))
+			tag.WorkflowDomainID(taskInfo.GetDomainID()),
+			tag.WorkflowID(taskInfo.GetWorkflowID()),
+			tag.WorkflowRunID(taskInfo.GetRunID()),
+			tag.SourceCluster(remoteClusterName),
+			tag.Error(err),
+		)
+	} else if t.logger.DebugOn() {
+		t.logger.Debug("Successfully re-replicated history from remote.",
+			tag.WorkflowID(taskInfo.GetWorkflowID()),
+			tag.WorkflowRunID(taskInfo.GetRunID()),
+			tag.WorkflowDomainID(taskInfo.GetDomainID()),
+			tag.TaskID(taskInfo.GetTaskID()),
+			tag.TaskType(int(taskInfo.GetTaskType())),
+			tag.SourceCluster(remoteClusterName),
+		)
 	}
 
 	// return error so task processing logic will retry
-	return ErrTaskRedispatch
+	return &redispatchError{Reason: "fetchHistoryFromRemote"}
 }
 
-func (t *timerStandbyTaskExecutor) getCurrentTime() time.Time {
-	return t.shard.GetCurrentTime(t.clusterName)
+func (t *timerStandbyTaskExecutor) getCurrentTime(taskInfo persistence.Task) (time.Time, error) {
+	// the schedule time of a standby task is the time from the active cluster of the task,
+	// for history queue v2, t.clusterName is the current cluster, so we should get remote cluster name of the task
+	// However, this only has an effect when the time skew between the current cluster and the remote cluster is large enough (probably more than 1 minute),
+	// the impact is that the standby task may be discarded too early
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	sourceClusterName, err := t.getRemoteClusterNameFn(ctx, taskInfo)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return t.shard.GetCurrentTime(sourceClusterName), nil
 }

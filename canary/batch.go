@@ -43,7 +43,7 @@ func init() {
 const (
 	// TODO: to get rid of them:
 	//  after batch job has an API, we should use the API: https://github.com/uber/cadence/issues/2225
-	sysBatchWFTypeName        = "cadence-sys-batch-workflow"
+	sysBatchWFTypeName        = "cadence-sys-batch-workflow-v2"
 	systemBatcherTaskListName = "cadence-sys-batcher-tasklist"
 
 	// there are two level, so totally 5*5 + 5 == 30 descendants
@@ -63,7 +63,10 @@ type (
 	}
 )
 
-func batchWorkflow(ctx workflow.Context, scheduledTimeNanos int64, domain string) error {
+func batchWorkflow(ctx workflow.Context, inputScheduledTimeNanos int64) error {
+	scheduledTimeNanos := getScheduledTimeFromInputIfNonZero(ctx, inputScheduledTimeNanos)
+	domain := workflow.GetInfo(ctx).Domain
+
 	profile, err := beginWorkflow(ctx, wfTypeBatch, scheduledTimeNanos)
 	if err != nil {
 		return err
@@ -164,7 +167,7 @@ func batchWorkflowChild(ctx workflow.Context, scheduledTimeNanos int64) error {
 }
 
 func startBatchWorkflow(ctx context.Context, domain, startTime string) error {
-	sdkClient := getContextValue(ctx, ctxKeyActivitySystemClient).(*activityContext).cadence
+	sdkClient := getContextValue(ctx, ctxKeyActivityBatcherClient).(*activityContext).cadence
 
 	params := BatchParams{
 		DomainName: domain,

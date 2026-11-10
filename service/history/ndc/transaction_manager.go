@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-//go:generate mockgen -copyright_file ../../../LICENSE -package $GOPACKAGE -source $GOFILE -destination transaction_manager_mock.go
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination transaction_manager_mock.go
 
 package ndc
 
@@ -28,14 +28,16 @@ import (
 
 	"github.com/pborman/uuid"
 
-	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
-	"github.com/uber/cadence/common/cache"
+	"github.com/uber/cadence/common/activecluster"
 	"github.com/uber/cadence/common/cluster"
+	"github.com/uber/cadence/common/constants"
+	"github.com/uber/cadence/common/definition"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/service/history/execution"
 	"github.com/uber/cadence/service/history/reset"
 	"github.com/uber/cadence/service/history/shard"
@@ -145,16 +147,16 @@ type (
 	}
 
 	transactionManagerImpl struct {
-		shard            shard.Context
-		domainCache      cache.DomainCache
-		executionCache   *execution.Cache
-		clusterMetadata  cluster.Metadata
-		historyV2Manager persistence.HistoryManager
-		serializer       persistence.PayloadSerializer
-		metricsClient    metrics.Client
-		workflowResetter reset.WorkflowResetter
-		eventsReapplier  EventsReapplier
-		logger           log.Logger
+		shard                shard.Context
+		executionCache       execution.Cache
+		clusterMetadata      cluster.Metadata
+		activeClusterManager activecluster.Manager
+		historyV2Manager     persistence.HistoryManager
+		serializer           persistence.PayloadSerializer
+		metricsClient        metrics.Client
+		workflowResetter     reset.WorkflowResetter
+		eventsReapplier      EventsReapplier
+		logger               log.Logger
 
 		createManager transactionManagerForNewWorkflow
 		updateManager transactionManagerForExistingWorkflow
@@ -165,19 +167,19 @@ var _ transactionManager = (*transactionManagerImpl)(nil)
 
 func newTransactionManager(
 	shard shard.Context,
-	executionCache *execution.Cache,
+	executionCache execution.Cache,
 	eventsReapplier EventsReapplier,
 	logger log.Logger,
 ) *transactionManagerImpl {
 
 	transactionManager := &transactionManagerImpl{
-		shard:            shard,
-		domainCache:      shard.GetDomainCache(),
-		executionCache:   executionCache,
-		clusterMetadata:  shard.GetClusterMetadata(),
-		historyV2Manager: shard.GetHistoryManager(),
-		serializer:       shard.GetService().GetPayloadSerializer(),
-		metricsClient:    shard.GetMetricsClient(),
+		shard:                shard,
+		executionCache:       executionCache,
+		clusterMetadata:      shard.GetClusterMetadata(),
+		activeClusterManager: shard.GetActiveClusterManager(),
+		historyV2Manager:     shard.GetHistoryManager(),
+		serializer:           shard.GetService().GetPayloadSerializer(),
+		metricsClient:        shard.GetMetricsClient(),
 		workflowResetter: reset.NewWorkflowResetter(
 			shard,
 			executionCache,
@@ -189,8 +191,8 @@ func newTransactionManager(
 		createManager: nil,
 		updateManager: nil,
 	}
-	transactionManager.createManager = newTransactionManagerForNewWorkflow(transactionManager)
-	transactionManager.updateManager = newTransactionManagerForExistingWorkflow(transactionManager)
+	transactionManager.createManager = newTransactionManagerForNewWorkflow(transactionManager, logger)
+	transactionManager.updateManager = newTransactionManagerForExistingWorkflow(transactionManager, logger)
 	return transactionManager
 }
 
@@ -240,7 +242,7 @@ func (r *transactionManagerImpl) backfillWorkflow(
 		}
 	}()
 
-	if _, err := targetWorkflow.GetContext().PersistNonFirstWorkflowEvents(
+	if _, err := targetWorkflow.GetContext().PersistNonStartWorkflowBatchEvents(
 		ctx,
 		targetWorkflowEvents,
 	); err != nil {
@@ -256,6 +258,13 @@ func (r *transactionManagerImpl) backfillWorkflow(
 		return err
 	}
 
+	r.logger.Debugf("backfillWorkflowEventsReapply calling UpdateWorkflowExecutionWithNew for wfID %s, updateMode %v, current policy %v, new policy %v",
+		targetWorkflow.GetMutableState().GetExecutionInfo().WorkflowID,
+		updateMode,
+		transactionPolicy,
+		nil,
+	)
+
 	return targetWorkflow.GetContext().UpdateWorkflowExecutionWithNew(
 		ctx,
 		now,
@@ -264,6 +273,7 @@ func (r *transactionManagerImpl) backfillWorkflow(
 		nil,
 		transactionPolicy,
 		nil,
+		persistence.CreateWorkflowRequestModeReplicated,
 	)
 }
 
@@ -278,9 +288,12 @@ func (r *transactionManagerImpl) backfillWorkflowEventsReapply(
 		return 0, execution.TransactionPolicyActive, err
 	}
 	isWorkflowRunning := targetWorkflow.GetMutableState().IsWorkflowExecutionRunning()
-	targetWorkflowActiveCluster := r.clusterMetadata.ClusterNameForFailoverVersion(
-		targetWorkflow.GetMutableState().GetDomainEntry().GetFailoverVersion(),
-	)
+	activeClusterSelectionPolicy := targetWorkflow.GetMutableState().GetExecutionInfo().ActiveClusterSelectionPolicy
+	activeClusterInfo, err := r.activeClusterManager.GetActiveClusterInfoByClusterAttribute(ctx, targetWorkflow.GetMutableState().GetExecutionInfo().DomainID, activeClusterSelectionPolicy.GetClusterAttribute())
+	if err != nil {
+		return 0, execution.TransactionPolicyActive, err
+	}
+	targetWorkflowActiveCluster := activeClusterInfo.ActiveClusterName
 	currentCluster := r.clusterMetadata.GetCurrentClusterName()
 	isActiveCluster := targetWorkflowActiveCluster == currentCluster
 
@@ -313,21 +326,34 @@ func (r *transactionManagerImpl) backfillWorkflowEventsReapply(
 		domainID := baseMutableState.GetExecutionInfo().DomainID
 		workflowID := baseMutableState.GetExecutionInfo().WorkflowID
 		baseRunID := baseMutableState.GetExecutionInfo().RunID
+
+		// filter the batch to signals not yet applied to this run. If there are none, skip
+		// the reset, to prevent a new run that runs the last decision of the closed workflow again
+		eventsToReapply := getReapplicableEvents(baseMutableState, targetWorkflowEvents.Events, baseRunID)
+		if len(eventsToReapply) == 0 {
+			// no reset happened, so target workflow is still the current workflow
+			return persistence.UpdateWorkflowModeUpdateCurrent, execution.TransactionPolicyPassive, nil
+		}
+
 		resetRunID := uuid.New()
 		baseRebuildLastEventID := baseMutableState.GetPreviousStartedEventID()
 
 		// TODO when https://github.com/uber/cadence/issues/2420 is finished, remove this block,
 		//  since cannot reapply event to a finished workflow which had no decisions started
-		if baseRebuildLastEventID == common.EmptyEventID {
+		if baseRebuildLastEventID == constants.EmptyEventID {
 			r.logger.Warn("cannot reapply event to a finished workflow",
 				tag.WorkflowDomainID(domainID),
 				tag.WorkflowID(workflowID),
 			)
 			r.metricsClient.IncCounter(metrics.HistoryReapplyEventsScope, metrics.EventReapplySkippedCount)
-			return persistence.UpdateWorkflowModeBypassCurrent, execution.TransactionPolicyPassive, nil
+			// no reset happened, so target workflow is still the current workflow
+			return persistence.UpdateWorkflowModeUpdateCurrent, execution.TransactionPolicyPassive, nil
 		}
 
 		baseVersionHistories := baseMutableState.GetVersionHistories()
+		if baseVersionHistories == nil {
+			return 0, execution.TransactionPolicyActive, execution.ErrMissingVersionHistories
+		}
 		baseCurrentVersionHistory, err := baseVersionHistories.GetCurrentVersionHistory()
 		if err != nil {
 			return 0, execution.TransactionPolicyActive, err
@@ -352,7 +378,8 @@ func (r *transactionManagerImpl) backfillWorkflowEventsReapply(
 			uuid.New(),
 			targetWorkflow,
 			EventsReapplicationResetWorkflowReason,
-			targetWorkflowEvents.Events,
+			eventsToReapply,
+			false,
 		); err != nil {
 			return 0, execution.TransactionPolicyActive, err
 		}
@@ -375,28 +402,52 @@ func (r *transactionManagerImpl) backfillWorkflowEventsReapply(
 	return persistence.UpdateWorkflowModeBypassCurrent, execution.TransactionPolicyPassive, nil
 }
 
+// getReapplicableEvents returns the signal events not yet reapplied to the given run
+func getReapplicableEvents(
+	mutableState execution.MutableState,
+	events []*types.HistoryEvent,
+	runID string,
+) []*types.HistoryEvent {
+	var eventsToReapply []*types.HistoryEvent
+	for _, event := range events {
+		if event.GetEventType() != types.EventTypeWorkflowExecutionSignaled {
+			continue
+		}
+		dedupResource := definition.NewEventReappliedID(runID, event.ID, event.Version)
+		if mutableState.IsResourceDuplicated(dedupResource) {
+			continue
+		}
+		eventsToReapply = append(eventsToReapply, event)
+	}
+	return eventsToReapply
+}
+
 func (r *transactionManagerImpl) checkWorkflowExists(
 	ctx context.Context,
 	domainID string,
 	workflowID string,
 	runID string,
 ) (bool, error) {
-
-	_, err := r.shard.GetExecutionManager().GetWorkflowExecution(
+	domainName, errorDomainName := r.shard.GetDomainCache().GetDomainName(domainID)
+	if errorDomainName != nil {
+		return false, errorDomainName
+	}
+	_, err := r.shard.GetWorkflowExecution(
 		ctx,
 		&persistence.GetWorkflowExecutionRequest{
 			DomainID: domainID,
-			Execution: shared.WorkflowExecution{
-				WorkflowId: common.StringPtr(workflowID),
-				RunId:      common.StringPtr(runID),
+			Execution: types.WorkflowExecution{
+				WorkflowID: workflowID,
+				RunID:      runID,
 			},
+			DomainName: domainName,
 		},
 	)
 
 	switch err.(type) {
 	case nil:
 		return true, nil
-	case *shared.EntityNotExistsError:
+	case *types.EntityNotExistsError:
 		return false, nil
 	default:
 		return false, err
@@ -409,18 +460,24 @@ func (r *transactionManagerImpl) getCurrentWorkflowRunID(
 	workflowID string,
 ) (string, error) {
 
+	domainName, errorDomainName := r.shard.GetDomainCache().GetDomainName(domainID)
+	if errorDomainName != nil {
+		return "", errorDomainName
+	}
 	resp, err := r.shard.GetExecutionManager().GetCurrentExecution(
 		ctx,
 		&persistence.GetCurrentExecutionRequest{
 			DomainID:   domainID,
 			WorkflowID: workflowID,
+			DomainName: domainName,
+			ShardID:    common.Ptr(r.shard.GetShardID()),
 		},
 	)
 
 	switch err.(type) {
 	case nil:
 		return resp.RunID, nil
-	case *shared.EntityNotExistsError:
+	case *types.EntityNotExistsError:
 		return "", nil
 	default:
 		return "", err
@@ -438,9 +495,9 @@ func (r *transactionManagerImpl) loadNDCWorkflow(
 	context, release, err := r.executionCache.GetOrCreateWorkflowExecution(
 		ctx,
 		domainID,
-		shared.WorkflowExecution{
-			WorkflowId: common.StringPtr(workflowID),
-			RunId:      common.StringPtr(runID),
+		types.WorkflowExecution{
+			WorkflowID: workflowID,
+			RunID:      runID,
 		},
 	)
 	if err != nil {
@@ -453,7 +510,7 @@ func (r *transactionManagerImpl) loadNDCWorkflow(
 		release(err)
 		return nil, err
 	}
-	return execution.NewWorkflow(ctx, r.domainCache, r.clusterMetadata, context, msBuilder, release), nil
+	return execution.NewWorkflow(ctx, r.clusterMetadata, context, msBuilder, release, r.logger), nil
 }
 
 func (r *transactionManagerImpl) isWorkflowCurrent(

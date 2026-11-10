@@ -18,28 +18,31 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-//go:generate mockgen -copyright_file ../../../LICENSE -package $GOPACKAGE -source $GOFILE -destination task_fetcher_mock.go  -self_package github.com/uber/cadence/service/history/replication
-
 package replication
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
-	r "github.com/uber/cadence/.gen/go/replicator"
-	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/client"
 	"github.com/uber/cadence/client/admin"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/backoff"
+	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/cluster"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
+	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/quotas"
+	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/service/history/config"
 )
 
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination task_fetcher_mock.go -self_package github.com/uber/cadence/service/history/replication
+
+// TODO: reuse the interface and implementation defined in history/task package
 const (
 	fetchTaskRequestTimeout = 60 * time.Second
 	requestChanBufferSize   = 1000
@@ -51,8 +54,8 @@ type (
 		common.Daemon
 
 		GetSourceCluster() string
-		GetRequestChan() chan<- *request
-		GetRateLimiter() *quotas.DynamicRateLimiter
+		GetRequestChan(shardID int) chan<- *request
+		GetRateLimiter() quotas.Limiter
 	}
 
 	// TaskFetchers is a group of fetchers, one per source DC.
@@ -69,10 +72,16 @@ type (
 		sourceCluster  string
 		config         *config.Config
 		logger         log.Logger
+		metricsScope   metrics.Scope
 		remotePeer     admin.Client
-		rateLimiter    *quotas.DynamicRateLimiter
-		requestChan    chan *request
-		done           chan struct{}
+		rateLimiter    quotas.Limiter
+		timeSource     clock.TimeSource
+		requestChan    []chan *request
+		ctx            context.Context
+		cancelCtx      context.CancelFunc
+		wg             sync.WaitGroup
+
+		fetchAndDistributeTasksFn func(map[int32]*request) error
 	}
 
 	// taskFetchersImpl is a group of fetchers, one per source DC.
@@ -92,33 +101,31 @@ func NewTaskFetchers(
 	config *config.Config,
 	clusterMetadata cluster.Metadata,
 	clientBean client.Bean,
-) TaskFetchers {
-
+	metricsClient metrics.Client,
+) (TaskFetchers, error) {
+	currentCluster := clusterMetadata.GetCurrentClusterName()
 	var fetchers []TaskFetcher
-	for clusterName, info := range clusterMetadata.GetAllClusterInfo() {
-		if !info.Enabled {
-			continue
+	for clusterName := range clusterMetadata.GetRemoteClusterInfo() {
+		remoteFrontendClient, err := clientBean.GetRemoteAdminClient(clusterName)
+		if err != nil {
+			return nil, err
 		}
-
-		currentCluster := clusterMetadata.GetCurrentClusterName()
-		if clusterName != currentCluster {
-			remoteFrontendClient := clientBean.GetRemoteAdminClient(clusterName)
-			fetcher := newReplicationTaskFetcher(
-				logger,
-				clusterName,
-				currentCluster,
-				config,
-				remoteFrontendClient,
-			)
-			fetchers = append(fetchers, fetcher)
-		}
+		fetcher := newReplicationTaskFetcher(
+			logger,
+			clusterName,
+			currentCluster,
+			config,
+			remoteFrontendClient,
+			metricsClient,
+		)
+		fetchers = append(fetchers, fetcher)
 	}
 
 	return &taskFetchersImpl{
 		fetchers: fetchers,
 		status:   common.DaemonStatusInitialized,
 		logger:   logger,
-	}
+	}, nil
 }
 
 // Start starts the fetchers
@@ -130,7 +137,7 @@ func (f *taskFetchersImpl) Start() {
 	for _, fetcher := range f.fetchers {
 		fetcher.Start()
 	}
-	f.logger.Info("Replication task fetchers started.")
+	f.logger.Info("Replication task fetchers started.", tag.Counter(len(f.fetchers)))
 }
 
 // Stop stops the fetchers
@@ -142,7 +149,7 @@ func (f *taskFetchersImpl) Stop() {
 	for _, fetcher := range f.fetchers {
 		fetcher.Stop()
 	}
-	f.logger.Info("Replication task fetchers stopped.")
+	f.logger.Info("Replication task fetchers stopped.", tag.Counter(len(f.fetchers)))
 }
 
 // GetFetchers returns all the fetchers
@@ -157,21 +164,31 @@ func newReplicationTaskFetcher(
 	currentCluster string,
 	config *config.Config,
 	sourceFrontend admin.Client,
+	metricsClient metrics.Client,
 ) TaskFetcher {
+	ctx, cancel := context.WithCancel(context.Background())
 
-	return &taskFetcherImpl{
+	requestChan := make([]chan *request, config.ReplicationTaskFetcherParallelism())
+	for i := 0; i < config.ReplicationTaskFetcherParallelism(); i++ {
+		requestChan[i] = make(chan *request, requestChanBufferSize)
+	}
+
+	fetcher := &taskFetcherImpl{
 		status:         common.DaemonStatusInitialized,
 		config:         config,
 		logger:         logger.WithTags(tag.ClusterName(sourceCluster)),
+		metricsScope:   metricsClient.Scope(metrics.ReplicationTaskFetcherScope, metrics.TargetClusterTag(sourceCluster)),
 		remotePeer:     sourceFrontend,
 		currentCluster: currentCluster,
 		sourceCluster:  sourceCluster,
-		rateLimiter: quotas.NewDynamicRateLimiter(func() float64 {
-			return config.ReplicationTaskProcessorHostQPS()
-		}),
-		requestChan: make(chan *request, requestChanBufferSize),
-		done:        make(chan struct{}),
+		rateLimiter:    quotas.NewDynamicRateLimiter(config.ReplicationTaskProcessorHostQPS.AsFloat64()),
+		timeSource:     clock.NewRealTimeSource(),
+		requestChan:    requestChan,
+		ctx:            ctx,
+		cancelCtx:      cancel,
 	}
+	fetcher.fetchAndDistributeTasksFn = fetcher.fetchAndDistributeTasks
+	return fetcher
 }
 
 // Start starts the fetcher
@@ -180,8 +197,12 @@ func (f *taskFetcherImpl) Start() {
 		return
 	}
 
+	// NOTE: ReplicationTaskFetcherParallelism > 1 is now supported. Each fetcher goroutine handles a subset of shards
+	// (distributed via shardID % parallelism) and runs its own fetch cycle independently.
 	for i := 0; i < f.config.ReplicationTaskFetcherParallelism(); i++ {
-		go f.fetchTasks()
+		i := i
+		f.wg.Add(1)
+		go f.fetchTasks(i)
 	}
 	f.logger.Info("Replication task fetcher started.", tag.Counter(f.config.ReplicationTaskFetcherParallelism()))
 }
@@ -192,40 +213,44 @@ func (f *taskFetcherImpl) Stop() {
 		return
 	}
 
-	close(f.done)
-	f.logger.Info("Replication task fetcher stopped.")
+	f.cancelCtx()
+	if !common.AwaitWaitGroup(&f.wg, 10*time.Second) {
+		f.logger.Warn("Replication task fetcher timed out on shutdown.")
+	} else {
+		f.logger.Info("Replication task fetcher graceful shutdown completed.")
+	}
 }
 
 // fetchTasks collects getReplicationTasks request from shards and send out aggregated request to source frontend.
-func (f *taskFetcherImpl) fetchTasks() {
-	timer := time.NewTimer(backoff.JitDuration(
+func (f *taskFetcherImpl) fetchTasks(chanIdx int) {
+	defer f.wg.Done()
+
+	timer := f.timeSource.NewTimer(backoff.JitDuration(
 		f.config.ReplicationTaskFetcherAggregationInterval(),
 		f.config.ReplicationTaskFetcherTimerJitterCoefficient(),
 	))
+	defer timer.Stop()
 
 	requestByShard := make(map[int32]*request)
-
 	for {
 		select {
-		case request := <-f.requestChan:
+		case request := <-f.requestChan[chanIdx]:
 			// Here we only add the request to map. We will wait until timer fires to send the request to remote.
 			if req, ok := requestByShard[request.token.GetShardID()]; ok && req != request {
-				// since this replication task fetcher is per host
-				// and replication task processor is per shard
-				// during shard movement, duplicated requests can appear
-				// if shard moved from this host, to this host.
-				f.logger.Error("Get replication task request already exist for shard.")
+				// since this replication task fetcher is per host and replication task processor is per shard
+				// during shard movement, duplicated requests can appear, if shard moved from this host to this host.
+				f.logger.Info("Get replication task request already exist for shard.", tag.ShardID(int(request.token.GetShardID())))
 				close(req.respChan)
 			}
 			requestByShard[request.token.GetShardID()] = request
 
-		case <-timer.C:
+		case <-timer.Chan():
 			// When timer fires, we collect all the requests we have so far and attempt to send them to remote.
-			err := f.fetchAndDistributeTasks(requestByShard)
+			err := f.fetchAndDistributeTasksFn(requestByShard)
 			if err != nil {
-				if _, ok := err.(*shared.ServiceBusyError); ok {
+				if _, ok := err.(*types.ServiceBusyError); ok {
 					// slow down replication when source cluster is busy
-					timer.Reset(f.config.ReplicationTaskFetcherErrorRetryWait())
+					timer.Reset(f.config.ReplicationTaskFetcherServiceBusyWait())
 				} else {
 					timer.Reset(backoff.JitDuration(
 						f.config.ReplicationTaskFetcherErrorRetryWait(),
@@ -238,14 +263,19 @@ func (f *taskFetcherImpl) fetchTasks() {
 					f.config.ReplicationTaskFetcherTimerJitterCoefficient(),
 				))
 			}
-		case <-f.done:
-			timer.Stop()
+		case <-f.ctx.Done():
 			return
 		}
 	}
 }
 
 func (f *taskFetcherImpl) fetchAndDistributeTasks(requestByShard map[int32]*request) error {
+	startTime := f.timeSource.Now()
+	defer func() {
+		fetchLatency := f.timeSource.Now().Sub(startTime)
+		f.metricsScope.ExponentialHistogram(metrics.ExponentialReplicationTaskFetchLatency, fetchLatency)
+	}()
+
 	if len(requestByShard) == 0 {
 		// We don't receive tasks from previous fetch so processors are all sleeping.
 		f.logger.Debug("Skip fetching as no processor is asking for tasks.")
@@ -254,14 +284,22 @@ func (f *taskFetcherImpl) fetchAndDistributeTasks(requestByShard map[int32]*requ
 
 	messagesByShard, err := f.getMessages(requestByShard)
 	if err != nil {
-		if _, ok := err.(*shared.ServiceBusyError); !ok {
+		if _, ok := err.(*types.ServiceBusyError); !ok {
 			f.logger.Error("Failed to get replication tasks", tag.Error(err))
-			return err
+		} else {
+			f.logger.Debug("Failed to get replication tasks because service busy")
 		}
+
+		return err
 	}
 
-	f.logger.Debug("Successfully fetched replication tasks.", tag.Counter(len(messagesByShard)))
+	totalTasks := 0
+	for _, messages := range messagesByShard {
+		totalTasks += len(messages.ReplicationTasks)
+	}
+	f.metricsScope.RecordHistogramValue(metrics.ReplicationTasksFetchedSize, float64(totalTasks))
 
+	f.logger.Debug("Successfully fetched replication tasks.", tag.Counter(len(messagesByShard)))
 	for shardID, tasks := range messagesByShard {
 		request := requestByShard[shardID]
 		request.respChan <- tasks
@@ -269,32 +307,28 @@ func (f *taskFetcherImpl) fetchAndDistributeTasks(requestByShard map[int32]*requ
 		delete(requestByShard, shardID)
 	}
 
-	return err
+	return nil
 }
 
-func (f *taskFetcherImpl) getMessages(
-	requestByShard map[int32]*request,
-) (map[int32]*r.ReplicationMessages, error) {
-	var tokens []*r.ReplicationToken
+func (f *taskFetcherImpl) getMessages(requestByShard map[int32]*request) (map[int32]*types.ReplicationMessages, error) {
+	var tokens []*types.ReplicationToken
 	for _, request := range requestByShard {
 		tokens = append(tokens, request.token)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), fetchTaskRequestTimeout)
+	ctx, cancel := context.WithTimeout(f.ctx, fetchTaskRequestTimeout)
 	defer cancel()
 
-	request := &r.GetReplicationMessagesRequest{
+	request := &types.GetReplicationMessagesRequest{
 		Tokens:      tokens,
-		ClusterName: common.StringPtr(f.currentCluster),
+		ClusterName: f.currentCluster,
 	}
 	response, err := f.remotePeer.GetReplicationMessages(ctx, request)
 	if err != nil {
-		if _, ok := err.(*shared.ServiceBusyError); !ok {
-			return nil, err
-		}
+		return nil, err
 	}
 
-	return response.GetMessagesByShard(), err
+	return response.GetMessagesByShard(), nil
 }
 
 // GetSourceCluster returns the source cluster for the fetcher
@@ -303,11 +337,13 @@ func (f *taskFetcherImpl) GetSourceCluster() string {
 }
 
 // GetRequestChan returns the request chan for the fetcher
-func (f *taskFetcherImpl) GetRequestChan() chan<- *request {
-	return f.requestChan
+func (f *taskFetcherImpl) GetRequestChan(shardID int) chan<- *request {
+	chanIdx := shardID % len(f.requestChan)
+
+	return f.requestChan[chanIdx]
 }
 
 // GetRateLimiter returns the host level rate limiter for the fetcher
-func (f *taskFetcherImpl) GetRateLimiter() *quotas.DynamicRateLimiter {
+func (f *taskFetcherImpl) GetRateLimiter() quotas.Limiter {
 	return f.rateLimiter
 }

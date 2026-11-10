@@ -21,21 +21,20 @@
 package backoff
 
 import (
+	"math/rand"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+
+	"github.com/uber/cadence/common/clock"
 )
 
 type (
 	RetryPolicySuite struct {
 		*require.Assertions // override suite.Suite.Assertions with require.Assertions; this means that s.NotNil(nil) will stop the test, not merely log an error
 		suite.Suite
-	}
-
-	TestClock struct {
-		currentTime time.Time
 	}
 )
 
@@ -44,6 +43,7 @@ func TestRetryPolicySuite(t *testing.T) {
 }
 
 func (s *RetryPolicySuite) SetupTest() {
+	rand.Seed(int64(time.Now().Nanosecond()))
 	s.Assertions = require.New(s.T()) // Have to define our overridden assertions in the test setup. If we did it earlier, s.T() will return nil
 }
 
@@ -115,7 +115,7 @@ func (s *RetryPolicySuite) TestExpirationInterval() {
 	policy.SetExpirationInterval(5 * time.Minute)
 
 	r, clock := createRetrier(policy)
-	clock.moveClock(6 * time.Minute)
+	clock.Advance(6 * time.Minute)
 	next := r.NextBackOff()
 
 	s.Equal(done, next)
@@ -131,7 +131,7 @@ func (s *RetryPolicySuite) TestExpirationOverflow() {
 	s.True(next >= min, "NextBackoff too low")
 	s.True(next < max, "NextBackoff too high")
 
-	clock.moveClock(2 * time.Second)
+	clock.Advance(2 * time.Second)
 
 	next = r.NextBackOff()
 	min, max = getNextBackoffRange(3 * time.Second)
@@ -159,19 +159,21 @@ func (s *RetryPolicySuite) TestDefaultPublishRetryPolicy() {
 		10000 * time.Millisecond,
 		10000 * time.Millisecond,
 		6000 * time.Millisecond,
-		1300 * time.Millisecond,
+		1250 * time.Millisecond,
 		done,
 	}
 
-	for _, expected := range expectedResult {
+	total := 0
+	for i, expected := range expectedResult {
 		next := r.NextBackOff()
+		total += int(next)
 		if expected == done {
 			s.Equal(done, next, "backoff not done yet!!!")
 		} else {
 			min, _ := getNextBackoffRange(expected)
-			s.True(next >= min, "NextBackoff too low: actual: %v, expected: %v", next, expected)
+			s.True(next >= min, "iteration %d: NextBackoff too low: actual: %v, expected: %v", i, next, expected)
 			// s.True(next < max, "NextBackoff too high: actual: %v, expected: %v", next, expected)
-			clock.moveClock(expected)
+			clock.Advance(expected)
 		}
 	}
 }
@@ -184,9 +186,9 @@ func (s *RetryPolicySuite) TestNoMaxAttempts() {
 	r, clock := createRetrier(policy)
 	for i := 0; i < 100; i++ {
 		next := r.NextBackOff()
-		//print("Iter: ", i, ", Next Backoff: ", next.String(), "\n")
+		// print("Iter: ", i, ", Next Backoff: ", next.String(), "\n")
 		s.True(next > 0 || next == done, "Unexpected value for next retry duration: %v", next)
-		clock.moveClock(next)
+		clock.Advance(next)
 	}
 }
 
@@ -196,9 +198,9 @@ func (s *RetryPolicySuite) TestUnbounded() {
 	r, clock := createRetrier(policy)
 	for i := 0; i < 100; i++ {
 		next := r.NextBackOff()
-		//print("Iter: ", i, ", Next Backoff: ", next.String(), "\n")
+		// print("Iter: ", i, ", Next Backoff: ", next.String(), "\n")
 		s.True(next > 0 || next == done, "Unexpected value for next retry duration: %v", next)
-		clock.moveClock(next)
+		clock.Advance(next)
 	}
 }
 
@@ -222,7 +224,7 @@ func (s *RetryPolicySuite) TestMultiPhasesRetryPolicy() {
 		32 * time.Second,
 		64 * time.Second,
 		128 * time.Second,
-		46 * time.Second,
+		45650 * time.Millisecond,
 		done,
 	}
 	for _, expected := range expectedResult {
@@ -233,17 +235,9 @@ func (s *RetryPolicySuite) TestMultiPhasesRetryPolicy() {
 			min, max := getNextBackoffRange(expected)
 			s.True(next >= min, "NextBackoff too low: actual: %v, expected: %v", next, expected)
 			s.True(next < max, "NextBackoff too high: actual: %v, expected: %v", next, expected)
-			clock.moveClock(expected)
+			clock.Advance(expected)
 		}
 	}
-}
-
-func (c *TestClock) Now() time.Time {
-	return c.currentTime
-}
-
-func (c *TestClock) moveClock(duration time.Duration) {
-	c.currentTime = c.currentTime.Add(duration)
 }
 
 func createPolicy(initialInterval time.Duration) *ExponentialRetryPolicy {
@@ -256,8 +250,8 @@ func createPolicy(initialInterval time.Duration) *ExponentialRetryPolicy {
 	return policy
 }
 
-func createRetrier(policy RetryPolicy) (Retrier, *TestClock) {
-	clock := &TestClock{currentTime: time.Time{}}
+func createRetrier(policy RetryPolicy) (Retrier, clock.MockedTimeSource) {
+	clock := clock.NewMockedTimeSourceAt(time.Time{})
 	return NewRetrier(policy, clock), clock
 }
 

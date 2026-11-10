@@ -21,7 +21,10 @@
 package canary
 
 import (
+	"fmt"
+
 	"go.uber.org/cadence/workflow"
+	"go.uber.org/multierr"
 	"go.uber.org/zap"
 )
 
@@ -41,6 +44,7 @@ var sanityChildWFList = []string{
 	wfTypeHistoryArchival,
 	wfTypeVisibilityArchival,
 	wfTypeBatch,
+	wfTypeCrossClusterParent,
 }
 
 func init() {
@@ -52,7 +56,10 @@ func init() {
 // exercises the frontend APIs and the basic functionality of the
 // client library - each probe / test MUST be implemented as a
 // child workflow of this workflow
-func sanityWorkflow(ctx workflow.Context, scheduledTimeNanos int64, domain string) error {
+func sanityWorkflow(ctx workflow.Context, inputScheduledTimeNanos int64) error {
+	scheduledTimeNanos := getScheduledTimeFromInputIfNonZero(ctx, inputScheduledTimeNanos)
+	domain := workflow.GetInfo(ctx).Domain
+
 	var err error
 	profile, err := beginWorkflow(ctx, wfTypeSanity, scheduledTimeNanos)
 	if err != nil {
@@ -86,10 +93,11 @@ func forkChildWorkflows(ctx workflow.Context, domain string, names []string) (wo
 	for _, childName := range names {
 		cwo := newChildWorkflowOptions(domain, concat(myID, childName))
 		childCtx := workflow.WithChildOptions(ctx, cwo)
-		future := workflow.ExecuteChildWorkflow(childCtx, childName, now, domain)
+		future := workflow.ExecuteChildWorkflow(childCtx, childName, now)
 		selector.AddFuture(future, func(f workflow.Future) {
 			if err := f.Get(ctx, nil); err != nil {
 				workflow.GetLogger(ctx).Error("child workflow failed", zap.Error(err))
+				err = fmt.Errorf("child workflow %s failed: %w", childName, err)
 				resultC.Send(ctx, err)
 				return
 			}
@@ -108,9 +116,7 @@ func joinChildWorkflows(ctx workflow.Context, names []string, selector workflow.
 		selector.Select(ctx)
 		var err1 error
 		resultC.Receive(ctx, &err1)
-		if err1 != nil {
-			err = err1
-		}
+		err = multierr.Append(err, err1)
 	}
 	return err
 }

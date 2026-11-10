@@ -1,37 +1,26 @@
-- persistence:
-    dbname: integration_active
-  clustermetadata:
-    enableGlobalDomain: true
-    replicationConsumer:
-      type: rpc
-      fetcher:
-        rpcParallelism: 1
-        aggregationIntervalSecs: 2
-        errorRetryWaitSecs: 1
-        timerJitterCoefficient: 0.15
-      processor:
-        noTaskInitialWaitIntervalSecs: 2
-        noTaskWaitBackoffCoefficient: 1
-        noTaskMaxWaitIntervalSecs: 2
+- clustergroupmetadata:
     failoverVersionIncrement: 10
-    masterClusterName: "active"
+    primaryClusterName: "active"
     currentClusterName: "active"
-    clusterInformation:
+    clusterGroup:
       active:
         enabled: true
         initialFailoverVersion: 0
         rpcName: "cadence-frontend"
-        rpcAddress: "127.0.0.1:7104"
+        rpcAddress: "127.0.0.1:7114"
+        rpcTransport: "grpc"
       standby:
         enabled: true
         initialFailoverVersion: 1
         rpcName: "cadence-frontend"
-        rpcAddress: "127.0.0.1:8104"
+        rpcAddress: "127.0.0.1:8114"
+        rpcTransport: "grpc"
       other:
         enabled: true
         initialFailoverVersion: 2
         rpcName: "cadence-frontend"
-        rpcAddress: "127.0.0.1:9104"
+        rpcAddress: "127.0.0.1:9114"
+        rpcTransport: "grpc"
   enablearchival: false
   workerconfig:
     enablearchiver: false
@@ -41,6 +30,8 @@
   historyconfig:
     numhistoryshards: 1
     numhistoryhosts: 1
+  matchingconfig:
+    nummatchinghosts: 1
   messagingclientconfig:
     usemock: false
     kafkaconfig:
@@ -72,40 +63,32 @@
           topic: other
           dlq-topic: other-dlq
       applications: { }
-- persistence:
-    dbname: integration_standby
-  clustermetadata:
-    enableGlobalDomain: true
-    replicationConsumer:
-      type: rpc
-      fetcher:
-        rpcParallelism: 1
-        aggregationIntervalSecs: 2
-        errorRetryWaitSecs: 1
-        timerJitterCoefficient: 0.15
-      processor:
-        noTaskInitialWaitIntervalSecs: 2
-        noTaskWaitBackoffCoefficient: 1
-        noTaskMaxWaitIntervalSecs: 2
+  dynamicclientconfig:
+    filepath: "../testdata/dynamicconfig/integration_test.yaml"
+    pollInterval: "10s"
+- clustergroupmetadata:
     failoverVersionIncrement: 10
-    masterClusterName: "active"
+    primaryClusterName: "active"
     currentClusterName: "standby"
-    clusterInformation:
+    clusterGroup:
       active:
         enabled: true
         initialFailoverVersion: 0
         rpcName: "cadence-frontend"
-        rpcAddress: "127.0.0.1:7104"
+        rpcAddress: "127.0.0.1:7114"
+        rpcTransport: "grpc"
       standby:
         enabled: true
         initialFailoverVersion: 1
         rpcName: "cadence-frontend"
-        rpcAddress: "127.0.0.1:8104"
+        rpcAddress: "127.0.0.1:8114"
+        rpcTransport: "grpc"
       other:
         enabled: true
         initialFailoverVersion: 2
         rpcName: "cadence-frontend"
-        rpcAddress: "127.0.0.1:9104"
+        rpcAddress: "127.0.0.1:9114"
+        rpcTransport: "grpc"
   enablearchival: false
   workerconfig:
     enablearchiver: false
@@ -115,6 +98,8 @@
   historyconfig:
     numhistoryshards: 1
     numhistoryhosts: 1
+  matchingconfig:
+    nummatchinghosts: 1
   messagingclientconfig:
     usemock: false
     kafkaconfig:
@@ -148,38 +133,29 @@
       applications: { }
 - persistence:
     dbname: integration_other
-  clustermetadata:
-    enableGlobalDomain: true
-    replicationConsumer:
-      type: rpc
-      fetcher:
-        rpcParallelism: 1
-        aggregationIntervalSecs: 2
-        errorRetryWaitSecs: 1
-        timerJitterCoefficient: 0.15
-      processor:
-        noTaskInitialWaitIntervalSecs: 2
-        noTaskWaitBackoffCoefficient: 1
-        noTaskMaxWaitIntervalSecs: 2
+  clustergroupmetadata:
     failoverVersionIncrement: 10
-    masterClusterName: "active"
+    primaryClusterName: "active"
     currentClusterName: "other"
-    clusterInformation:
+    clusterGroup:
       active:
         enabled: true
         initialFailoverVersion: 0
         rpcName: "cadence-frontend"
-        rpcAddress: "127.0.0.1:7104"
+        rpcAddress: "127.0.0.1:7114"
+        rpcTransport: "grpc"
       standby:
         enabled: true
         initialFailoverVersion: 1
         rpcName: "cadence-frontend"
-        rpcAddress: "127.0.0.1:8104"
+        rpcAddress: "127.0.0.1:8114"
+        rpcTransport: "grpc"
       other:
         enabled: true
         initialFailoverVersion: 2
         rpcName: "cadence-frontend"
-        rpcAddress: "127.0.0.1:9104"
+        rpcAddress: "127.0.0.1:9114"
+        rpcTransport: "grpc"
   enablearchival: false
   workerconfig:
     enablearchiver: false
@@ -189,6 +165,8 @@
   historyconfig:
     numhistoryshards: 1
     numhistoryhosts: 1
+  matchingconfig:
+    nummatchinghosts: 1
   messagingclientconfig:
     usemock: false
     kafkaconfig:
@@ -196,3 +174,6 @@
         test:
           brokers:
             - "${KAFKA_SEEDS}:9092"
+  dynamicclientconfig:
+    filepath: "../testdata/dynamicconfig/integration_test.yaml"
+    pollInterval: "10s"

@@ -30,9 +30,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
-	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
-	"github.com/uber/cadence/common/archiver"
+	"github.com/uber/cadence/common/constants"
+	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/common/util"
 )
 
@@ -55,27 +55,27 @@ func (s *UtilSuite) SetupTest() {
 }
 
 func (s *UtilSuite) TestEncodeDecodeHistoryBatches() {
-	historyBatches := []*shared.History{
-		&shared.History{
-			Events: []*shared.HistoryEvent{
-				&shared.HistoryEvent{
-					EventId: common.Int64Ptr(common.FirstEventID),
-					Version: common.Int64Ptr(1),
+	historyBatches := []*types.History{
+		{
+			Events: []*types.HistoryEvent{
+				{
+					ID:      constants.FirstEventID,
+					Version: 1,
 				},
 			},
 		},
-		&shared.History{
-			Events: []*shared.HistoryEvent{
-				&shared.HistoryEvent{
-					EventId:   common.Int64Ptr(common.FirstEventID + 1),
+		{
+			Events: []*types.HistoryEvent{
+				{
+					ID:        constants.FirstEventID + 1,
 					Timestamp: common.Int64Ptr(time.Now().UnixNano()),
-					Version:   common.Int64Ptr(1),
+					Version:   1,
 				},
-				&shared.HistoryEvent{
-					EventId: common.Int64Ptr(common.FirstEventID + 2),
-					Version: common.Int64Ptr(2),
-					DecisionTaskStartedEventAttributes: &shared.DecisionTaskStartedEventAttributes{
-						Identity: common.StringPtr("some random identity"),
+				{
+					ID:      constants.FirstEventID + 2,
+					Version: 2,
+					DecisionTaskStartedEventAttributes: &types.DecisionTaskStartedEventAttributes{
+						Identity: "some random identity",
 					},
 				},
 			},
@@ -91,9 +91,7 @@ func (s *UtilSuite) TestEncodeDecodeHistoryBatches() {
 }
 
 func (s *UtilSuite) TestValidateDirPath() {
-	dir, err := ioutil.TempDir("", "TestValidateDirPath")
-	s.NoError(err)
-	defer os.RemoveAll(dir)
+	dir := s.T().TempDir()
 	s.assertDirectoryExists(dir)
 	filename := "test-file-name"
 	s.createFile(dir, filename)
@@ -192,106 +190,6 @@ func (s *UtilSuite) TestExtractCloseFailoverVersion() {
 			s.NoError(err)
 			s.Equal(tc.expectedVersion, version)
 		}
-	}
-}
-
-func (s *UtilSuite) TestHistoryMutated() {
-	testCases := []struct {
-		historyBatches []*shared.History
-		request        *archiver.ArchiveHistoryRequest
-		isLast         bool
-		isMutated      bool
-	}{
-		{
-			historyBatches: []*shared.History{
-				&shared.History{
-					Events: []*shared.HistoryEvent{
-						&shared.HistoryEvent{
-							Version: common.Int64Ptr(15),
-						},
-					},
-				},
-			},
-			request: &archiver.ArchiveHistoryRequest{
-				CloseFailoverVersion: 3,
-			},
-			isMutated: true,
-		},
-		{
-			historyBatches: []*shared.History{
-				&shared.History{
-					Events: []*shared.HistoryEvent{
-						&shared.HistoryEvent{
-							EventId: common.Int64Ptr(33),
-							Version: common.Int64Ptr(10),
-						},
-					},
-				},
-				&shared.History{
-					Events: []*shared.HistoryEvent{
-						&shared.HistoryEvent{
-							EventId: common.Int64Ptr(49),
-							Version: common.Int64Ptr(10),
-						},
-						&shared.HistoryEvent{
-							EventId: common.Int64Ptr(50),
-							Version: common.Int64Ptr(10),
-						},
-					},
-				},
-			},
-			request: &archiver.ArchiveHistoryRequest{
-				CloseFailoverVersion: 10,
-				NextEventID:          34,
-			},
-			isLast:    true,
-			isMutated: true,
-		},
-		{
-			historyBatches: []*shared.History{
-				&shared.History{
-					Events: []*shared.HistoryEvent{
-						&shared.HistoryEvent{
-							Version: common.Int64Ptr(9),
-						},
-					},
-				},
-			},
-			request: &archiver.ArchiveHistoryRequest{
-				CloseFailoverVersion: 10,
-			},
-			isLast:    true,
-			isMutated: true,
-		},
-		{
-			historyBatches: []*shared.History{
-				&shared.History{
-					Events: []*shared.HistoryEvent{
-						&shared.HistoryEvent{
-							EventId: common.Int64Ptr(20),
-							Version: common.Int64Ptr(10),
-						},
-					},
-				},
-				&shared.History{
-					Events: []*shared.HistoryEvent{
-						&shared.HistoryEvent{
-							EventId: common.Int64Ptr(33),
-							Version: common.Int64Ptr(10),
-						},
-					},
-				},
-			},
-			request: &archiver.ArchiveHistoryRequest{
-				CloseFailoverVersion: 10,
-				NextEventID:          34,
-			},
-			isLast:    true,
-			isMutated: false,
-		},
-	}
-	for _, tc := range testCases {
-		s.Equal(tc.isMutated, historyMutated(tc.request, tc.historyBatches, tc.isLast))
 	}
 }
 

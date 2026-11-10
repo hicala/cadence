@@ -26,17 +26,20 @@ import (
 
 	"github.com/pborman/uuid"
 
-	gen "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/collection"
 	"github.com/uber/cadence/common/definition"
 	"github.com/uber/cadence/common/metrics"
+	"github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/types"
 )
 
 const (
 	eventsChanSize = 1000
 )
+
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination notifier_mock.go -self_package github.com/uber/cadence/service/history/events
 
 type (
 	// Notifier is a pub-sub for sending and receiving notifications on new history events
@@ -54,9 +57,9 @@ type (
 		NextEventID            int64
 		PreviousStartedEventID int64
 		Timestamp              time.Time
-		CurrentBranchToken     []byte
 		WorkflowState          int
 		WorkflowCloseState     int
+		VersionHistories       *persistence.VersionHistories
 	}
 
 	notifierImpl struct {
@@ -84,27 +87,27 @@ var _ Notifier = (*notifierImpl)(nil)
 // NewNotification creates a new history event notification
 func NewNotification(
 	domainID string,
-	workflowExecution *gen.WorkflowExecution,
+	workflowExecution *types.WorkflowExecution,
 	lastFirstEventID int64,
 	nextEventID int64,
 	previousStartedEventID int64,
-	currentBranchToken []byte,
 	workflowState int,
 	workflowCloseState int,
+	versionHistories *persistence.VersionHistories,
 ) *Notification {
 
 	return &Notification{
 		ID: definition.NewWorkflowIdentifier(
 			domainID,
-			workflowExecution.GetWorkflowId(),
-			workflowExecution.GetRunId(),
+			workflowExecution.GetWorkflowID(),
+			workflowExecution.GetRunID(),
 		),
 		LastFirstEventID:       lastFirstEventID,
 		NextEventID:            nextEventID,
 		PreviousStartedEventID: previousStartedEventID,
-		CurrentBranchToken:     currentBranchToken,
 		WorkflowState:          workflowState,
 		WorkflowCloseState:     workflowCloseState,
+		VersionHistories:       versionHistories,
 	}
 }
 
@@ -149,7 +152,7 @@ func (notifier *notifierImpl) WatchHistoryEvent(
 
 		if _, ok := subscribers[subscriberID]; ok {
 			// UUID collision
-			return &gen.InternalServiceError{
+			return &types.InternalServiceError{
 				Message: "Unable to watch on workflow execution.",
 			}
 		}
@@ -183,7 +186,7 @@ func (notifier *notifierImpl) UnwatchHistoryEvent(
 
 	if !success {
 		// cannot find the subscribe ID, which means there is a bug
-		return &gen.InternalServiceError{
+		return &types.InternalServiceError{
 			Message: "Unable to unwatch on workflow execution.",
 		}
 	}
@@ -194,8 +197,12 @@ func (notifier *notifierImpl) UnwatchHistoryEvent(
 func (notifier *notifierImpl) dispatchHistoryEventNotification(event *Notification) {
 	identifier := event.ID
 
+	fanoutStart := time.Now()
 	timer := notifier.metrics.StartTimer(metrics.HistoryEventNotificationScope, metrics.HistoryEventNotificationFanoutLatency)
-	defer timer.Stop()
+	defer func() {
+		timer.Stop()
+		notifier.metrics.Scope(metrics.HistoryEventNotificationScope).ExponentialHistogram(metrics.HistoryEventNotificationFanoutLatencyHistogram, time.Since(fanoutStart))
+	}()
 	notifier.eventsPubsubs.GetAndDo(identifier, func(key interface{}, value interface{}) error { //nolint:errcheck
 		subscribers := value.(map[string]chan *Notification)
 
@@ -235,6 +242,7 @@ func (notifier *notifierImpl) dequeueHistoryEventNotifications() {
 			timeelapsed := time.Since(event.Timestamp)
 			notifier.metrics.RecordTimer(metrics.HistoryEventNotificationScope,
 				metrics.HistoryEventNotificationQueueingLatency, timeelapsed)
+			notifier.metrics.Scope(metrics.HistoryEventNotificationScope).ExponentialHistogram(metrics.HistoryEventNotificationQueueingLatencyHistogram, timeelapsed)
 
 			notifier.dispatchHistoryEventNotification(event)
 		case <-notifier.closeChan:

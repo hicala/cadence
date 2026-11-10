@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-//go:generate mockgen -copyright_file ../../../LICENSE -package $GOPACKAGE -source $GOFILE -destination activity_replicator_mock.go
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination activity_replicator_mock.go
 
 package ndc
 
@@ -26,16 +26,14 @@ import (
 	ctx "context"
 	"time"
 
-	"go.uber.org/cadence/.gen/go/shared"
-
-	h "github.com/uber/cadence/.gen/go/history"
-	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
-	"github.com/uber/cadence/common/clock"
+	"github.com/uber/cadence/common/cache"
 	"github.com/uber/cadence/common/cluster"
+	"github.com/uber/cadence/common/constants"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/service/history/execution"
 	"github.com/uber/cadence/service/history/shard"
 )
@@ -51,13 +49,14 @@ type (
 	ActivityReplicator interface {
 		SyncActivity(
 			ctx ctx.Context,
-			request *h.SyncActivityRequest,
+			request *types.SyncActivityRequest,
 		) error
 	}
 
 	activityReplicatorImpl struct {
-		executionCache  *execution.Cache
+		executionCache  execution.Cache
 		clusterMetadata cluster.Metadata
+		domainCache     cache.DomainCache
 		logger          log.Logger
 	}
 )
@@ -67,31 +66,31 @@ var _ ActivityReplicator = (*activityReplicatorImpl)(nil)
 // NewActivityReplicator creates activity replicator
 func NewActivityReplicator(
 	shard shard.Context,
-	executionCache *execution.Cache,
+	executionCache execution.Cache,
 	logger log.Logger,
 ) ActivityReplicator {
 
 	return &activityReplicatorImpl{
 		executionCache:  executionCache,
 		clusterMetadata: shard.GetService().GetClusterMetadata(),
+		domainCache:     shard.GetDomainCache(),
 		logger:          logger.WithTags(tag.ComponentHistoryReplicator),
 	}
 }
 
 func (r *activityReplicatorImpl) SyncActivity(
 	ctx ctx.Context,
-	request *h.SyncActivityRequest,
+	request *types.SyncActivityRequest,
 ) (retError error) {
 
-	// sync activity info will only be sent from active side, when
-	// 1. activity has retry policy and activity got started
-	// 2. activity heart beat
-	// no sync activity task will be sent when active side fail / timeout activity,
-	// since standby side does not have activity retry timer
-	domainID := request.GetDomainId()
-	workflowExecution := workflow.WorkflowExecution{
-		WorkflowId: request.WorkflowId,
-		RunId:      request.RunId,
+	// Sync activity info is sent from the active side when an activity starts,
+	// heartbeats, or has a retriable failure. For an unstarted retry, this apply
+	// path regenerates the retry backoff timer locally because timer tasks are not
+	// replicated.
+	domainID := request.GetDomainID()
+	workflowExecution := types.WorkflowExecution{
+		WorkflowID: request.WorkflowID,
+		RunID:      request.RunID,
 	}
 
 	context, release, err := r.executionCache.GetOrCreateWorkflowExecution(ctx, domainID, workflowExecution)
@@ -104,7 +103,7 @@ func (r *activityReplicatorImpl) SyncActivity(
 
 	mutableState, err := context.LoadWorkflowExecution(ctx)
 	if err != nil {
-		if _, ok := err.(*workflow.EntityNotExistsError); !ok {
+		if _, ok := err.(*types.EntityNotExistsError); !ok {
 			return err
 		}
 
@@ -116,11 +115,11 @@ func (r *activityReplicatorImpl) SyncActivity(
 	}
 
 	version := request.GetVersion()
-	scheduleID := request.GetScheduledId()
+	scheduleID := request.GetScheduledID()
 	shouldApply, err := r.shouldApplySyncActivity(
 		domainID,
-		workflowExecution.GetWorkflowId(),
-		workflowExecution.GetRunId(),
+		workflowExecution.GetWorkflowID(),
+		workflowExecution.GetRunID(),
 		scheduleID,
 		version,
 		mutableState,
@@ -173,6 +172,11 @@ func (r *activityReplicatorImpl) SyncActivity(
 	} else if ai.Attempt < request.GetAttempt() {
 		resetActivityTimerTaskStatus = true
 	}
+	// capture whether this sync advances the retry attempt before
+	// ReplicateActivityInfo overwrites the activity info in place
+	attemptIncremented := ai.Attempt < request.GetAttempt()
+	activityNotStarted := request.GetStartedID() == constants.EmptyEventID
+
 	err = mutableState.ReplicateActivityInfo(request, resetActivityTimerTaskStatus)
 	if err != nil {
 		return err
@@ -190,10 +194,25 @@ func (r *activityReplicatorImpl) SyncActivity(
 	// passive logic need to explicitly call create timer
 	now := time.Unix(0, eventTime)
 	if _, err := execution.NewTimerSequence(
-		clock.NewEventTimeSource().Update(now),
 		mutableState,
 	).CreateNextActivityTimer(); err != nil {
 		return err
+	}
+
+	// ActivityRetryTimers are only generated in the cluster that recorded the activity failure.
+	// With a race between the activity failure, failover, and domain cache refresh, this can
+	// mean the timer is processed by both clusters as a 'passive' task.
+	// When this occurs, the timer is dropped. Ensure that syncActivity generates a timer whenever
+	// the attempt is incremented to prevent this race condition.
+	if attemptIncremented && activityNotStarted && !ai.CancelRequested {
+		if err := execution.NewMutableStateTaskGenerator(
+			r.logger,
+			r.clusterMetadata,
+			r.domainCache,
+			mutableState,
+		).GenerateActivityRetryTasks(scheduleID); err != nil {
+			return err
+		}
 	}
 
 	updateMode := persistence.UpdateWorkflowModeUpdateCurrent
@@ -201,6 +220,12 @@ func (r *activityReplicatorImpl) SyncActivity(
 		updateMode = persistence.UpdateWorkflowModeBypassCurrent
 	}
 
+	r.logger.Debugf("SyncActivity calling UpdateWorkflowExecutionWithNew for wfID %s, updateMode %v, current policy %v, new policy %v",
+		workflowExecution.GetWorkflowID(),
+		updateMode,
+		execution.TransactionPolicyPassive,
+		nil,
+	)
 	return context.UpdateWorkflowExecutionWithNew(
 		ctx,
 		now,
@@ -209,6 +234,7 @@ func (r *activityReplicatorImpl) SyncActivity(
 		nil, // no new workflow
 		execution.TransactionPolicyPassive,
 		nil,
+		persistence.CreateWorkflowRequestModeReplicated,
 	)
 }
 
@@ -219,7 +245,7 @@ func (r *activityReplicatorImpl) shouldApplySyncActivity(
 	scheduleID int64,
 	activityVersion int64,
 	mutableState execution.MutableState,
-	incomingRawVersionHistory *workflow.VersionHistory,
+	incomingRawVersionHistory *types.VersionHistory,
 ) (bool, error) {
 
 	if mutableState.GetVersionHistories() != nil {
@@ -237,7 +263,7 @@ func (r *activityReplicatorImpl) shouldApplySyncActivity(
 			return false, err
 		}
 
-		incomingVersionHistory := persistence.NewVersionHistoryFromThrift(incomingRawVersionHistory)
+		incomingVersionHistory := persistence.NewVersionHistoryFromInternalType(incomingRawVersionHistory)
 		lastIncomingItem, err := incomingVersionHistory.GetLastItem()
 		if err != nil {
 			return false, err
@@ -257,39 +283,39 @@ func (r *activityReplicatorImpl) shouldApplySyncActivity(
 		// case 2-2: incoming version history has the higher version and resend the missing incoming events
 		if currentVersionHistory.IsLCAAppendable(lcaItem) || incomingVersionHistory.IsLCAAppendable(lcaItem) {
 			// case 1
-			if scheduleID > lcaItem.GetEventID() {
+			if scheduleID > lcaItem.EventID {
 				return false, newNDCRetryTaskErrorWithHint(
 					resendMissingEventMessage,
 					domainID,
 					workflowID,
 					runID,
-					common.Int64Ptr(lcaItem.GetEventID()),
-					common.Int64Ptr(lcaItem.GetVersion()),
+					common.Int64Ptr(lcaItem.EventID),
+					common.Int64Ptr(lcaItem.Version),
 					nil,
 					nil,
 				)
 			}
 		} else {
 			// case 2
-			if lastIncomingItem.GetVersion() < lastLocalItem.GetVersion() {
+			if lastIncomingItem.Version < lastLocalItem.Version {
 				// case 2-1
 				return false, nil
-			} else if lastIncomingItem.GetVersion() > lastLocalItem.GetVersion() {
+			} else if lastIncomingItem.Version > lastLocalItem.Version {
 				// case 2-2
 				return false, newNDCRetryTaskErrorWithHint(
 					resendHigherVersionMessage,
 					domainID,
 					workflowID,
 					runID,
-					common.Int64Ptr(lcaItem.GetEventID()),
-					common.Int64Ptr(lcaItem.GetVersion()),
+					common.Int64Ptr(lcaItem.EventID),
+					common.Int64Ptr(lcaItem.Version),
 					nil,
 					nil,
 				)
 			}
 		}
 	} else {
-		return false, &shared.InternalServiceError{Message: "The workflow version histories is corrupted."}
+		return false, &types.InternalServiceError{Message: "The workflow version histories is corrupted."}
 	}
 
 	return true, nil

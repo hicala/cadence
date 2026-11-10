@@ -21,197 +21,86 @@
 package frontend
 
 import (
+	"context"
+	"fmt"
 	"sync/atomic"
 	"time"
 
-	"github.com/uber/cadence/.gen/go/cadence/workflowserviceserver"
-	"github.com/uber/cadence/.gen/go/health/metaserver"
+	"go.uber.org/multierr"
+
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/client"
-	"github.com/uber/cadence/common/definition"
 	"github.com/uber/cadence/common/domain"
-	"github.com/uber/cadence/common/log"
-	"github.com/uber/cadence/common/messaging"
-	"github.com/uber/cadence/common/persistence"
-	persistenceClient "github.com/uber/cadence/common/persistence/client"
-	espersistence "github.com/uber/cadence/common/persistence/elasticsearch"
+	"github.com/uber/cadence/common/dynamicconfig/dynamicproperties"
+	"github.com/uber/cadence/common/log/tag"
+	"github.com/uber/cadence/common/quotas"
+	"github.com/uber/cadence/common/quotas/global/collection"
+	"github.com/uber/cadence/common/quotas/permember"
 	"github.com/uber/cadence/common/resource"
 	"github.com/uber/cadence/common/service"
-	"github.com/uber/cadence/common/service/config"
-	"github.com/uber/cadence/common/service/dynamicconfig"
+	"github.com/uber/cadence/service/frontend/admin"
+	"github.com/uber/cadence/service/frontend/api"
+	"github.com/uber/cadence/service/frontend/config"
+	"github.com/uber/cadence/service/frontend/wrappers/accesscontrolled"
+	"github.com/uber/cadence/service/frontend/wrappers/clusterredirection"
+	"github.com/uber/cadence/service/frontend/wrappers/grpc"
+	"github.com/uber/cadence/service/frontend/wrappers/metered"
+	"github.com/uber/cadence/service/frontend/wrappers/ratelimited"
+	"github.com/uber/cadence/service/frontend/wrappers/thrift"
+	"github.com/uber/cadence/service/frontend/wrappers/versioncheck"
 )
-
-// Config represents configuration for cadence-frontend service
-type Config struct {
-	NumHistoryShards                int
-	domainConfig                    domain.Config
-	PersistenceMaxQPS               dynamicconfig.IntPropertyFn
-	PersistenceGlobalMaxQPS         dynamicconfig.IntPropertyFn
-	VisibilityMaxPageSize           dynamicconfig.IntPropertyFnWithDomainFilter
-	EnableVisibilitySampling        dynamicconfig.BoolPropertyFn
-	EnableReadFromClosedExecutionV2 dynamicconfig.BoolPropertyFn
-	VisibilityListMaxQPS            dynamicconfig.IntPropertyFnWithDomainFilter
-	EnableReadVisibilityFromES      dynamicconfig.BoolPropertyFnWithDomainFilter
-	ESVisibilityListMaxQPS          dynamicconfig.IntPropertyFnWithDomainFilter
-	ESIndexMaxResultWindow          dynamicconfig.IntPropertyFn
-	HistoryMaxPageSize              dynamicconfig.IntPropertyFnWithDomainFilter
-	RPS                             dynamicconfig.IntPropertyFn
-	MaxDomainRPSPerInstance         dynamicconfig.IntPropertyFnWithDomainFilter
-	GlobalDomainRPS                 dynamicconfig.IntPropertyFnWithDomainFilter
-	MaxIDLengthLimit                dynamicconfig.IntPropertyFn
-	MaxIDLengthWarnLimit            dynamicconfig.IntPropertyFn
-	EnableClientVersionCheck        dynamicconfig.BoolPropertyFn
-	DisallowQuery                   dynamicconfig.BoolPropertyFnWithDomainFilter
-	ShutdownDrainDuration           dynamicconfig.DurationPropertyFn
-
-	// Persistence settings
-	HistoryMgrNumConns dynamicconfig.IntPropertyFn
-
-	// security protection settings
-	EnableAdminProtection         dynamicconfig.BoolPropertyFn
-	AdminOperationToken           dynamicconfig.StringPropertyFn
-	DisableListVisibilityByFilter dynamicconfig.BoolPropertyFnWithDomainFilter
-
-	// size limit system protection
-	BlobSizeLimitError dynamicconfig.IntPropertyFnWithDomainFilter
-	BlobSizeLimitWarn  dynamicconfig.IntPropertyFnWithDomainFilter
-
-	ThrottledLogRPS dynamicconfig.IntPropertyFn
-
-	// Domain specific config
-	EnableDomainNotActiveAutoForwarding         dynamicconfig.BoolPropertyFnWithDomainFilter
-	EnableGracefulFailover                      dynamicconfig.BoolPropertyFn
-	DomainFailoverRefreshInterval               dynamicconfig.DurationPropertyFn
-	DomainFailoverRefreshTimerJitterCoefficient dynamicconfig.FloatPropertyFn
-
-	// ValidSearchAttributes is legal indexed keys that can be used in list APIs
-	ValidSearchAttributes             dynamicconfig.MapPropertyFn
-	SearchAttributesNumberOfKeysLimit dynamicconfig.IntPropertyFnWithDomainFilter
-	SearchAttributesSizeOfValueLimit  dynamicconfig.IntPropertyFnWithDomainFilter
-	SearchAttributesTotalSizeLimit    dynamicconfig.IntPropertyFnWithDomainFilter
-
-	// VisibilityArchival system protection
-	VisibilityArchivalQueryMaxPageSize dynamicconfig.IntPropertyFn
-
-	SendRawWorkflowHistory dynamicconfig.BoolPropertyFnWithDomainFilter
-}
-
-// NewConfig returns new service config with default values
-func NewConfig(dc *dynamicconfig.Collection, numHistoryShards int, enableReadFromES bool, sendRawWorkflowHistory bool) *Config {
-	return &Config{
-		NumHistoryShards:                            numHistoryShards,
-		PersistenceMaxQPS:                           dc.GetIntProperty(dynamicconfig.FrontendPersistenceMaxQPS, 2000),
-		PersistenceGlobalMaxQPS:                     dc.GetIntProperty(dynamicconfig.FrontendPersistenceGlobalMaxQPS, 0),
-		VisibilityMaxPageSize:                       dc.GetIntPropertyFilteredByDomain(dynamicconfig.FrontendVisibilityMaxPageSize, 1000),
-		EnableVisibilitySampling:                    dc.GetBoolProperty(dynamicconfig.EnableVisibilitySampling, true),
-		EnableReadFromClosedExecutionV2:             dc.GetBoolProperty(dynamicconfig.EnableReadFromClosedExecutionV2, false),
-		VisibilityListMaxQPS:                        dc.GetIntPropertyFilteredByDomain(dynamicconfig.FrontendVisibilityListMaxQPS, 1),
-		EnableReadVisibilityFromES:                  dc.GetBoolPropertyFilteredByDomain(dynamicconfig.EnableReadVisibilityFromES, enableReadFromES),
-		ESVisibilityListMaxQPS:                      dc.GetIntPropertyFilteredByDomain(dynamicconfig.FrontendESVisibilityListMaxQPS, 3),
-		ESIndexMaxResultWindow:                      dc.GetIntProperty(dynamicconfig.FrontendESIndexMaxResultWindow, 10000),
-		HistoryMaxPageSize:                          dc.GetIntPropertyFilteredByDomain(dynamicconfig.FrontendHistoryMaxPageSize, common.GetHistoryMaxPageSize),
-		RPS:                                         dc.GetIntProperty(dynamicconfig.FrontendRPS, 1200),
-		MaxDomainRPSPerInstance:                     dc.GetIntPropertyFilteredByDomain(dynamicconfig.FrontendMaxDomainRPSPerInstance, 1200),
-		GlobalDomainRPS:                             dc.GetIntPropertyFilteredByDomain(dynamicconfig.FrontendGlobalDomainRPS, 0),
-		MaxIDLengthLimit:                            dc.GetIntProperty(dynamicconfig.MaxIDLengthLimit, 1000),
-		MaxIDLengthWarnLimit:                        dc.GetIntProperty(dynamicconfig.MaxIDLengthWarnLimit, 150),
-		HistoryMgrNumConns:                          dc.GetIntProperty(dynamicconfig.FrontendHistoryMgrNumConns, 10),
-		EnableAdminProtection:                       dc.GetBoolProperty(dynamicconfig.EnableAdminProtection, false),
-		AdminOperationToken:                         dc.GetStringProperty(dynamicconfig.AdminOperationToken, common.DefaultAdminOperationToken),
-		DisableListVisibilityByFilter:               dc.GetBoolPropertyFilteredByDomain(dynamicconfig.DisableListVisibilityByFilter, false),
-		BlobSizeLimitError:                          dc.GetIntPropertyFilteredByDomain(dynamicconfig.BlobSizeLimitError, 2*1024*1024),
-		BlobSizeLimitWarn:                           dc.GetIntPropertyFilteredByDomain(dynamicconfig.BlobSizeLimitWarn, 256*1024),
-		ThrottledLogRPS:                             dc.GetIntProperty(dynamicconfig.FrontendThrottledLogRPS, 20),
-		ShutdownDrainDuration:                       dc.GetDurationProperty(dynamicconfig.FrontendShutdownDrainDuration, 0),
-		EnableDomainNotActiveAutoForwarding:         dc.GetBoolPropertyFilteredByDomain(dynamicconfig.EnableDomainNotActiveAutoForwarding, true),
-		EnableGracefulFailover:                      dc.GetBoolProperty(dynamicconfig.EnableGracefulFailover, false),
-		DomainFailoverRefreshInterval:               dc.GetDurationProperty(dynamicconfig.DomainFailoverRefreshInterval, 10*time.Second),
-		DomainFailoverRefreshTimerJitterCoefficient: dc.GetFloat64Property(dynamicconfig.DomainFailoverRefreshTimerJitterCoefficient, 0.1),
-		EnableClientVersionCheck:                    dc.GetBoolProperty(dynamicconfig.EnableClientVersionCheck, false),
-		ValidSearchAttributes:                       dc.GetMapProperty(dynamicconfig.ValidSearchAttributes, definition.GetDefaultIndexedKeys()),
-		SearchAttributesNumberOfKeysLimit:           dc.GetIntPropertyFilteredByDomain(dynamicconfig.SearchAttributesNumberOfKeysLimit, 100),
-		SearchAttributesSizeOfValueLimit:            dc.GetIntPropertyFilteredByDomain(dynamicconfig.SearchAttributesSizeOfValueLimit, 2*1024),
-		SearchAttributesTotalSizeLimit:              dc.GetIntPropertyFilteredByDomain(dynamicconfig.SearchAttributesTotalSizeLimit, 40*1024),
-		VisibilityArchivalQueryMaxPageSize:          dc.GetIntProperty(dynamicconfig.VisibilityArchivalQueryMaxPageSize, 10000),
-		DisallowQuery:                               dc.GetBoolPropertyFilteredByDomain(dynamicconfig.DisallowQuery, false),
-		SendRawWorkflowHistory:                      dc.GetBoolPropertyFilteredByDomain(dynamicconfig.SendRawWorkflowHistory, sendRawWorkflowHistory),
-		domainConfig: domain.Config{
-			MaxBadBinaryCount: dc.GetIntPropertyFilteredByDomain(dynamicconfig.FrontendMaxBadBinaries, domain.MaxBadBinaries),
-			MinRetentionDays:  dc.GetIntProperty(dynamicconfig.MinRetentionDays, domain.MinRetentionDays),
-			FailoverCoolDown:  dc.GetDurationPropertyFilteredByDomain(dynamicconfig.FrontendFailoverCoolDown, domain.FailoverCoolDown),
-		},
-	}
-}
 
 // Service represents the cadence-frontend service
 type Service struct {
 	resource.Resource
 
-	status       int32
-	handler      *WorkflowHandler
-	adminHandler *AdminHandler
-	stopC        chan struct{}
-	config       *Config
-	params       *service.BootstrapParams
+	status                 int32
+	handler                *api.WorkflowHandler
+	adminHandler           admin.Handler
+	stopC                  chan struct{}
+	config                 *config.Config
+	params                 *resource.Params
+	ratelimiterCollections globalRatelimiterCollections
 }
 
 // NewService builds a new cadence-frontend service
 func NewService(
-	params *service.BootstrapParams,
+	params *resource.Params,
 ) (resource.Resource, error) {
 
 	isAdvancedVisExistInConfig := len(params.PersistenceConfig.AdvancedVisibilityStore) != 0
-	serviceConfig := NewConfig(
-		dynamicconfig.NewCollection(
-			params.DynamicConfig,
-			params.Logger,
-			dynamicconfig.ClusterNameFilter(params.ClusterMetadata.GetCurrentClusterName()),
-		),
+	serviceConfig := config.NewConfig(
+		params.DynamicCollection,
 		params.PersistenceConfig.NumHistoryShards,
 		isAdvancedVisExistInConfig,
-		false,
+		params.HostName,
+		params.Logger,
 	)
-
-	params.PersistenceConfig.HistoryMaxConns = serviceConfig.HistoryMgrNumConns()
-	params.PersistenceConfig.VisibilityConfig = &config.VisibilityConfig{
-		VisibilityListMaxQPS:            serviceConfig.VisibilityListMaxQPS,
-		EnableSampling:                  serviceConfig.EnableVisibilitySampling,
-		EnableReadFromClosedExecutionV2: serviceConfig.EnableReadFromClosedExecutionV2,
-	}
-
-	visibilityManagerInitializer := func(
-		persistenceBean persistenceClient.Bean,
-		logger log.Logger,
-	) (persistence.VisibilityManager, error) {
-		visibilityFromDB := persistenceBean.GetVisibilityManager()
-
-		var visibilityFromES persistence.VisibilityManager
-		if params.ESConfig != nil {
-			visibilityIndexName := params.ESConfig.Indices[common.VisibilityAppName]
-			visibilityConfigForES := &config.VisibilityConfig{
-				MaxQPS:                 serviceConfig.PersistenceMaxQPS,
-				VisibilityListMaxQPS:   serviceConfig.ESVisibilityListMaxQPS,
-				ESIndexMaxResultWindow: serviceConfig.ESIndexMaxResultWindow,
-				ValidSearchAttributes:  serviceConfig.ValidSearchAttributes,
-			}
-			visibilityFromES = espersistence.NewESVisibilityManager(visibilityIndexName, params.ESClient, visibilityConfigForES,
-				nil, params.MetricsClient, logger)
-		}
-		return persistence.NewVisibilityManagerWrapper(
-			visibilityFromDB,
-			visibilityFromES,
-			serviceConfig.EnableReadVisibilityFromES,
-			dynamicconfig.GetStringPropertyFn(common.AdvancedVisibilityWritingModeOff), // frontend visibility never write
-		), nil
-	}
 
 	serviceResource, err := resource.New(
 		params,
-		common.FrontendServiceName,
-		serviceConfig.PersistenceMaxQPS,
-		serviceConfig.PersistenceGlobalMaxQPS,
-		serviceConfig.ThrottledLogRPS,
-		visibilityManagerInitializer,
+		service.Frontend,
+		&service.Config{
+			PersistenceMaxQPS:       serviceConfig.PersistenceMaxQPS,
+			PersistenceGlobalMaxQPS: serviceConfig.PersistenceGlobalMaxQPS,
+			ThrottledLoggerMaxRPS:   serviceConfig.ThrottledLogRPS,
+
+			WriteVisibilityStoreName:        nil, // frontend service never write
+			EnableLogCustomerQueryParameter: serviceConfig.EnableLogCustomerQueryParameter,
+			ReadVisibilityStoreName:         serviceConfig.ReadVisibilityStoreName,
+
+			EnableDBVisibilitySampling:                  serviceConfig.EnableVisibilitySampling,
+			EnableReadDBVisibilityFromClosedExecutionV2: serviceConfig.EnableReadFromClosedExecutionV2,
+			DBVisibilityListMaxQPS:                      serviceConfig.VisibilityListMaxQPS,
+			WriteDBVisibilityOpenMaxQPS:                 nil, // frontend service never write
+			WriteDBVisibilityClosedMaxQPS:               nil, // frontend service never write
+
+			ESVisibilityListMaxQPS:     serviceConfig.ESVisibilityListMaxQPS,
+			ESIndexMaxResultWindow:     serviceConfig.ESIndexMaxResultWindow,
+			ValidSearchAttributes:      serviceConfig.ValidSearchAttributes,
+			IsErrorRetryableFunction:   common.FrontendRetry,
+			PinotOptimizedQueryColumns: serviceConfig.PinotOptimizedQueryColumns,
+		},
 	)
 	if err != nil {
 		return nil, err
@@ -235,34 +124,87 @@ func (s *Service) Start() {
 	logger := s.GetLogger()
 	logger.Info("frontend starting")
 
-	var replicationMessageSink messaging.Producer
-	clusterMetadata := s.GetClusterMetadata()
-	if clusterMetadata.IsGlobalDomainEnabled() {
-		replicationMessageSink = s.GetDomainReplicationQueue()
-	} else {
-		replicationMessageSink = messaging.NewNoopProducer()
-	}
+	// domain handler's shared between admin and workflow handler, so instantiate it centrally and share it
+	dh := domain.NewHandler(
+		s.config.DomainConfig,
+		s.GetLogger(),
+		s.GetDomainManager(),
+		s.GetDomainAuditManager(),
+		s.GetClusterMetadata(),
+		domain.NewDomainReplicator(s.GetDomainReplicationQueue(), s.GetLogger()),
+		s.GetArchivalMetadata(),
+		s.GetArchiverProvider(),
+		s.GetTimeSource(),
+	)
 
 	// Base handler
-	s.handler = NewWorkflowHandler(s, s.config, replicationMessageSink, client.NewVersionChecker())
+	s.handler = api.NewWorkflowHandler(s, s.config, client.NewVersionChecker(), dh)
+
+	collections, err := s.createGlobalQuotaCollections()
+	if err != nil {
+		logger.Fatal("constructing ratelimiter collections", tag.Error(err))
+	}
+	userRateLimiter := quotas.NewMultiStageRateLimiter(quotas.NewDynamicRateLimiter(s.config.UserRPS.AsFloat64()), collections.user, collections.userTaskList)
+	workerRateLimiter := quotas.NewMultiStageRateLimiter(quotas.NewDynamicRateLimiter(s.config.WorkerRPS.AsFloat64()), collections.worker, collections.workerTaskList)
+	visibilityRateLimiter := quotas.NewMultiStageRateLimiter(quotas.NewDynamicRateLimiter(s.config.VisibilityRPS.AsFloat64()), collections.visibility, nil)
+	asyncRateLimiter := quotas.NewMultiStageRateLimiter(quotas.NewDynamicRateLimiter(s.config.AsyncRPS.AsFloat64()), collections.async, collections.asyncTaskList)
 
 	// Additional decorations
-	var handler Handler = s.handler
-	handler = NewDCRedirectionHandler(handler, s, s.config, s.params.DCRedirectionPolicy)
-	if s.params.Authorizer != nil {
-		handler = NewAccessControlledHandlerImpl(handler, s, s.params.Authorizer)
+	var handler api.Handler = s.handler
+	handler = versioncheck.NewAPIHandler(handler, s.config, client.NewVersionChecker())
+	callerBypass := quotas.NewCallerBypass(s.config.RateLimiterBypassCallerTypes)
+	handler = ratelimited.NewAPIHandler(handler, s.GetDomainCache(), userRateLimiter, workerRateLimiter, visibilityRateLimiter, asyncRateLimiter, s.config.MaxWorkerPollDelay, callerBypass)
+	handler = metered.NewAPIHandler(handler, s.GetLogger(), s.GetMetricsClient(), s.GetDomainCache(), s.config)
+	if s.params.ClusterRedirectionPolicy != nil {
+		handler = clusterredirection.NewAPIHandler(handler, s, s.config, *s.params.ClusterRedirectionPolicy)
 	}
+	handler = accesscontrolled.NewAPIHandler(handler, s, s.params.Authorizer, s.params.AuthorizationConfig)
 
 	// Register the latest (most decorated) handler
-	// TODO: this is temporary, will be moved to Thrift specific handler later
-	s.GetDispatcher().Register(workflowserviceserver.New(handler))
-	s.GetDispatcher().Register(metaserver.New(handler))
+	thriftHandler := thrift.NewAPIHandler(handler)
+	thriftHandler.Register(s.GetDispatcher())
 
-	s.adminHandler = NewAdminHandler(s, s.params, s.config)
-	s.adminHandler.RegisterHandler()
+	grpcHandler := grpc.NewAPIHandler(handler)
+	grpcHandler.Register(s.GetDispatcher())
+
+	s.adminHandler = admin.NewHandler(s, s.params, s.config, dh)
+	s.adminHandler = accesscontrolled.NewAdminHandler(s.adminHandler, s, s.params.Authorizer, s.params.AuthorizationConfig)
+
+	adminThriftHandler := thrift.NewAdminHandler(s.adminHandler)
+	adminThriftHandler.Register(s.GetDispatcher())
+
+	adminGRPCHandler := grpc.NewAdminHandler(s.adminHandler)
+	adminGRPCHandler.Register(s.GetDispatcher())
 
 	// must start resource first
 	s.Resource.Start()
+
+	startCtx, cancel := context.WithTimeout(context.Background(), time.Second) // should take nearly no time at all
+	defer cancel()
+	if err := collections.user.OnStart(startCtx); err != nil {
+		logger.Fatal("failed to start user global ratelimiter collection", tag.Error(err))
+	}
+	if err := collections.worker.OnStart(startCtx); err != nil {
+		logger.Fatal("failed to start worker global ratelimiter collection", tag.Error(err))
+	}
+	if err := collections.visibility.OnStart(startCtx); err != nil {
+		logger.Fatal("failed to start visibility global ratelimiter collection", tag.Error(err))
+	}
+	if err := collections.async.OnStart(startCtx); err != nil {
+		logger.Fatal("failed to start async global ratelimiter collection", tag.Error(err))
+	}
+	if err := collections.userTaskList.OnStart(startCtx); err != nil {
+		logger.Fatal("failed to start user task list global ratelimiter collection", tag.Error(err))
+	}
+	if err := collections.workerTaskList.OnStart(startCtx); err != nil {
+		logger.Fatal("failed to start worker task list global ratelimiter collection", tag.Error(err))
+	}
+	if err := collections.asyncTaskList.OnStart(startCtx); err != nil {
+		logger.Fatal("failed to start async task list global ratelimiter collection", tag.Error(err))
+	}
+	cancel()
+	s.ratelimiterCollections = collections // save so they can be stopped later
+
 	s.handler.Start()
 	s.adminHandler.Start()
 
@@ -271,6 +213,106 @@ func (s *Service) Start() {
 	logger.Info("frontend started")
 
 	<-s.stopC
+}
+
+type globalRatelimiterCollections struct {
+	user, worker, visibility, async             *collection.Collection
+	userTaskList, workerTaskList, asyncTaskList *collection.Collection
+}
+
+// ratelimiterCollections contains the "base" ratelimiters that make up both:
+// - "local" limits, which do not use global-load-balancing to adjust to request load
+// - fallbacks within "global" limits, for when the global-load information cannot be retrieved (startup, errors, etc)
+type ratelimiterCollections struct {
+	user, worker, visibility, async             *quotas.Collection[string]
+	userTaskList, workerTaskList, asyncTaskList *quotas.Collection[string]
+}
+
+// taskListRPS adapts an IntPropertyFnWithTaskListInfoFilters into an IntPropertyFnWithDomainFilter
+// by parsing the composite task list key into its domain/taskList components.
+func taskListRPS(fn dynamicproperties.IntPropertyFnWithDomainAndTaskListFilter) dynamicproperties.IntPropertyFnWithDomainFilter {
+	return func(key string) int {
+		k := quotas.ParseTaskListKey(key)
+		return fn(k.Domain, k.TaskList)
+	}
+}
+
+func (s *Service) createGlobalQuotaCollections() (globalRatelimiterCollections, error) {
+	create := func(name string, local, global *quotas.Collection[string], targetRPS dynamicproperties.IntPropertyFnWithDomainFilter) (*collection.Collection, error) {
+		c, err := collection.New(
+			name,
+			local,
+			global,
+			s.config.GlobalRatelimiterUpdateInterval,
+			targetRPS,
+			s.config.GlobalRatelimiterKeyMode,
+			s.GetRatelimiterAggregatorsClient(),
+			s.GetLogger(),
+			s.GetMetricsClient(),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("error creating %v collection: %w", name, err)
+		}
+		return c, nil
+	}
+	var combinedErr error
+
+	// to safely shadow global ratelimits, we must make duplicate *quota.Collection collections
+	// so they do not share data when the global limiter decides to use its local fallback.
+	// these are then combined into the global/algorithm.Collection to handle all limiting calls
+	local, global := s.createBaseLimiters(), s.createBaseLimiters()
+
+	user, err := create("user", local.user, global.user, s.config.GlobalDomainUserRPS)
+	combinedErr = multierr.Combine(combinedErr, err)
+
+	worker, err := create("worker", local.worker, global.worker, s.config.GlobalDomainWorkerRPS)
+	combinedErr = multierr.Combine(combinedErr, err)
+
+	visibility, err := create("visibility", local.visibility, global.visibility, s.config.GlobalDomainVisibilityRPS)
+	combinedErr = multierr.Combine(combinedErr, err)
+
+	async, err := create("async", local.async, global.async, s.config.GlobalDomainAsyncRPS)
+	combinedErr = multierr.Combine(combinedErr, err)
+
+	userTaskList, err := create("userTaskList", local.userTaskList, global.userTaskList, taskListRPS(s.config.GlobalTaskListUserRPS))
+	combinedErr = multierr.Combine(combinedErr, err)
+
+	workerTaskList, err := create("workerTaskList", local.workerTaskList, global.workerTaskList, taskListRPS(s.config.GlobalTaskListWorkerRPS))
+	combinedErr = multierr.Combine(combinedErr, err)
+
+	asyncTaskList, err := create("asyncTaskList", local.asyncTaskList, global.asyncTaskList, taskListRPS(s.config.GlobalTaskListAsyncRPS))
+	combinedErr = multierr.Combine(combinedErr, err)
+
+	return globalRatelimiterCollections{
+		user:           user,
+		worker:         worker,
+		visibility:     visibility,
+		async:          async,
+		userTaskList:   userTaskList,
+		workerTaskList: workerTaskList,
+		asyncTaskList:  asyncTaskList,
+	}, combinedErr
+}
+
+func (s *Service) createBaseLimiters() ratelimiterCollections {
+	create := func(shared, perInstance dynamicproperties.IntPropertyFnWithDomainFilter) *quotas.Collection[string] {
+		return quotas.NewCollection(permember.NewPerMemberDynamicRateLimiterFactory(
+			service.Frontend,
+			shared,
+			perInstance,
+			s.GetMembershipResolver(),
+		))
+	}
+
+	return ratelimiterCollections{
+		user:           create(s.config.GlobalDomainUserRPS, s.config.MaxDomainUserRPSPerInstance),
+		worker:         create(s.config.GlobalDomainWorkerRPS, s.config.MaxDomainWorkerRPSPerInstance),
+		visibility:     create(s.config.GlobalDomainVisibilityRPS, s.config.MaxDomainVisibilityRPSPerInstance),
+		async:          create(s.config.GlobalDomainAsyncRPS, s.config.MaxDomainAsyncRPSPerInstance),
+		userTaskList:   create(taskListRPS(s.config.GlobalTaskListUserRPS), taskListRPS(s.config.MaxTaskListUserRPSPerInstance)),
+		workerTaskList: create(taskListRPS(s.config.GlobalTaskListWorkerRPS), taskListRPS(s.config.MaxTaskListWorkerRPSPerInstance)),
+		asyncTaskList:  create(taskListRPS(s.config.GlobalTaskListAsyncRPS), taskListRPS(s.config.MaxTaskListAsyncRPSPerInstance)),
+	}
 }
 
 // Stop stops the service
@@ -286,11 +328,11 @@ func (s *Service) Stop() {
 	// 4. Wait for a second
 	// 5. Stop everything forcefully and return
 
-	requestDrainTime := common.MinDuration(time.Second, s.config.ShutdownDrainDuration())
-	failureDetectionTime := common.MaxDuration(0, s.config.ShutdownDrainDuration()-requestDrainTime)
+	requestDrainTime := min(time.Second, s.config.ShutdownDrainDuration())
+	failureDetectionTime := max(0, s.config.ShutdownDrainDuration()-requestDrainTime)
 
 	s.GetLogger().Info("ShutdownHandler: Updating rpc health status to ShuttingDown")
-	s.handler.UpdateHealthStatus(HealthStatusShuttingDown)
+	s.handler.UpdateHealthStatus(api.HealthStatusShuttingDown)
 
 	s.GetLogger().Info("ShutdownHandler: Waiting for others to discover I am unhealthy")
 	time.Sleep(failureDetectionTime)
@@ -298,10 +340,38 @@ func (s *Service) Stop() {
 	s.handler.Stop()
 	s.adminHandler.Stop()
 
+	s.stopRatelimiters()
+
 	s.GetLogger().Info("ShutdownHandler: Draining traffic")
 	time.Sleep(requestDrainTime)
 
 	close(s.stopC)
 	s.Resource.Stop()
 	s.params.Logger.Info("frontend stopped")
+}
+
+func (s *Service) stopRatelimiters() {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second) // should take nearly no time at all
+	defer cancel()
+	if err := s.ratelimiterCollections.user.OnStop(ctx); err != nil {
+		s.GetLogger().Error("failed to stop user global ratelimiter collection", tag.Error(err))
+	}
+	if err := s.ratelimiterCollections.worker.OnStop(ctx); err != nil {
+		s.GetLogger().Error("failed to stop worker global ratelimiter collection", tag.Error(err))
+	}
+	if err := s.ratelimiterCollections.visibility.OnStop(ctx); err != nil {
+		s.GetLogger().Error("failed to stop visibility global ratelimiter collection", tag.Error(err))
+	}
+	if err := s.ratelimiterCollections.async.OnStop(ctx); err != nil {
+		s.GetLogger().Error("failed to stop async global ratelimiter collection", tag.Error(err))
+	}
+	if err := s.ratelimiterCollections.userTaskList.OnStop(ctx); err != nil {
+		s.GetLogger().Error("failed to stop user task list global ratelimiter collection", tag.Error(err))
+	}
+	if err := s.ratelimiterCollections.workerTaskList.OnStop(ctx); err != nil {
+		s.GetLogger().Error("failed to stop worker task list global ratelimiter collection", tag.Error(err))
+	}
+	if err := s.ratelimiterCollections.asyncTaskList.OnStop(ctx); err != nil {
+		s.GetLogger().Error("failed to stop async task list global ratelimiter collection", tag.Error(err))
+	}
 }

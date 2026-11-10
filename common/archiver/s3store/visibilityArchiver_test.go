@@ -31,24 +31,17 @@ import (
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/stretchr/testify/mock"
-
-	"github.com/uber-go/tally"
-
-	"github.com/uber/cadence/common/metrics"
-
-	"go.uber.org/zap"
-
-	"github.com/uber/cadence/.gen/go/shared"
-	"github.com/uber/cadence/common"
-	"github.com/uber/cadence/common/archiver/s3store/mocks"
-	"github.com/uber/cadence/common/log/loggerimpl"
-
-	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"github.com/uber-go/tally"
+	"go.uber.org/mock/gomock"
 
+	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/archiver"
-	"github.com/uber/cadence/common/log"
+	"github.com/uber/cadence/common/archiver/s3store/mocks"
+	"github.com/uber/cadence/common/log/testlogger"
+	"github.com/uber/cadence/common/metrics"
+	"github.com/uber/cadence/common/types"
 )
 
 type visibilityArchiverSuite struct {
@@ -57,7 +50,6 @@ type visibilityArchiverSuite struct {
 	s3cli *mocks.S3API
 
 	container         *archiver.VisibilityBootstrapContainer
-	logger            log.Logger
 	visibilityRecords []*visibilityRecord
 
 	controller      *gomock.Controller
@@ -130,10 +122,9 @@ func (s *visibilityArchiverSuite) SetupSuite() {
 	s.testArchivalURI, err = archiver.NewURI(testBucketURI)
 	s.Require().NoError(err)
 
-	zapLogger := zap.NewNop()
 	s.container = &archiver.VisibilityBootstrapContainer{
-		Logger:        loggerimpl.NewLogger(zapLogger),
-		MetricsClient: metrics.NewClient(scope, metrics.VisibilityArchiverScope),
+		Logger:        testlogger.New(s.T()),
+		MetricsClient: metrics.NewClient(scope, metrics.History, metrics.MigrationConfig{}),
 	}
 	s.setupVisibilityDirectory()
 }
@@ -163,7 +154,7 @@ func (s *visibilityArchiverSuite) TestArchive_Fail_InvalidURI() {
 		StartTimestamp:     time.Now().UnixNano(),
 		ExecutionTimestamp: 0, // workflow without backoff
 		CloseTimestamp:     time.Now().UnixNano(),
-		CloseStatus:        shared.WorkflowExecutionCloseStatusFailed,
+		CloseStatus:        types.WorkflowExecutionCloseStatusFailed,
 		HistoryLength:      int64(101),
 	}
 	err = visibilityArchiver.Archive(context.Background(), URI, request)
@@ -202,9 +193,9 @@ func (s *visibilityArchiverSuite) TestArchive_Success() {
 		StartTimestamp:     closeTimestamp.Add(-time.Hour).UnixNano(),
 		ExecutionTimestamp: 0, // workflow without backoff
 		CloseTimestamp:     closeTimestamp.UnixNano(),
-		CloseStatus:        shared.WorkflowExecutionCloseStatusFailed,
+		CloseStatus:        types.WorkflowExecutionCloseStatusFailed,
 		HistoryLength:      int64(101),
-		Memo: &shared.Memo{
+		Memo: &types.Memo{
 			Fields: map[string][]byte{
 				"testFields": {1, 2, 3},
 			},
@@ -219,7 +210,7 @@ func (s *visibilityArchiverSuite) TestArchive_Success() {
 	s.NoError(err)
 
 	expectedKey := constructTimestampIndex(URI.Path(), testDomainID, primaryIndexKeyWorkflowID, testWorkflowID, secondaryIndexKeyCloseTimeout, closeTimestamp.UnixNano(), testRunID)
-	data, err := download(context.Background(), visibilityArchiver.s3cli, URI, expectedKey)
+	data, err := download(context.Background(), visibilityArchiver.s3cli, URI, visibilityArchiver.region, expectedKey)
 	s.NoError(err, expectedKey)
 
 	archivedRecord := &archiver.ArchiveVisibilityRequest{}
@@ -433,7 +424,7 @@ func (s *visibilityArchiverSuite) TestArchiveAndQueryPrecisions() {
 			WorkflowTypeName: testWorkflowTypeName,
 			StartTimestamp:   testData.day*int64(time.Hour)*24 + testData.hour*int64(time.Hour) + testData.minute*int64(time.Minute) + testData.second*int64(time.Second),
 			CloseTimestamp:   (testData.day+30)*int64(time.Hour)*24 + testData.hour*int64(time.Hour) + testData.minute*int64(time.Minute) + testData.second*int64(time.Second),
-			CloseStatus:      shared.WorkflowExecutionCloseStatusFailed,
+			CloseStatus:      types.WorkflowExecutionCloseStatusFailed,
 			HistoryLength:    101,
 		}
 		err := visibilityArchiver.Archive(context.Background(), URI, &record)
@@ -519,7 +510,7 @@ func (s *visibilityArchiverSuite) TestArchiveAndQuery() {
 		PageSize: 1,
 		Query:    "parsed by mockParser",
 	}
-	executions := []*shared.WorkflowExecutionInfo{}
+	executions := []*types.WorkflowExecutionInfo{}
 	var first = true
 	for first || request.NextPageToken != nil {
 		response, err := visibilityArchiver.Query(context.Background(), URI, request)
@@ -544,7 +535,7 @@ func (s *visibilityArchiverSuite) TestArchiveAndQuery() {
 		PageSize: 1,
 		Query:    "parsed by mockParser",
 	}
-	executions = []*shared.WorkflowExecutionInfo{}
+	executions = []*types.WorkflowExecutionInfo{}
 	first = true
 	for first || request.NextPageToken != nil {
 		response, err := visibilityArchiver.Query(context.Background(), URI, request)
@@ -570,7 +561,7 @@ func (s *visibilityArchiverSuite) setupVisibilityDirectory() {
 			WorkflowTypeName: testWorkflowTypeName,
 			StartTimestamp:   1,
 			CloseTimestamp:   int64(1 * time.Hour),
-			CloseStatus:      shared.WorkflowExecutionCloseStatusFailed,
+			CloseStatus:      types.WorkflowExecutionCloseStatusFailed,
 			HistoryLength:    101,
 		},
 		{
@@ -581,7 +572,7 @@ func (s *visibilityArchiverSuite) setupVisibilityDirectory() {
 			WorkflowTypeName: testWorkflowTypeName,
 			StartTimestamp:   1,
 			CloseTimestamp:   int64(1*time.Hour + 30*time.Minute),
-			CloseStatus:      shared.WorkflowExecutionCloseStatusFailed,
+			CloseStatus:      types.WorkflowExecutionCloseStatusFailed,
 			HistoryLength:    101,
 		},
 		{
@@ -592,7 +583,7 @@ func (s *visibilityArchiverSuite) setupVisibilityDirectory() {
 			WorkflowTypeName: testWorkflowTypeName,
 			StartTimestamp:   1,
 			CloseTimestamp:   int64(3 * time.Hour),
-			CloseStatus:      shared.WorkflowExecutionCloseStatusFailed,
+			CloseStatus:      types.WorkflowExecutionCloseStatusFailed,
 			HistoryLength:    101,
 		},
 	}

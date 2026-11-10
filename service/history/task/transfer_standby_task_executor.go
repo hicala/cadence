@@ -22,18 +22,21 @@ package task
 
 import (
 	"context"
+	"fmt"
 	"time"
 
-	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
+	"github.com/uber/cadence/common/constants"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/ndc"
 	"github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/service/history/config"
 	"github.com/uber/cadence/service/history/execution"
 	"github.com/uber/cadence/service/history/shard"
+	"github.com/uber/cadence/service/history/simulation"
 	"github.com/uber/cadence/service/worker/archiver"
 )
 
@@ -41,8 +44,10 @@ type (
 	transferStandbyTaskExecutor struct {
 		*transferTaskExecutorBase
 
-		clusterName     string
-		historyResender ndc.HistoryResender
+		clusterName            string
+		historyResender        ndc.HistoryResender
+		getRemoteClusterNameFn func(context.Context, persistence.Task) (string, error)
+		dlqWriter              TaskDLQWriter
 	}
 )
 
@@ -50,12 +55,12 @@ type (
 func NewTransferStandbyTaskExecutor(
 	shard shard.Context,
 	archiverClient archiver.Client,
-	executionCache *execution.Cache,
+	executionCache execution.Cache,
 	historyResender ndc.HistoryResender,
 	logger log.Logger,
-	metricsClient metrics.Client,
 	clusterName string,
 	config *config.Config,
+	dlqWriter TaskDLQWriter,
 ) Executor {
 	return &transferStandbyTaskExecutor{
 		transferTaskExecutorBase: newTransferTaskExecutorBase(
@@ -63,62 +68,91 @@ func NewTransferStandbyTaskExecutor(
 			archiverClient,
 			executionCache,
 			logger,
-			metricsClient,
 			config,
+			dlqWriter,
 		),
 		clusterName:     clusterName,
 		historyResender: historyResender,
+		getRemoteClusterNameFn: func(ctx context.Context, taskInfo persistence.Task) (string, error) {
+			if shard.GetConfig().EnableTransferQueueV2(shard.GetShardID()) {
+				return getRemoteClusterName(ctx, shard.GetClusterMetadata().GetCurrentClusterName(), shard.GetActiveClusterManager(), taskInfo)
+			}
+			return clusterName, nil
+		},
+		dlqWriter: dlqWriter,
 	}
 }
 
-func (t *transferStandbyTaskExecutor) Execute(
-	taskInfo Info,
-	shouldProcessTask bool,
-) error {
-
-	transferTask, ok := taskInfo.(*persistence.TransferTaskInfo)
-	if !ok {
-		return errUnexpectedTask
+func (t *transferStandbyTaskExecutor) Execute(task Task) (ExecuteResponse, error) {
+	simulation.LogEvents(simulation.E{
+		EventName:  simulation.EventNameExecuteHistoryTask,
+		Host:       t.shard.GetConfig().HostName,
+		ShardID:    t.shard.GetShardID(),
+		DomainID:   task.GetDomainID(),
+		WorkflowID: task.GetWorkflowID(),
+		RunID:      task.GetRunID(),
+		Payload: map[string]any{
+			"task_category": persistence.HistoryTaskCategoryTransfer.Name(),
+			"task_type":     task.GetTaskType(),
+			"task_key":      task.GetTaskKey(),
+		},
+	})
+	scope := getOrCreateDomainTaggedScope(t.shard, GetTransferTaskMetricsScope(task.GetTaskType(), false), task.GetDomainID(), t.logger)
+	executeResponse := ExecuteResponse{
+		Scope:        scope,
+		IsActiveTask: false,
 	}
-
-	if !shouldProcessTask &&
-		transferTask.TaskType != persistence.TransferTaskTypeCloseExecution {
-		// guarantee the processing of workflow execution close
-		return nil
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), taskDefaultTimeout)
 	defer cancel()
 
-	switch transferTask.TaskType {
-	case persistence.TransferTaskTypeActivityTask:
-		return t.processActivityTask(ctx, transferTask)
-	case persistence.TransferTaskTypeDecisionTask:
-		return t.processDecisionTask(ctx, transferTask)
-	case persistence.TransferTaskTypeCloseExecution:
-		return t.processCloseExecution(ctx, transferTask)
-	case persistence.TransferTaskTypeCancelExecution:
-		return t.processCancelExecution(ctx, transferTask)
-	case persistence.TransferTaskTypeSignalExecution:
-		return t.processSignalExecution(ctx, transferTask)
-	case persistence.TransferTaskTypeStartChildExecution:
-		return t.processStartChildExecution(ctx, transferTask)
-	case persistence.TransferTaskTypeRecordWorkflowStarted:
-		return t.processRecordWorkflowStarted(ctx, transferTask)
-	case persistence.TransferTaskTypeResetWorkflow:
+	switch transferTask := task.GetInfo().(type) {
+	case *persistence.ActivityTask:
+		return executeResponse, t.processActivityTask(ctx, transferTask)
+	case *persistence.DecisionTask:
+		return executeResponse, t.processDecisionTask(ctx, transferTask)
+	case *persistence.CloseExecutionTask:
+		return executeResponse, t.processCloseExecution(ctx, transferTask)
+	case *persistence.RecordWorkflowClosedTask:
+		return executeResponse, t.processCloseExecution(ctx, &persistence.CloseExecutionTask{
+			WorkflowIdentifier: transferTask.WorkflowIdentifier,
+			TaskData:           transferTask.TaskData,
+		})
+	case *persistence.RecordChildExecutionCompletedTask:
+		// no action needed for standby
+		// check the comment in t.processCloseExecution()
+		return executeResponse, nil
+	case *persistence.CancelExecutionTask:
+		return executeResponse, t.processCancelExecution(ctx, transferTask)
+	case *persistence.SignalExecutionTask:
+		return executeResponse, t.processSignalExecution(ctx, transferTask)
+	case *persistence.StartChildExecutionTask:
+		return executeResponse, t.processStartChildExecution(ctx, transferTask)
+	case *persistence.RecordWorkflowStartedTask:
+		return executeResponse, t.processRecordWorkflowStarted(ctx, transferTask)
+	case *persistence.ResetWorkflowTask:
 		// no reset needed for standby
 		// TODO: add error logs
-		return nil
-	case persistence.TransferTaskTypeUpsertWorkflowSearchAttributes:
-		return t.processUpsertWorkflowSearchAttributes(ctx, transferTask)
+		return executeResponse, nil
+	case *persistence.UpsertWorkflowSearchAttributesTask:
+		return executeResponse, t.processUpsertWorkflowSearchAttributes(ctx, transferTask)
+	case *persistence.AcquireSemaphoreTask:
+		return executeResponse, t.processAcquireSemaphore(ctx, transferTask)
+	case *persistence.ReleaseSemaphoreTask:
+		// no action needed for standby: tokens are regional, and a standby acquired none here.
+		// A token left in this region by a run that was active here before a failover is freed
+		// by reconciliation.
+		return executeResponse, nil
 	default:
-		return errUnknownTransferTask
+		return executeResponse, errUnknownTransferTask
 	}
 }
 
+// Empty func for now
+func (t *transferStandbyTaskExecutor) Stop() {}
+
 func (t *transferStandbyTaskExecutor) processActivityTask(
 	ctx context.Context,
-	transferTask *persistence.TransferTaskInfo,
+	transferTask *persistence.ActivityTask,
 ) error {
 
 	processTaskIfClosed := false
@@ -134,9 +168,19 @@ func (t *transferStandbyTaskExecutor) processActivityTask(
 			return nil, err
 		}
 
-		if activityInfo.StartedID == common.EmptyEventID {
+		taskList := types.TaskList{
+			Name: activityInfo.TaskList,
+			Kind: activityInfo.TaskListKind.Ptr(),
+		}
+		if taskList.Name == "" {
+			taskList.Name = transferTask.TaskList
+		}
+
+		if activityInfo.StartedID == constants.EmptyEventID {
 			return newPushActivityToMatchingInfo(
 				activityInfo.ScheduleToStartTimeout,
+				taskList,
+				mutableState.GetExecutionInfo().PartitionConfig,
 			), nil
 		}
 
@@ -147,8 +191,10 @@ func (t *transferStandbyTaskExecutor) processActivityTask(
 		ctx,
 		processTaskIfClosed,
 		transferTask,
+		transferTask.ScheduleID,
 		actionFn,
 		getStandbyPostActionFn(
+			t.logger,
 			transferTask,
 			t.getCurrentTime,
 			t.config.StandbyTaskMissingEventsResendDelay(),
@@ -161,7 +207,7 @@ func (t *transferStandbyTaskExecutor) processActivityTask(
 
 func (t *transferStandbyTaskExecutor) processDecisionTask(
 	ctx context.Context,
-	transferTask *persistence.TransferTaskInfo,
+	transferTask *persistence.DecisionTask,
 ) error {
 
 	processTaskIfClosed := false
@@ -174,17 +220,24 @@ func (t *transferStandbyTaskExecutor) processDecisionTask(
 
 		executionInfo := mutableState.GetExecutionInfo()
 		workflowTimeout := executionInfo.WorkflowTimeout
-		decisionTimeout := common.MinInt32(workflowTimeout, common.MaxTaskTimeout)
+		decisionTimeout := min(workflowTimeout, constants.MaxTaskTimeout)
+		if executionInfo.TaskList != transferTask.TaskList {
+			// Experimental: try to push sticky task as regular task with sticky timeout as TTL.
+			// workflow might be sticky before namespace become standby
+			// there shall already be a schedule_to_start timer created
+			decisionTimeout = executionInfo.StickyScheduleToStartTimeout
+		}
 
 		ok, err := verifyTaskVersion(t.shard, t.logger, transferTask.DomainID, decisionInfo.Version, transferTask.Version, transferTask)
 		if err != nil || !ok {
 			return nil, err
 		}
 
-		if decisionInfo.StartedID == common.EmptyEventID {
+		if decisionInfo.StartedID == constants.EmptyEventID {
 			return newPushDecisionToMatchingInfo(
 				decisionTimeout,
-				workflow.TaskList{Name: &transferTask.TaskList},
+				types.TaskList{Name: executionInfo.TaskList, Kind: executionInfo.TaskListKind.Ptr()}, // at standby, always use non-sticky tasklist
+				mutableState.GetExecutionInfo().PartitionConfig,
 			), nil
 		}
 
@@ -195,8 +248,10 @@ func (t *transferStandbyTaskExecutor) processDecisionTask(
 		ctx,
 		processTaskIfClosed,
 		transferTask,
+		transferTask.ScheduleID,
 		actionFn,
 		getStandbyPostActionFn(
+			t.logger,
 			transferTask,
 			t.getCurrentTime,
 			t.config.StandbyTaskMissingEventsResendDelay(),
@@ -209,7 +264,7 @@ func (t *transferStandbyTaskExecutor) processDecisionTask(
 
 func (t *transferStandbyTaskExecutor) processCloseExecution(
 	ctx context.Context,
-	transferTask *persistence.TransferTaskInfo,
+	transferTask *persistence.CloseExecutionTask,
 ) error {
 
 	processTaskIfClosed := true
@@ -229,7 +284,7 @@ func (t *transferStandbyTaskExecutor) processCloseExecution(
 		executionInfo := mutableState.GetExecutionInfo()
 		workflowTypeName := executionInfo.WorkflowTypeName
 		workflowCloseTimestamp := wfCloseTime
-		workflowCloseStatus := persistence.ToThriftWorkflowExecutionCloseStatus(executionInfo.CloseStatus)
+		workflowCloseStatus := persistence.ToInternalWorkflowExecutionCloseStatus(executionInfo.CloseStatus)
 		workflowHistoryLength := mutableState.GetNextEventID() - 1
 		startEvent, err := mutableState.GetStartEvent(ctx)
 		if err != nil {
@@ -239,6 +294,13 @@ func (t *transferStandbyTaskExecutor) processCloseExecution(
 		workflowExecutionTimestamp := getWorkflowExecutionTimestamp(mutableState, startEvent)
 		visibilityMemo := getWorkflowMemo(executionInfo.Memo)
 		searchAttr := executionInfo.SearchAttributes
+		headers := getWorkflowHeaders(startEvent)
+		isCron := len(executionInfo.CronSchedule) > 0
+		cronSchedule := ""
+		if isCron {
+			cronSchedule = executionInfo.CronSchedule
+		}
+		updateTimestamp := t.shard.GetTimeSource().Now()
 
 		lastWriteVersion, err := mutableState.GetLastWriteVersion()
 		if err != nil {
@@ -247,6 +309,22 @@ func (t *transferStandbyTaskExecutor) processCloseExecution(
 		ok, err := verifyTaskVersion(t.shard, t.logger, transferTask.DomainID, lastWriteVersion, transferTask.Version, transferTask)
 		if err != nil || !ok {
 			return nil, err
+		}
+
+		domainEntry, err := t.shard.GetDomainCache().GetDomainByID(transferTask.DomainID)
+		if err != nil {
+			return nil, err
+		}
+		numClusters := (int16)(len(domainEntry.GetReplicationConfig().Clusters))
+
+		executionStatus := getWorkflowExecutionStatus(mutableState, completionEvent)
+
+		// Calculate ScheduledExecutionTime
+		scheduledExecutionTimestamp := startEvent.GetTimestamp()
+		if startEvent.WorkflowExecutionStartedEventAttributes != nil &&
+			startEvent.WorkflowExecutionStartedEventAttributes.GetFirstDecisionTaskBackoffSeconds() > 0 {
+			scheduledExecutionTimestamp = startEvent.GetTimestamp() +
+				int64(startEvent.WorkflowExecutionStartedEventAttributes.GetFirstDecisionTaskBackoffSeconds())*int64(time.Second)
 		}
 
 		// DO NOT REPLY TO PARENT
@@ -260,12 +338,20 @@ func (t *transferStandbyTaskExecutor) processCloseExecution(
 			workflowStartTimestamp,
 			workflowExecutionTimestamp.UnixNano(),
 			workflowCloseTimestamp,
-			workflowCloseStatus,
+			*workflowCloseStatus,
 			workflowHistoryLength,
 			transferTask.GetTaskID(),
 			visibilityMemo,
 			executionInfo.TaskList,
+			isCron,
+			cronSchedule,
+			numClusters,
+			updateTimestamp.UnixNano(),
 			searchAttr,
+			headers,
+			executionInfo.ActiveClusterSelectionPolicy.GetClusterAttribute(),
+			executionStatus,
+			scheduledExecutionTimestamp,
 		)
 	}
 
@@ -273,6 +359,7 @@ func (t *transferStandbyTaskExecutor) processCloseExecution(
 		ctx,
 		processTaskIfClosed,
 		transferTask,
+		0,
 		actionFn,
 		standbyTaskPostActionNoOp,
 	) // no op post action, since the entire workflow is finished
@@ -280,13 +367,13 @@ func (t *transferStandbyTaskExecutor) processCloseExecution(
 
 func (t *transferStandbyTaskExecutor) processCancelExecution(
 	ctx context.Context,
-	transferTask *persistence.TransferTaskInfo,
+	transferTask *persistence.CancelExecutionTask,
 ) error {
 
 	processTaskIfClosed := false
 	actionFn := func(ctx context.Context, wfContext execution.Context, mutableState execution.MutableState) (interface{}, error) {
 
-		requestCancelInfo, ok := mutableState.GetRequestCancelInfo(transferTask.ScheduleID)
+		requestCancelInfo, ok := mutableState.GetRequestCancelInfo(transferTask.InitiatedID)
 		if !ok {
 			return nil, nil
 		}
@@ -303,27 +390,29 @@ func (t *transferStandbyTaskExecutor) processCancelExecution(
 		ctx,
 		processTaskIfClosed,
 		transferTask,
+		transferTask.InitiatedID,
 		actionFn,
 		getStandbyPostActionFn(
+			t.logger,
 			transferTask,
 			t.getCurrentTime,
 			t.config.StandbyTaskMissingEventsResendDelay(),
 			t.config.StandbyTaskMissingEventsDiscardDelay(),
 			t.fetchHistoryFromRemote,
-			standbyTransferTaskPostActionTaskDiscarded,
+			standbyTaskPostActionWriteToDLQ(t.dlqWriter, t.shard, t.config.HistoryTaskDLQMode),
 		),
 	)
 }
 
 func (t *transferStandbyTaskExecutor) processSignalExecution(
 	ctx context.Context,
-	transferTask *persistence.TransferTaskInfo,
+	transferTask *persistence.SignalExecutionTask,
 ) error {
 
 	processTaskIfClosed := false
 	actionFn := func(ctx context.Context, wfContext execution.Context, mutableState execution.MutableState) (interface{}, error) {
 
-		signalInfo, ok := mutableState.GetSignalInfo(transferTask.ScheduleID)
+		signalInfo, ok := mutableState.GetSignalInfo(transferTask.InitiatedID)
 		if !ok {
 			return nil, nil
 		}
@@ -340,27 +429,29 @@ func (t *transferStandbyTaskExecutor) processSignalExecution(
 		ctx,
 		processTaskIfClosed,
 		transferTask,
+		transferTask.InitiatedID,
 		actionFn,
 		getStandbyPostActionFn(
+			t.logger,
 			transferTask,
 			t.getCurrentTime,
 			t.config.StandbyTaskMissingEventsResendDelay(),
 			t.config.StandbyTaskMissingEventsDiscardDelay(),
 			t.fetchHistoryFromRemote,
-			standbyTransferTaskPostActionTaskDiscarded,
+			standbyTaskPostActionWriteToDLQ(t.dlqWriter, t.shard, t.config.HistoryTaskDLQMode),
 		),
 	)
 }
 
 func (t *transferStandbyTaskExecutor) processStartChildExecution(
 	ctx context.Context,
-	transferTask *persistence.TransferTaskInfo,
+	transferTask *persistence.StartChildExecutionTask,
 ) error {
 
 	processTaskIfClosed := false
 	actionFn := func(ctx context.Context, wfContext execution.Context, mutableState execution.MutableState) (interface{}, error) {
 
-		childWorkflowInfo, ok := mutableState.GetChildExecutionInfo(transferTask.ScheduleID)
+		childWorkflowInfo, ok := mutableState.GetChildExecutionInfo(transferTask.InitiatedID)
 		if !ok {
 			return nil, nil
 		}
@@ -370,7 +461,7 @@ func (t *transferStandbyTaskExecutor) processStartChildExecution(
 			return nil, err
 		}
 
-		if childWorkflowInfo.StartedID != common.EmptyEventID {
+		if childWorkflowInfo.StartedID != constants.EmptyEventID {
 			return nil, nil
 		}
 
@@ -381,21 +472,68 @@ func (t *transferStandbyTaskExecutor) processStartChildExecution(
 		ctx,
 		processTaskIfClosed,
 		transferTask,
+		transferTask.InitiatedID,
 		actionFn,
 		getStandbyPostActionFn(
+			t.logger,
 			transferTask,
 			t.getCurrentTime,
 			t.config.StandbyTaskMissingEventsResendDelay(),
 			t.config.StandbyTaskMissingEventsDiscardDelay(),
 			t.fetchHistoryFromRemote,
-			standbyTransferTaskPostActionTaskDiscarded,
+			standbyTaskPostActionWriteToDLQ(t.dlqWriter, t.shard, t.config.HistoryTaskDLQMode),
+		),
+	)
+}
+
+// processAcquireSemaphore waits until replication shows the hold granted or gone. It gives up after
+// the standby discard delay, so after a failover the acquire runs only if HistoryTaskDLQMode is enabled.
+func (t *transferStandbyTaskExecutor) processAcquireSemaphore(
+	ctx context.Context,
+	transferTask *persistence.AcquireSemaphoreTask,
+) error {
+
+	processTaskIfClosed := false
+	actionFn := func(ctx context.Context, wfContext execution.Context, mutableState execution.MutableState) (interface{}, error) {
+
+		semaphoreInfo, ok := mutableState.GetSemaphoreInfo(transferTask.InitiatedID)
+		if !ok {
+			return nil, nil
+		}
+
+		ok, err := verifyTaskVersion(t.shard, t.logger, transferTask.DomainID, semaphoreInfo.Version, transferTask.Version, transferTask)
+		if err != nil || !ok {
+			return nil, err
+		}
+
+		if semaphoreInfo.HasToken() {
+			return nil, nil
+		}
+
+		return getHistoryResendInfo(mutableState)
+	}
+
+	return t.processTransfer(
+		ctx,
+		processTaskIfClosed,
+		transferTask,
+		transferTask.InitiatedID,
+		actionFn,
+		getStandbyPostActionFn(
+			t.logger,
+			transferTask,
+			t.getCurrentTime,
+			t.config.StandbyTaskMissingEventsResendDelay(),
+			t.config.StandbyTaskMissingEventsDiscardDelay(),
+			t.fetchHistoryFromRemote,
+			standbyTaskPostActionWriteToDLQ(t.dlqWriter, t.shard, t.config.HistoryTaskDLQMode),
 		),
 	)
 }
 
 func (t *transferStandbyTaskExecutor) processRecordWorkflowStarted(
 	ctx context.Context,
-	transferTask *persistence.TransferTaskInfo,
+	transferTask *persistence.RecordWorkflowStartedTask,
 ) error {
 
 	processTaskIfClosed := false
@@ -403,6 +541,7 @@ func (t *transferStandbyTaskExecutor) processRecordWorkflowStarted(
 		ctx,
 		processTaskIfClosed,
 		transferTask,
+		0,
 		func(ctx context.Context, wfContext execution.Context, mutableState execution.MutableState) (interface{}, error) {
 			return nil, t.processRecordWorkflowStartedOrUpsertHelper(ctx, transferTask, mutableState, true)
 		},
@@ -412,7 +551,7 @@ func (t *transferStandbyTaskExecutor) processRecordWorkflowStarted(
 
 func (t *transferStandbyTaskExecutor) processUpsertWorkflowSearchAttributes(
 	ctx context.Context,
-	transferTask *persistence.TransferTaskInfo,
+	transferTask *persistence.UpsertWorkflowSearchAttributesTask,
 ) error {
 
 	processTaskIfClosed := false
@@ -420,6 +559,7 @@ func (t *transferStandbyTaskExecutor) processUpsertWorkflowSearchAttributes(
 		ctx,
 		processTaskIfClosed,
 		transferTask,
+		0,
 		func(ctx context.Context, wfContext execution.Context, mutableState execution.MutableState) (interface{}, error) {
 			return nil, t.processRecordWorkflowStartedOrUpsertHelper(ctx, transferTask, mutableState, false)
 		},
@@ -429,10 +569,12 @@ func (t *transferStandbyTaskExecutor) processUpsertWorkflowSearchAttributes(
 
 func (t *transferStandbyTaskExecutor) processRecordWorkflowStartedOrUpsertHelper(
 	ctx context.Context,
-	transferTask *persistence.TransferTaskInfo,
+	transferTask persistence.Task,
 	mutableState execution.MutableState,
 	isRecordStart bool,
 ) error {
+
+	workflowStartedScope := getOrCreateDomainTaggedScope(t.shard, metrics.TransferStandbyTaskRecordWorkflowStartedScope, transferTask.GetDomainID(), t.logger)
 
 	// verify task version for RecordWorkflowStarted.
 	// upsert doesn't require verifyTask, because it is just a sync of mutableState.
@@ -441,7 +583,7 @@ func (t *transferStandbyTaskExecutor) processRecordWorkflowStartedOrUpsertHelper
 		if err != nil {
 			return err
 		}
-		ok, err := verifyTaskVersion(t.shard, t.logger, transferTask.DomainID, startVersion, transferTask.Version, transferTask)
+		ok, err := verifyTaskVersion(t.shard, t.logger, transferTask.GetDomainID(), startVersion, transferTask.GetVersion(), transferTask)
 		if err != nil || !ok {
 			return err
 		}
@@ -457,29 +599,58 @@ func (t *transferStandbyTaskExecutor) processRecordWorkflowStartedOrUpsertHelper
 	startTimestamp := startEvent.GetTimestamp()
 	executionTimestamp := getWorkflowExecutionTimestamp(mutableState, startEvent)
 	visibilityMemo := getWorkflowMemo(executionInfo.Memo)
+	isCron := len(executionInfo.CronSchedule) > 0
+	cronSchedule := ""
+	if isCron {
+		cronSchedule = executionInfo.CronSchedule
+	}
+	updateTimestamp := t.shard.GetTimeSource().Now()
+
+	domainEntry, err := t.shard.GetDomainCache().GetDomainByID(transferTask.GetDomainID())
+	if err != nil {
+		return err
+	}
+	numClusters := (int16)(len(domainEntry.GetReplicationConfig().Clusters))
+
 	searchAttr := copySearchAttributes(executionInfo.SearchAttributes)
+	headers := getWorkflowHeaders(startEvent)
+
+	isAdvancedVisibilityEnabled := common.IsAdvancedVisibilityWritingEnabled(
+		t.config.WriteVisibilityStoreName(),
+		t.config.IsAdvancedVisConfigExist,
+	)
+	executionStatus, scheduledExecutionTimestamp := determineExecutionStatusForVisibility(startEvent, mutableState, isAdvancedVisibilityEnabled)
 
 	if isRecordStart {
+		workflowStartedScope.IncCounter(metrics.WorkflowStartedCount)
 		return t.recordWorkflowStarted(
 			ctx,
-			transferTask.DomainID,
-			transferTask.WorkflowID,
-			transferTask.RunID,
+			transferTask.GetDomainID(),
+			transferTask.GetWorkflowID(),
+			transferTask.GetRunID(),
 			wfTypeName,
 			startTimestamp,
 			executionTimestamp.UnixNano(),
 			workflowTimeout,
 			transferTask.GetTaskID(),
 			executionInfo.TaskList,
+			isCron,
+			numClusters,
 			visibilityMemo,
+			updateTimestamp.UnixNano(),
 			searchAttr,
+			headers,
+			executionInfo.ActiveClusterSelectionPolicy.GetClusterAttribute(),
+			cronSchedule,
+			executionStatus,
+			scheduledExecutionTimestamp,
 		)
 	}
 	return t.upsertWorkflowExecution(
 		ctx,
-		transferTask.DomainID,
-		transferTask.WorkflowID,
-		transferTask.RunID,
+		transferTask.GetDomainID(),
+		transferTask.GetWorkflowID(),
+		transferTask.GetRunID(),
 		wfTypeName,
 		startTimestamp,
 		executionTimestamp.UnixNano(),
@@ -487,7 +658,15 @@ func (t *transferStandbyTaskExecutor) processRecordWorkflowStartedOrUpsertHelper
 		transferTask.GetTaskID(),
 		executionInfo.TaskList,
 		visibilityMemo,
+		isCron,
+		numClusters,
+		updateTimestamp.UnixNano(),
 		searchAttr,
+		headers,
+		executionInfo.ActiveClusterSelectionPolicy.GetClusterAttribute(),
+		cronSchedule,
+		executionStatus,
+		scheduledExecutionTimestamp,
 	)
 
 }
@@ -495,29 +674,31 @@ func (t *transferStandbyTaskExecutor) processRecordWorkflowStartedOrUpsertHelper
 func (t *transferStandbyTaskExecutor) processTransfer(
 	ctx context.Context,
 	processTaskIfClosed bool,
-	taskInfo Info,
+	transferTask persistence.Task,
+	eventID int64,
 	actionFn standbyActionFn,
 	postActionFn standbyPostActionFn,
 ) (retError error) {
-
-	transferTask := taskInfo.(*persistence.TransferTaskInfo)
 	wfContext, release, err := t.executionCache.GetOrCreateWorkflowExecutionWithTimeout(
-		transferTask.DomainID,
+		transferTask.GetDomainID(),
 		getWorkflowExecution(transferTask),
 		taskGetExecutionContextTimeout,
 	)
 	if err != nil {
+		if err == context.DeadlineExceeded {
+			return errWorkflowBusy
+		}
 		return err
 	}
 	defer func() {
-		if retError == ErrTaskRedispatch {
+		if isRedispatchErr(err) {
 			release(nil)
 		} else {
 			release(retError)
 		}
 	}()
 
-	mutableState, err := loadMutableStateForTransferTask(ctx, wfContext, transferTask, t.metricsClient, t.logger)
+	mutableState, err := loadMutableState(ctx, wfContext, transferTask, t.metricsClient.Scope(metrics.TransferQueueProcessorScope), t.logger, eventID)
 	if err != nil || mutableState == nil {
 		return err
 	}
@@ -533,12 +714,12 @@ func (t *transferStandbyTaskExecutor) processTransfer(
 	}
 
 	release(nil)
-	return postActionFn(ctx, taskInfo, historyResendInfo, t.logger)
+	return postActionFn(ctx, transferTask, historyResendInfo, t.logger)
 }
 
 func (t *transferStandbyTaskExecutor) pushActivity(
 	ctx context.Context,
-	task Info,
+	task persistence.Task,
 	postActionInfo interface{},
 	logger log.Logger,
 ) error {
@@ -547,18 +728,16 @@ func (t *transferStandbyTaskExecutor) pushActivity(
 		return nil
 	}
 
-	pushActivityInfo := postActionInfo.(*pushActivityToMatchingInfo)
-	timeout := common.MinInt32(pushActivityInfo.activityScheduleToStartTimeout, common.MaxTaskTimeout)
 	return t.transferTaskExecutorBase.pushActivity(
 		ctx,
-		task.(*persistence.TransferTaskInfo),
-		timeout,
+		task.(*persistence.ActivityTask),
+		postActionInfo.(*pushActivityToMatchingInfo),
 	)
 }
 
 func (t *transferStandbyTaskExecutor) pushDecision(
 	ctx context.Context,
-	task Info,
+	task persistence.Task,
 	postActionInfo interface{},
 	logger log.Logger,
 ) error {
@@ -567,66 +746,74 @@ func (t *transferStandbyTaskExecutor) pushDecision(
 		return nil
 	}
 
-	pushDecisionInfo := postActionInfo.(*pushDecisionToMatchingInfo)
-	timeout := common.MinInt32(pushDecisionInfo.decisionScheduleToStartTimeout, common.MaxTaskTimeout)
 	return t.transferTaskExecutorBase.pushDecision(
 		ctx,
-		task.(*persistence.TransferTaskInfo),
-		&pushDecisionInfo.tasklist,
-		timeout,
+		task.(*persistence.DecisionTask),
+		postActionInfo.(*pushDecisionToMatchingInfo),
 	)
 }
 
 func (t *transferStandbyTaskExecutor) fetchHistoryFromRemote(
-	_ context.Context,
-	taskInfo Info,
+	ctx context.Context,
+	taskInfo persistence.Task,
 	postActionInfo interface{},
-	log log.Logger,
+	_ log.Logger,
 ) error {
 
 	if postActionInfo == nil {
 		return nil
 	}
 
-	transferTask := taskInfo.(*persistence.TransferTaskInfo)
 	resendInfo := postActionInfo.(*historyResendInfo)
 
 	t.metricsClient.IncCounter(metrics.HistoryRereplicationByTransferTaskScope, metrics.CadenceClientRequests)
+	rereplicationLatencyStart := time.Now()
 	stopwatch := t.metricsClient.StartTimer(metrics.HistoryRereplicationByTransferTaskScope, metrics.CadenceClientLatency)
-	defer stopwatch.Stop()
+	defer func() {
+		stopwatch.Stop()
+		t.metricsClient.Scope(metrics.HistoryRereplicationByTransferTaskScope).ExponentialHistogram(metrics.CadenceClientLatencyHistogram, time.Since(rereplicationLatencyStart))
+	}()
 
-	var err error
+	remoteClusterName, err := t.getRemoteClusterNameFn(ctx, taskInfo)
+	if err != nil {
+		return err
+	}
 	if resendInfo.lastEventID != nil && resendInfo.lastEventVersion != nil {
 		// note history resender doesn't take in a context parameter, there's a separate dynamicconfig for
 		// controlling the timeout for resending history.
 		err = t.historyResender.SendSingleWorkflowHistory(
-			transferTask.DomainID,
-			transferTask.WorkflowID,
-			transferTask.RunID,
+			remoteClusterName,
+			taskInfo.GetDomainID(),
+			taskInfo.GetWorkflowID(),
+			taskInfo.GetRunID(),
 			resendInfo.lastEventID,
 			resendInfo.lastEventVersion,
 			nil,
 			nil,
 		)
 	} else {
-		err = &workflow.InternalServiceError{
-			Message: "transferQueueStandbyProcessor encounter empty historyResendInfo",
+		err = &types.InternalServiceError{
+			Message: fmt.Sprintf("incomplete historyResendInfo: %v", resendInfo),
 		}
 	}
 
 	if err != nil {
 		t.logger.Error("Error re-replicating history from remote.",
 			tag.ShardID(t.shard.GetShardID()),
-			tag.WorkflowDomainID(transferTask.DomainID),
-			tag.WorkflowID(transferTask.WorkflowID),
-			tag.WorkflowRunID(transferTask.RunID),
-			tag.SourceCluster(t.clusterName))
+			tag.WorkflowDomainID(taskInfo.GetDomainID()),
+			tag.WorkflowID(taskInfo.GetWorkflowID()),
+			tag.WorkflowRunID(taskInfo.GetRunID()),
+			tag.SourceCluster(remoteClusterName),
+			tag.Error(err),
+		)
 	}
 
 	// return error so task processing logic will retry
-	return ErrTaskRedispatch
+	return &redispatchError{Reason: "fetchHistoryFromRemote"}
 }
 
-func (t *transferStandbyTaskExecutor) getCurrentTime() time.Time {
-	return t.shard.GetCurrentTime(t.clusterName)
+func (t *transferStandbyTaskExecutor) getCurrentTime(taskInfo persistence.Task) (time.Time, error) {
+	// for standby task, we can always use timesource.Now, because they're supposed to be processed immediately after creation,
+	// this is what're doing for queue v2, for queue v1, I just don't bother to change the behavior
+	return t.shard.GetCurrentTime(t.clusterName), nil
 }

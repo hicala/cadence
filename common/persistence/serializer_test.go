@@ -21,463 +21,556 @@
 package persistence
 
 import (
-	"sync"
+	"fmt"
 	"testing"
 	"time"
 
-	"github.com/uber/cadence/.gen/go/history"
+	"github.com/stretchr/testify/assert"
 
-	"github.com/stretchr/testify/require"
-	"github.com/stretchr/testify/suite"
-
-	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
-	"github.com/uber/cadence/common/log"
-	"github.com/uber/cadence/common/log/loggerimpl"
+	"github.com/uber/cadence/common/checksum"
+	"github.com/uber/cadence/common/constants"
+	"github.com/uber/cadence/common/dynamicconfig/dynamicproperties"
+	"github.com/uber/cadence/common/types"
 )
 
-type (
-	cadenceSerializerSuite struct {
-		suite.Suite
-		// override suite.Suite.Assertions with require.Assertions; this means that s.NotNil(nil) will stop the test,
-		// not merely log an error
-		*require.Assertions
-		logger log.Logger
-	}
-)
-
-func TestCadenceSerializerSuite(t *testing.T) {
-	s := new(cadenceSerializerSuite)
-	suite.Run(t, s)
+type testDef struct {
+	name string
+	// payloads is a map of payload name to payload. "nil" is a special name for nil payload which expects to return nil with some exceptions
+	payloads      map[string]any
+	nilHandled    bool
+	serializeFn   func(any, constants.EncodingType) (*DataBlob, error)
+	deserializeFn func(*DataBlob) (any, error)
 }
 
-func (s *cadenceSerializerSuite) SetupTest() {
-	var err error
-	s.logger, err = loggerimpl.NewDevelopment()
-	s.Require().NoError(err)
-	// Have to define our overridden assertions in the test setup. If we did it earlier, s.T() will return nil
-	s.Assertions = require.New(s.T())
+// key is encoding type, value is whether the encoding type is supported
+var encodingTypes = map[constants.EncodingType]bool{
+	constants.EncodingTypeEmpty:    true,
+	constants.EncodingTypeUnknown:  true,
+	constants.EncodingTypeJSON:     true,
+	constants.EncodingTypeThriftRW: true,
+	constants.EncodingTypeGob:      false,
 }
 
-func (s *cadenceSerializerSuite) TestSerializer() {
+type runnableTest struct {
+	testDef
+	encoding    constants.EncodingType
+	supported   bool
+	payloadName string
+	payload     any
+}
 
-	concurrency := 1
-	startWG := sync.WaitGroup{}
-	doneWG := sync.WaitGroup{}
-
-	startWG.Add(1)
-	doneWG.Add(concurrency)
-
+func TestSerializers(t *testing.T) {
+	// create serializer once and reuse it for all test cases in parallel to catch concurrency issues
 	serializer := NewPayloadSerializer()
 
-	event0 := &workflow.HistoryEvent{
-		EventId:   common.Int64Ptr(999),
-		Timestamp: common.Int64Ptr(time.Now().UnixNano()),
-		EventType: common.EventTypePtr(workflow.EventTypeActivityTaskCompleted),
-		ActivityTaskCompletedEventAttributes: &workflow.ActivityTaskCompletedEventAttributes{
-			Result:           []byte("result-1-event-1"),
-			ScheduledEventId: common.Int64Ptr(4),
-			StartedEventId:   common.Int64Ptr(5),
-			Identity:         common.StringPtr("event-1"),
+	tests := []testDef{
+		{
+			name: "history event",
+			payloads: map[string]any{
+				"nil":    (*types.HistoryEvent)(nil),
+				"normal": generateTestHistoryEvent(1),
+			},
+			serializeFn: func(payload any, encoding constants.EncodingType) (*DataBlob, error) {
+				return serializer.SerializeEvent(payload.(*types.HistoryEvent), encoding)
+			},
+			deserializeFn: func(data *DataBlob) (any, error) {
+				return serializer.DeserializeEvent(data)
+			},
+		},
+		{
+			name: "batch history events",
+			payloads: map[string]any{
+				"nil":    ([]*types.HistoryEvent)(nil),
+				"normal": generateTestHistoryEventBatch(),
+			},
+			nilHandled: true,
+			serializeFn: func(payload any, encoding constants.EncodingType) (*DataBlob, error) {
+				return serializer.SerializeBatchEvents(payload.([]*types.HistoryEvent), encoding)
+			},
+			deserializeFn: func(data *DataBlob) (any, error) {
+				return serializer.DeserializeBatchEvents(data)
+			},
+		},
+		{
+			name: "visibility memo",
+			payloads: map[string]any{
+				"nil":    (*types.Memo)(nil),
+				"normal": generateVisibilityMemo(),
+			},
+			serializeFn: func(payload any, encoding constants.EncodingType) (*DataBlob, error) {
+				return serializer.SerializeVisibilityMemo(payload.(*types.Memo), encoding)
+			},
+			deserializeFn: func(data *DataBlob) (any, error) {
+				return serializer.DeserializeVisibilityMemo(data)
+			},
+		},
+		{
+			name: "version histories",
+			payloads: map[string]any{
+				"nil":    (*types.VersionHistories)(nil),
+				"normal": generateVersionHistories(),
+			},
+			serializeFn: func(payload any, encoding constants.EncodingType) (*DataBlob, error) {
+				return serializer.SerializeVersionHistories(payload.(*types.VersionHistories), encoding)
+			},
+			deserializeFn: func(data *DataBlob) (any, error) {
+				return serializer.DeserializeVersionHistories(data)
+			},
+		},
+		{
+			name: "reset points",
+			payloads: map[string]any{
+				"nil":    (*types.ResetPoints)(nil),
+				"normal": generateResetPoints(),
+			},
+			nilHandled: true,
+			serializeFn: func(payload any, encoding constants.EncodingType) (*DataBlob, error) {
+				return serializer.SerializeResetPoints(payload.(*types.ResetPoints), encoding)
+			},
+			deserializeFn: func(data *DataBlob) (any, error) {
+				return serializer.DeserializeResetPoints(data)
+			},
+		},
+		{
+			name: "bad binaries",
+			payloads: map[string]any{
+				"nil":    (*types.BadBinaries)(nil),
+				"normal": generateBadBinaries(),
+			},
+			nilHandled: true,
+			serializeFn: func(payload any, encoding constants.EncodingType) (*DataBlob, error) {
+				return serializer.SerializeBadBinaries(payload.(*types.BadBinaries), encoding)
+			},
+			deserializeFn: func(data *DataBlob) (any, error) {
+				return serializer.DeserializeBadBinaries(data)
+			},
+		},
+		{
+			name: "processing queue states",
+			payloads: map[string]any{
+				"nil":    (*types.ProcessingQueueStates)(nil),
+				"normal": generateProcessingQueueStates(),
+			},
+			serializeFn: func(payload any, encoding constants.EncodingType) (*DataBlob, error) {
+				return serializer.SerializeProcessingQueueStates(payload.(*types.ProcessingQueueStates), encoding)
+			},
+			deserializeFn: func(data *DataBlob) (any, error) {
+				return serializer.DeserializeProcessingQueueStates(data)
+			},
+		},
+		{
+			name: "dynamic config blob",
+			payloads: map[string]any{
+				"nil":    (*types.DynamicConfigBlob)(nil),
+				"normal": generateDynamicConfigBlob(),
+			},
+			serializeFn: func(payload any, encoding constants.EncodingType) (*DataBlob, error) {
+				return serializer.SerializeDynamicConfigBlob(payload.(*types.DynamicConfigBlob), encoding)
+			},
+			deserializeFn: func(data *DataBlob) (any, error) {
+				return serializer.DeserializeDynamicConfigBlob(data)
+			},
+		},
+		{
+			name: "isolation group",
+			payloads: map[string]any{
+				"nil":    (*types.IsolationGroupConfiguration)(nil),
+				"normal": generateIsolationGroupConfiguration(),
+			},
+			serializeFn: func(payload any, encoding constants.EncodingType) (*DataBlob, error) {
+				return serializer.SerializeIsolationGroups(payload.(*types.IsolationGroupConfiguration), encoding)
+			},
+			deserializeFn: func(data *DataBlob) (any, error) {
+				return serializer.DeserializeIsolationGroups(data)
+			},
+		},
+		{
+			name: "failover markers",
+			payloads: map[string]any{
+				"nil":    ([]*types.FailoverMarkerAttributes)(nil),
+				"normal": generateFailoverMarkerAttributes(),
+			},
+			serializeFn: func(payload any, encoding constants.EncodingType) (*DataBlob, error) {
+				return serializer.SerializePendingFailoverMarkers(payload.([]*types.FailoverMarkerAttributes), encoding)
+			},
+			deserializeFn: func(data *DataBlob) (any, error) {
+				return serializer.DeserializePendingFailoverMarkers(data)
+			},
+		},
+		{
+			name: "async workflow config",
+			payloads: map[string]any{
+				"nil":    (*types.AsyncWorkflowConfiguration)(nil),
+				"normal": generateAsyncWorkflowConfig(),
+			},
+			serializeFn: func(payload any, encoding constants.EncodingType) (*DataBlob, error) {
+				return serializer.SerializeAsyncWorkflowsConfig(payload.(*types.AsyncWorkflowConfiguration), encoding)
+			},
+			deserializeFn: func(data *DataBlob) (any, error) {
+				return serializer.DeserializeAsyncWorkflowsConfig(data)
+			},
+		},
+		{
+			name: "checksum",
+			payloads: map[string]any{
+				"empty":  checksum.Checksum{},
+				"normal": generateChecksum(),
+			},
+			serializeFn: func(payload any, encoding constants.EncodingType) (*DataBlob, error) {
+				return serializer.SerializeChecksum(payload.(checksum.Checksum), encoding)
+			},
+			deserializeFn: func(data *DataBlob) (any, error) {
+				return serializer.DeserializeChecksum(data)
+			},
+		},
+		{
+			name: "active clusters",
+			payloads: map[string]any{
+				"nil":    (*types.ActiveClusters)(nil),
+				"normal": generateActiveClusters(),
+			},
+			serializeFn: func(payload any, encoding constants.EncodingType) (*DataBlob, error) {
+				return serializer.SerializeActiveClusters(payload.(*types.ActiveClusters), encoding)
+			},
+			deserializeFn: func(data *DataBlob) (any, error) {
+				return serializer.DeserializeActiveClusters(data)
+			},
+		},
+		{
+			name: "active cluster selection policy",
+			payloads: map[string]any{
+				"nil":    (*types.ActiveClusterSelectionPolicy)(nil),
+				"normal": generateActiveClusterSelectionPolicy(),
+			},
+			serializeFn: func(payload any, encoding constants.EncodingType) (*DataBlob, error) {
+				return serializer.SerializeActiveClusterSelectionPolicy(payload.(*types.ActiveClusterSelectionPolicy), encoding)
+			},
+			deserializeFn: func(data *DataBlob) (any, error) {
+				return serializer.DeserializeActiveClusterSelectionPolicy(data)
+			},
+		},
+		{
+			name: "replication DLQ task",
+			payloads: map[string]any{
+				"nil":    (*types.ReplicationTask)(nil),
+				"normal": generateReplicationTask(),
+			},
+			serializeFn: func(payload any, encoding constants.EncodingType) (*DataBlob, error) {
+				return serializer.SerializeReplicationDLQTask(payload.(*types.ReplicationTask), encoding)
+			},
+			deserializeFn: func(data *DataBlob) (any, error) {
+				return serializer.DeserializeReplicationDLQTask(data)
+			},
 		},
 	}
 
-	history0 := &workflow.History{Events: []*workflow.HistoryEvent{event0, event0}}
+	// generate runnable test cases here so actual test body is not 3 level nested
+	var runnableTests []runnableTest
+	for _, td := range tests {
+		for encoding, supported := range encodingTypes {
+			for payloadName, payload := range td.payloads {
+				if _, ok := payload.(checksum.Checksum); ok {
+					if encoding != constants.EncodingTypeJSON {
+						continue
+					}
+				}
+				runnableTests = append(runnableTests, runnableTest{
+					testDef:     td,
+					encoding:    encoding,
+					supported:   supported,
+					payloadName: payloadName,
+					payload:     payload,
+				})
+			}
+		}
+	}
 
+	for _, tc := range runnableTests {
+		tc := tc
+		t.Run(fmt.Sprintf("%s with encoding:%s,payload:%s", tc.name, tc.encoding, tc.payloadName), func(t *testing.T) {
+			t.Parallel()
+
+			serialized, err := tc.serializeFn(tc.payload, tc.encoding)
+			// expect error if the encoding type is not supported. special case is nil payloads.
+			// most of the serialization functions return early for nils but
+			// some of them call underlying helper function which checks encoding type and raises error.
+			wantErr := !tc.supported && !(tc.payloadName == "nil" && !tc.nilHandled)
+			if wantErr != (err != nil) {
+				t.Fatalf("Got serialization err: %v, want err?: %v", err, wantErr)
+			}
+			if err != nil {
+				return
+			}
+
+			deserialized, err := tc.deserializeFn(serialized)
+			if err != nil {
+				t.Fatalf("Got serialization err: %v", err)
+			}
+
+			if deserialized == nil {
+				t.Fatalf("Got nil deserialized payload")
+			}
+
+			if tc.payloadName == "nil" {
+				return
+			}
+		})
+	}
+}
+
+func TestDataBlob_GetData(t *testing.T) {
+	tests := map[string]struct {
+		in          *DataBlob
+		expectedOut []byte
+	}{
+		"valid data": {
+			in:          &DataBlob{Data: []byte("dat")},
+			expectedOut: []byte("dat"),
+		},
+		"empty data": {
+			in:          &DataBlob{Data: nil},
+			expectedOut: []byte{},
+		},
+		"empty data 2": {
+			in:          nil,
+			expectedOut: []byte{},
+		},
+	}
+
+	for name, td := range tests {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, td.expectedOut, td.in.GetData())
+		})
+	}
+}
+
+func generateTestHistoryEvent(id int64) *types.HistoryEvent {
+	return &types.HistoryEvent{
+		ID:        id,
+		Timestamp: common.Int64Ptr(time.Now().UnixNano()),
+		EventType: types.EventTypeActivityTaskCompleted.Ptr(),
+		ActivityTaskCompletedEventAttributes: &types.ActivityTaskCompletedEventAttributes{
+			Result:           []byte("result-1-event-1"),
+			ScheduledEventID: 4,
+			StartedEventID:   5,
+			Identity:         "event-1",
+		},
+	}
+}
+
+func generateTestHistoryEventBatch() []*types.HistoryEvent {
+	return []*types.HistoryEvent{
+		generateTestHistoryEvent(111),
+		generateTestHistoryEvent(112),
+		generateTestHistoryEvent(113),
+	}
+}
+
+func generateVisibilityMemo() *types.Memo {
 	memoFields := map[string][]byte{
 		"TestField": []byte(`Test binary`),
 	}
-	memo0 := &workflow.Memo{Fields: memoFields}
+	return &types.Memo{Fields: memoFields}
+}
 
-	resetPoints0 := &workflow.ResetPoints{
-		Points: []*workflow.ResetPointInfo{
-			{
-				BinaryChecksum:           common.StringPtr("bad-binary-cs"),
-				RunId:                    common.StringPtr("test-run-id"),
-				FirstDecisionCompletedId: common.Int64Ptr(123),
-				CreatedTimeNano:          common.Int64Ptr(456),
-				ExpiringTimeNano:         common.Int64Ptr(789),
-				Resettable:               common.BoolPtr(true),
-			},
-		},
-	}
-
-	badBinaries0 := &workflow.BadBinaries{
-		Binaries: map[string]*workflow.BadBinaryInfo{
-			"bad-binary-cs": {
-				CreatedTimeNano: common.Int64Ptr(456),
-				Operator:        common.StringPtr("test-operattor"),
-				Reason:          common.StringPtr("test-reason"),
-			},
-		},
-	}
-
-	histories := &workflow.VersionHistories{
-		Histories: []*workflow.VersionHistory{
+func generateVersionHistories() *types.VersionHistories {
+	return &types.VersionHistories{
+		Histories: []*types.VersionHistory{
 			{
 				BranchToken: []byte{1},
-				Items: []*workflow.VersionHistoryItem{
+				Items: []*types.VersionHistoryItem{
 					{
-						EventID: common.Int64Ptr(1),
-						Version: common.Int64Ptr(0),
+						EventID: 1,
+						Version: 0,
 					},
 					{
-						EventID: common.Int64Ptr(2),
-						Version: common.Int64Ptr(1),
+						EventID: 2,
+						Version: 1,
 					},
 				},
 			},
 			{
 				BranchToken: []byte{2},
-				Items: []*workflow.VersionHistoryItem{
+				Items: []*types.VersionHistoryItem{
 					{
-						EventID: common.Int64Ptr(2),
-						Version: common.Int64Ptr(0),
+						EventID: 2,
+						Version: 0,
 					},
 					{
-						EventID: common.Int64Ptr(3),
-						Version: common.Int64Ptr(1),
+						EventID: 3,
+						Version: 1,
 					},
 				},
 			},
 		},
 	}
+}
 
-	domainFilter := &history.DomainFilter{
-		DomainIDs:    []string{"domain1", "domain2"},
-		ReverseMatch: common.BoolPtr(true),
-	}
-	processingQueueStateMap := map[string][]*history.ProcessingQueueState{
-		"cluster1": {
-			&history.ProcessingQueueState{
-				Level:        common.Int32Ptr(0),
-				AckLevel:     common.Int64Ptr(1),
-				MaxLevel:     common.Int64Ptr(2),
-				DomainFilter: domainFilter,
-			},
-		},
-		"cluster2": {
-			&history.ProcessingQueueState{
-				Level:        common.Int32Ptr(3),
-				AckLevel:     common.Int64Ptr(4),
-				MaxLevel:     common.Int64Ptr(5),
-				DomainFilter: domainFilter,
+func generateResetPoints() *types.ResetPoints {
+	return &types.ResetPoints{
+		Points: []*types.ResetPointInfo{
+			{
+				BinaryChecksum:           "bad-binary-cs",
+				RunID:                    "test-run-id",
+				FirstDecisionCompletedID: 123,
+				CreatedTimeNano:          common.Int64Ptr(456),
+				ExpiringTimeNano:         common.Int64Ptr(789),
+				Resettable:               true,
 			},
 		},
 	}
-	processingQueueStates := &history.ProcessingQueueStates{StatesByCluster: processingQueueStateMap}
-
-	for i := 0; i < concurrency; i++ {
-
-		go func() {
-
-			startWG.Wait()
-			defer doneWG.Done()
-
-			// serialize event
-
-			nilEvent, err := serializer.SerializeEvent(nil, common.EncodingTypeThriftRW)
-			s.Nil(err)
-			s.Nil(nilEvent)
-
-			_, err = serializer.SerializeEvent(event0, common.EncodingTypeGob)
-			s.NotNil(err)
-			_, ok := err.(*UnknownEncodingTypeError)
-			s.True(ok)
-
-			dJSON, err := serializer.SerializeEvent(event0, common.EncodingTypeJSON)
-			s.Nil(err)
-			s.NotNil(dJSON)
-
-			dThrift, err := serializer.SerializeEvent(event0, common.EncodingTypeThriftRW)
-			s.Nil(err)
-			s.NotNil(dThrift)
-
-			dEmpty, err := serializer.SerializeEvent(event0, common.EncodingType(""))
-			s.Nil(err)
-			s.NotNil(dEmpty)
-
-			// serialize batch events
-
-			nilEvents, err := serializer.SerializeBatchEvents(nil, common.EncodingTypeThriftRW)
-			s.Nil(err)
-			s.NotNil(nilEvents)
-
-			_, err = serializer.SerializeBatchEvents(history0.Events, common.EncodingTypeGob)
-			s.NotNil(err)
-			_, ok = err.(*UnknownEncodingTypeError)
-			s.True(ok)
-
-			dsJSON, err := serializer.SerializeBatchEvents(history0.Events, common.EncodingTypeJSON)
-			s.Nil(err)
-			s.NotNil(dsJSON)
-
-			dsThrift, err := serializer.SerializeBatchEvents(history0.Events, common.EncodingTypeThriftRW)
-			s.Nil(err)
-			s.NotNil(dsThrift)
-
-			dsEmpty, err := serializer.SerializeBatchEvents(history0.Events, common.EncodingType(""))
-			s.Nil(err)
-			s.NotNil(dsEmpty)
-
-			_, err = serializer.SerializeVisibilityMemo(memo0, common.EncodingTypeGob)
-			s.NotNil(err)
-			_, ok = err.(*UnknownEncodingTypeError)
-			s.True(ok)
-
-			// serialize visibility memo
-
-			nilMemo, err := serializer.SerializeVisibilityMemo(nil, common.EncodingTypeThriftRW)
-			s.Nil(err)
-			s.Nil(nilMemo)
-
-			mJSON, err := serializer.SerializeVisibilityMemo(memo0, common.EncodingTypeJSON)
-			s.Nil(err)
-			s.NotNil(mJSON)
-
-			mThrift, err := serializer.SerializeVisibilityMemo(memo0, common.EncodingTypeThriftRW)
-			s.Nil(err)
-			s.NotNil(mThrift)
-
-			mEmpty, err := serializer.SerializeVisibilityMemo(memo0, common.EncodingType(""))
-			s.Nil(err)
-			s.NotNil(mEmpty)
-
-			// serialize version histories
-
-			nilHistories, err := serializer.SerializeVersionHistories(nil, common.EncodingTypeThriftRW)
-			s.Nil(err)
-			s.Nil(nilHistories)
-
-			historiesJSON, err := serializer.SerializeVersionHistories(histories, common.EncodingTypeJSON)
-			s.Nil(err)
-			s.NotNil(historiesJSON)
-
-			historiesThrift, err := serializer.SerializeVersionHistories(histories, common.EncodingTypeThriftRW)
-			s.Nil(err)
-			s.NotNil(historiesThrift)
-
-			historiesEmpty, err := serializer.SerializeVersionHistories(histories, common.EncodingType(""))
-			s.Nil(err)
-			s.NotNil(historiesEmpty)
-
-			// deserialize event
-
-			dNilEvent, err := serializer.DeserializeEvent(nilEvent)
-			s.Nil(err)
-			s.Nil(dNilEvent)
-
-			event1, err := serializer.DeserializeEvent(dJSON)
-			s.Nil(err)
-			s.True(event0.Equals(event1))
-
-			event2, err := serializer.DeserializeEvent(dThrift)
-			s.Nil(err)
-			s.True(event0.Equals(event2))
-
-			event3, err := serializer.DeserializeEvent(dEmpty)
-			s.Nil(err)
-			s.True(event0.Equals(event3))
-
-			// deserialize batch events
-
-			dNilEvents, err := serializer.DeserializeBatchEvents(nilEvents)
-			s.Nil(err)
-			s.Nil(dNilEvents)
-
-			events, err := serializer.DeserializeBatchEvents(dsJSON)
-			history1 := &workflow.History{Events: events}
-			s.Nil(err)
-			s.True(history0.Equals(history1))
-
-			events, err = serializer.DeserializeBatchEvents(dsThrift)
-			history2 := &workflow.History{Events: events}
-			s.Nil(err)
-			s.True(history0.Equals(history2))
-
-			events, err = serializer.DeserializeBatchEvents(dsEmpty)
-			history3 := &workflow.History{Events: events}
-			s.Nil(err)
-			s.True(history0.Equals(history3))
-
-			// deserialize visibility memo
-
-			dNilMemo, err := serializer.DeserializeVisibilityMemo(nilMemo)
-			s.Nil(err)
-			s.Equal(&workflow.Memo{}, dNilMemo)
-
-			memo1, err := serializer.DeserializeVisibilityMemo(mJSON)
-			s.Nil(err)
-			s.True(memo0.Equals(memo1))
-
-			memo2, err := serializer.DeserializeVisibilityMemo(mThrift)
-			s.Nil(err)
-			s.True(memo0.Equals(memo2))
-			memo3, err := serializer.DeserializeVisibilityMemo(mEmpty)
-			s.Nil(err)
-			s.True(memo0.Equals(memo3))
-
-			// serialize reset points
-
-			nilResetPoints, err := serializer.SerializeResetPoints(nil, common.EncodingTypeThriftRW)
-			s.Nil(err)
-			s.NotNil(nilResetPoints)
-
-			_, err = serializer.SerializeResetPoints(resetPoints0, common.EncodingTypeGob)
-			s.NotNil(err)
-			_, ok = err.(*UnknownEncodingTypeError)
-			s.True(ok)
-
-			resetPointsJSON, err := serializer.SerializeResetPoints(resetPoints0, common.EncodingTypeJSON)
-			s.Nil(err)
-			s.NotNil(resetPointsJSON)
-
-			resetPointsThrift, err := serializer.SerializeResetPoints(resetPoints0, common.EncodingTypeThriftRW)
-			s.Nil(err)
-			s.NotNil(resetPointsThrift)
-
-			resetPointsEmpty, err := serializer.SerializeResetPoints(resetPoints0, common.EncodingType(""))
-			s.Nil(err)
-			s.NotNil(resetPointsEmpty)
-
-			// deserialize reset points
-
-			dNilResetPoints1, err := serializer.DeserializeResetPoints(nil)
-			s.Nil(err)
-			s.Equal(&workflow.ResetPoints{}, dNilResetPoints1)
-
-			dNilResetPoints2, err := serializer.DeserializeResetPoints(nilResetPoints)
-			s.Nil(err)
-			s.Equal(&workflow.ResetPoints{}, dNilResetPoints2)
-
-			resetPoints1, err := serializer.DeserializeResetPoints(resetPointsJSON)
-			s.Nil(err)
-			s.True(resetPoints1.Equals(resetPoints0))
-
-			resetPoints2, err := serializer.DeserializeResetPoints(resetPointsThrift)
-			s.Nil(err)
-			s.True(resetPoints2.Equals(resetPoints0))
-
-			resetPoints3, err := serializer.DeserializeResetPoints(resetPointsEmpty)
-			s.Nil(err)
-			s.True(resetPoints3.Equals(resetPoints0))
-
-			// serialize bad binaries
-
-			nilBadBinaries, err := serializer.SerializeBadBinaries(nil, common.EncodingTypeThriftRW)
-			s.Nil(err)
-			s.NotNil(nilBadBinaries)
-
-			_, err = serializer.SerializeBadBinaries(badBinaries0, common.EncodingTypeGob)
-			s.NotNil(err)
-			_, ok = err.(*UnknownEncodingTypeError)
-			s.True(ok)
-
-			badBinariesJSON, err := serializer.SerializeBadBinaries(badBinaries0, common.EncodingTypeJSON)
-			s.Nil(err)
-			s.NotNil(badBinariesJSON)
-
-			badBinariesThrift, err := serializer.SerializeBadBinaries(badBinaries0, common.EncodingTypeThriftRW)
-			s.Nil(err)
-			s.NotNil(badBinariesThrift)
-
-			badBinariesEmpty, err := serializer.SerializeBadBinaries(badBinaries0, common.EncodingType(""))
-			s.Nil(err)
-			s.NotNil(badBinariesEmpty)
-
-			// deserialize bad binaries
-
-			dNilBadBinaries1, err := serializer.DeserializeBadBinaries(nil)
-			s.Nil(err)
-			s.Equal(&workflow.BadBinaries{}, dNilBadBinaries1)
-
-			dNilBadBinaries2, err := serializer.DeserializeBadBinaries(nilBadBinaries)
-			s.Nil(err)
-			s.Equal(&workflow.BadBinaries{}, dNilBadBinaries2)
-
-			badBinaries1, err := serializer.DeserializeBadBinaries(badBinariesJSON)
-			s.Nil(err)
-			s.True(badBinaries1.Equals(badBinaries0))
-
-			badBinaries2, err := serializer.DeserializeBadBinaries(badBinariesThrift)
-			s.Nil(err)
-			s.True(badBinaries2.Equals(badBinaries0))
-
-			badBinaries3, err := serializer.DeserializeBadBinaries(badBinariesEmpty)
-			s.Nil(err)
-			s.True(badBinaries3.Equals(badBinaries0))
-
-			// serialize version histories
-
-			dNilHistories, err := serializer.DeserializeVersionHistories(nil)
-			s.Nil(err)
-			s.Equal(&workflow.VersionHistories{}, dNilHistories)
-
-			dNilHistories2, err := serializer.DeserializeVersionHistories(nilHistories)
-			s.Nil(err)
-			s.Equal(&workflow.VersionHistories{}, dNilHistories2)
-
-			dHistoriesJSON, err := serializer.DeserializeVersionHistories(historiesJSON)
-			s.Nil(err)
-			s.True(dHistoriesJSON.Equals(histories))
-
-			dHistoriesThrift, err := serializer.DeserializeVersionHistories(historiesThrift)
-			s.Nil(err)
-			s.True(dHistoriesThrift.Equals(histories))
-
-			dHistoriesEmpty, err := serializer.DeserializeVersionHistories(historiesEmpty)
-			s.Nil(err)
-			s.True(dHistoriesEmpty.Equals(histories))
-
-			// serialize processing queue states
-
-			nilProcessingQueueStates, err := serializer.SerializeProcessingQueueStates(nil, common.EncodingTypeThriftRW)
-			s.Nil(err)
-			s.Nil(nilProcessingQueueStates)
-
-			_, err = serializer.SerializeProcessingQueueStates(processingQueueStates, common.EncodingTypeGob)
-			s.NotNil(err)
-			_, ok = err.(*UnknownEncodingTypeError)
-			s.True(ok)
-
-			processingQueueStatesJSON, err := serializer.SerializeProcessingQueueStates(processingQueueStates, common.EncodingTypeJSON)
-			s.Nil(err)
-			s.NotNil(processingQueueStatesJSON)
-
-			processingQueueStatesThrift, err := serializer.SerializeProcessingQueueStates(processingQueueStates, common.EncodingTypeThriftRW)
-			s.Nil(err)
-			s.NotNil(processingQueueStatesThrift)
-
-			processingQueueStatesEmpty, err := serializer.SerializeProcessingQueueStates(processingQueueStates, common.EncodingType(""))
-			s.Nil(err)
-			s.NotNil(processingQueueStatesEmpty)
-
-			// deserialize processing queue states
-
-			dNilProcessingQueueStates1, err := serializer.DeserializeProcessingQueueStates(nil)
-			s.Nil(err)
-			s.Nil(dNilProcessingQueueStates1)
-
-			dNilProcessingQueueStates2, err := serializer.DeserializeProcessingQueueStates(nilProcessingQueueStates)
-			s.Nil(err)
-			s.Nil(dNilProcessingQueueStates2)
-
-			dProcessingQueueStatesJSON, err := serializer.DeserializeProcessingQueueStates(processingQueueStatesJSON)
-			s.Nil(err)
-			s.True(dProcessingQueueStatesJSON.Equals(processingQueueStates))
-
-			dProcessingQueueStatesThrift, err := serializer.DeserializeProcessingQueueStates(processingQueueStatesThrift)
-			s.Nil(err)
-			s.True(dProcessingQueueStatesThrift.Equals(processingQueueStates))
-
-			dProcessingQueueStatesEmpty, err := serializer.DeserializeProcessingQueueStates(processingQueueStatesEmpty)
-			s.Nil(err)
-			s.True(dProcessingQueueStatesEmpty.Equals(processingQueueStates))
-
-		}()
+}
+
+func generateBadBinaries() *types.BadBinaries {
+	return &types.BadBinaries{
+		Binaries: map[string]*types.BadBinaryInfo{
+			"bad-binary-cs": {
+				CreatedTimeNano: common.Int64Ptr(456),
+				Operator:        "test-operattor",
+				Reason:          "test-reason",
+			},
+		},
 	}
+}
 
-	startWG.Done()
-	succ := common.AwaitWaitGroup(&doneWG, 10*time.Second)
-	s.True(succ, "test timed out")
+func generateProcessingQueueStates() *types.ProcessingQueueStates {
+	return &types.ProcessingQueueStates{
+		StatesByCluster: map[string][]*types.ProcessingQueueState{
+			"cluster1": {
+				&types.ProcessingQueueState{
+					Level:    common.Int32Ptr(0),
+					AckLevel: common.Int64Ptr(1),
+					MaxLevel: common.Int64Ptr(2),
+					DomainFilter: &types.DomainFilter{
+						DomainIDs:    []string{"domain1", "domain2"},
+						ReverseMatch: true,
+					},
+				},
+			},
+			"cluster2": {
+				&types.ProcessingQueueState{
+					Level:    common.Int32Ptr(3),
+					AckLevel: common.Int64Ptr(4),
+					MaxLevel: common.Int64Ptr(5),
+					DomainFilter: &types.DomainFilter{
+						DomainIDs:    []string{"domain3", "domain4"},
+						ReverseMatch: true,
+					},
+				},
+			},
+		},
+	}
+}
+
+func generateDynamicConfigBlob() *types.DynamicConfigBlob {
+	return &types.DynamicConfigBlob{
+		SchemaVersion: 1,
+		Entries: []*types.DynamicConfigEntry{
+			{
+				Name: dynamicproperties.TestGetBoolPropertyKey.String(),
+				Values: []*types.DynamicConfigValue{
+					{
+						Value: &types.DataBlob{
+							EncodingType: types.EncodingTypeJSON.Ptr(),
+							Data:         []byte("false"),
+						},
+						Filters: nil,
+					},
+				},
+			},
+		},
+	}
+}
+
+func generateIsolationGroupConfiguration() *types.IsolationGroupConfiguration {
+	return &types.IsolationGroupConfiguration{
+		"zone-1": {
+			Name:  "zone-1",
+			State: types.IsolationGroupStateDrained,
+		},
+		"zone-2": {
+			Name:  "zone-2",
+			State: types.IsolationGroupStateHealthy,
+		},
+	}
+}
+
+func generateFailoverMarkerAttributes() []*types.FailoverMarkerAttributes {
+	return []*types.FailoverMarkerAttributes{
+		{
+			DomainID:        "domain1",
+			FailoverVersion: 123,
+			CreationTime:    common.Int64Ptr(time.Now().UnixNano()),
+		},
+		{
+			DomainID:        "domain2",
+			FailoverVersion: 456,
+			CreationTime:    common.Int64Ptr(time.Now().UnixNano()),
+		},
+	}
+}
+
+func generateAsyncWorkflowConfig() *types.AsyncWorkflowConfiguration {
+	return &types.AsyncWorkflowConfiguration{
+		Enabled:             true,
+		PredefinedQueueName: "test-queue",
+		QueueType:           "kafka",
+		QueueConfig: &types.DataBlob{
+			EncodingType: types.EncodingTypeJSON.Ptr(),
+			Data:         []byte(`{"key":"value"}`),
+		},
+	}
+}
+
+func generateChecksum() checksum.Checksum {
+	return checksum.Checksum{
+		Flavor:  checksum.FlavorIEEECRC32OverThriftBinary,
+		Version: 1,
+		Value:   []byte("test-checksum"),
+	}
+}
+
+func generateActiveClusters() *types.ActiveClusters {
+	return &types.ActiveClusters{
+		AttributeScopes: map[string]types.ClusterAttributeScope{
+			"region": {
+				ClusterAttributes: map[string]types.ActiveClusterInfo{
+					"region1": {
+						ActiveClusterName: "cluster1",
+						FailoverVersion:   2,
+					},
+					"region2": {
+						ActiveClusterName: "cluster2",
+						FailoverVersion:   3,
+					},
+				},
+			},
+		},
+	}
+}
+
+func generateActiveClusterSelectionPolicy() *types.ActiveClusterSelectionPolicy {
+	return &types.ActiveClusterSelectionPolicy{
+		ClusterAttribute: &types.ClusterAttribute{Scope: "region", Name: "region1"},
+	}
+}
+
+func generateReplicationTask() *types.ReplicationTask {
+	return &types.ReplicationTask{
+		TaskType:     types.ReplicationTaskTypeHistoryV2.Ptr(),
+		SourceTaskID: 42,
+		HistoryTaskV2Attributes: &types.HistoryTaskV2Attributes{
+			DomainID:   "test-domain-id",
+			WorkflowID: "test-workflow-id",
+			RunID:      "test-run-id",
+			VersionHistoryItems: []*types.VersionHistoryItem{
+				{EventID: 10, Version: 1},
+			},
+			Events: &types.DataBlob{
+				EncodingType: types.EncodingTypeThriftRW.Ptr(),
+				Data:         []byte("test-events-data"),
+			},
+		},
+	}
 }

@@ -23,27 +23,22 @@ package schema
 import (
 	"bufio"
 	"io"
-	"os"
+	"io/fs"
 	"strings"
 )
 
 const newLineDelim = '\n'
 
-// ParseFile takes a cql / sql file path as input
+// ParseFile takes a cql / sql file as input
 // and returns an array of cql / sql statements on
 // success.
-func ParseFile(filePath string) ([]string, error) {
-	// #nosec
-	f, err := os.Open(filePath)
-	if err != nil {
-		return nil, err
-	}
-
-	reader := bufio.NewReader(f)
+func ParseFile(file fs.File) ([]string, error) {
+	reader := bufio.NewReader(file)
 
 	var line string
 	var currStmt string
 	var stmts = make([]string, 0, 4)
+	var err error
 
 	for err == nil {
 
@@ -60,8 +55,8 @@ func ParseFile(filePath string) ([]string, error) {
 		if len(tokens) > 0 && len(tokens[0]) > 0 {
 			currStmt += tokens[0]
 			// semi-colon is the end of statement delim
-			if strings.HasSuffix(currStmt, ";") {
-				stmts = append(stmts, currStmt)
+			if stmt := strings.TrimSpace(currStmt); strings.HasSuffix(stmt, ";") {
+				stmts = append(stmts, stmt)
 				currStmt = ""
 			}
 		}

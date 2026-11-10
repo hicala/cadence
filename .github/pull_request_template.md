@@ -1,15 +1,18 @@
-<!-- Describe what has changed in this PR -->
+<!-- If you are new to contributing or want a refresher, please read ./pull_request_guidance.md -->
 **What changed?**
 
 
-<!-- Tell your future self why have you made these changes -->
 **Why?**
 
 
-<!-- How have you verified this change? Tested locally? Added a unit test? Checked in staging env? -->
 **How did you test it?**
 
 
-<!-- Assuming the worst case, what can be broken when deploying this change to production? -->
 **Potential risks**
+
+
+**Release notes**
+
+
+**Documentation Changes**
 

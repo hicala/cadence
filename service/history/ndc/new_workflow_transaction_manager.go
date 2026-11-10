@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-//go:generate mockgen -copyright_file ../../../LICENSE -package $GOPACKAGE -source $GOFILE -destination new_workflow_transaction_mamanger_mock.go
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination new_workflow_transaction_mamanger_mock.go
 
 package ndc
 
@@ -27,8 +27,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/uber/cadence/.gen/go/shared"
+	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/types"
+	"github.com/uber/cadence/service/history/events"
 	"github.com/uber/cadence/service/history/execution"
 )
 
@@ -43,6 +45,7 @@ type (
 
 	transactionManagerForNewWorkflowImpl struct {
 		transactionManager transactionManager
+		logger             log.Logger
 	}
 )
 
@@ -50,10 +53,12 @@ var _ transactionManagerForNewWorkflow = (*transactionManagerForNewWorkflowImpl)
 
 func newTransactionManagerForNewWorkflow(
 	transactionManager transactionManager,
+	logger log.Logger,
 ) transactionManagerForNewWorkflow {
 
 	return &transactionManagerForNewWorkflowImpl{
 		transactionManager: transactionManager,
+		logger:             logger,
 	}
 }
 
@@ -157,10 +162,20 @@ func (r *transactionManagerForNewWorkflowImpl) createAsCurrent(
 		return err
 	}
 
-	targetWorkflowHistorySize, err := targetWorkflow.GetContext().PersistFirstWorkflowEvents(
-		ctx,
-		targetWorkflowEventsSeq[0],
-	)
+	var targetWorkflowHistoryBlob events.PersistedBlob
+	if len(targetWorkflowEventsSeq[0].Events) > 0 {
+		if targetWorkflowEventsSeq[0].Events[0].GetEventType() == types.EventTypeWorkflowExecutionStarted {
+			targetWorkflowHistoryBlob, err = targetWorkflow.GetContext().PersistStartWorkflowBatchEvents(
+				ctx,
+				targetWorkflowEventsSeq[0],
+			)
+		} else { // reset workflows fall into else branch
+			targetWorkflowHistoryBlob, err = targetWorkflow.GetContext().PersistNonStartWorkflowBatchEvents(
+				ctx,
+				targetWorkflowEventsSeq[0],
+			)
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -170,18 +185,18 @@ func (r *transactionManagerForNewWorkflowImpl) createAsCurrent(
 		// current workflow exists, need to do compare and swap
 		createMode := persistence.CreateWorkflowModeWorkflowIDReuse
 		prevRunID := currentWorkflow.GetMutableState().GetExecutionInfo().RunID
-		prevLastWriteVersion, _, err := currentWorkflow.GetVectorClock()
+		prevVectorClock, err := currentWorkflow.GetVectorClock()
 		if err != nil {
 			return err
 		}
 		return targetWorkflow.GetContext().CreateWorkflowExecution(
 			ctx,
 			targetWorkflowSnapshot,
-			targetWorkflowHistorySize,
-			now,
+			targetWorkflowHistoryBlob,
 			createMode,
 			prevRunID,
-			prevLastWriteVersion,
+			prevVectorClock.LastWriteVersion,
+			persistence.CreateWorkflowRequestModeReplicated,
 		)
 	}
 
@@ -192,11 +207,11 @@ func (r *transactionManagerForNewWorkflowImpl) createAsCurrent(
 	return targetWorkflow.GetContext().CreateWorkflowExecution(
 		ctx,
 		targetWorkflowSnapshot,
-		targetWorkflowHistorySize,
-		now,
+		targetWorkflowHistoryBlob,
 		createMode,
 		prevRunID,
 		prevLastWriteVersion,
+		persistence.CreateWorkflowRequestModeReplicated,
 	)
 }
 
@@ -214,7 +229,7 @@ func (r *transactionManagerForNewWorkflowImpl) createAsZombie(
 		return err
 	}
 	if targetWorkflowPolicy != execution.TransactionPolicyPassive {
-		return &shared.InternalServiceError{
+		return &types.InternalServiceError{
 			Message: "nDCTransactionManagerForNewWorkflow createAsZombie encounter target workflow policy not being passive",
 		}
 	}
@@ -227,13 +242,29 @@ func (r *transactionManagerForNewWorkflowImpl) createAsZombie(
 		return err
 	}
 
-	targetWorkflowHistorySize, err := targetWorkflow.GetContext().PersistFirstWorkflowEvents(
-		ctx,
-		targetWorkflowEventsSeq[0],
-	)
+	var targetWorkflowHistoryBlob events.PersistedBlob
+	if len(targetWorkflowEventsSeq[0].Events) > 0 {
+		if targetWorkflowEventsSeq[0].Events[0].GetEventType() == types.EventTypeWorkflowExecutionStarted {
+			targetWorkflowHistoryBlob, err = targetWorkflow.GetContext().PersistStartWorkflowBatchEvents(
+				ctx,
+				targetWorkflowEventsSeq[0],
+			)
+		} else { // reset workflows fall into else branch
+			targetWorkflowHistoryBlob, err = targetWorkflow.GetContext().PersistNonStartWorkflowBatchEvents(
+				ctx,
+				targetWorkflowEventsSeq[0],
+			)
+		}
+	}
 	if err != nil {
 		return err
 	}
+
+	// release lock on current workflow, since current cluster maybe the active cluster
+	// and events maybe reapplied to current workflow
+	// TODO: add functional test for this case.
+	currentWorkflow.GetReleaseFn()(nil)
+	currentWorkflow = nil
 
 	if err := targetWorkflow.GetContext().ReapplyEvents(
 		targetWorkflowEventsSeq,
@@ -247,11 +278,11 @@ func (r *transactionManagerForNewWorkflowImpl) createAsZombie(
 	err = targetWorkflow.GetContext().CreateWorkflowExecution(
 		ctx,
 		targetWorkflowSnapshot,
-		targetWorkflowHistorySize,
-		now,
+		targetWorkflowHistoryBlob,
 		createMode,
 		prevRunID,
 		prevLastWriteVersion,
+		persistence.CreateWorkflowRequestModeReplicated,
 	)
 	switch err.(type) {
 	case nil:
@@ -281,6 +312,11 @@ func (r *transactionManagerForNewWorkflowImpl) suppressCurrentAndCreateAsCurrent
 		return err
 	}
 
+	r.logger.Debugf("suppressCurrentAndCreateAsCurrent calling UpdateWorkflowExecutionWithNew for wfID %s, current policy %v, new policy %v",
+		currentWorkflow.GetMutableState().GetExecutionInfo().WorkflowID,
+		currentWorkflowPolicy,
+		execution.TransactionPolicyPassive,
+	)
 	return currentWorkflow.GetContext().UpdateWorkflowExecutionWithNew(
 		ctx,
 		now,
@@ -289,6 +325,7 @@ func (r *transactionManagerForNewWorkflowImpl) suppressCurrentAndCreateAsCurrent
 		targetWorkflow.GetMutableState(),
 		currentWorkflowPolicy,
 		execution.TransactionPolicyPassive.Ptr(),
+		persistence.CreateWorkflowRequestModeReplicated,
 	)
 }
 
@@ -335,7 +372,7 @@ func (r *transactionManagerForNewWorkflowImpl) executeTransaction(
 		)
 
 	default:
-		return &shared.InternalServiceError{
+		return &types.InternalServiceError{
 			Message: fmt.Sprintf("nDCTransactionManager: encounter unknown transaction type: %v", transactionPolicy),
 		}
 	}

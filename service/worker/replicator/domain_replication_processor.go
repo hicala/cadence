@@ -25,22 +25,21 @@ package replicator
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
-	"go.uber.org/cadence/.gen/go/shared"
-
-	"github.com/uber/cadence/.gen/go/replicator"
-	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/client/admin"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/backoff"
+	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/domain"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/membership"
 	"github.com/uber/cadence/common/metrics"
-	"github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/service"
+	"github.com/uber/cadence/common/types"
 )
 
 const (
@@ -49,76 +48,97 @@ const (
 	pollIntervalSecs                          = 1
 	taskProcessorErrorRetryWait               = time.Second
 	taskProcessorErrorRetryBackoffCoefficient = 1
-	taskProcessorErrorRetryMaxAttampts        = 5
+)
+
+type (
+	domainReplicationProcessor struct {
+		hostInfo               membership.HostInfo
+		membershipResolver     membership.Resolver
+		status                 int32
+		sourceCluster          string
+		currentCluster         string
+		logger                 log.Logger
+		remotePeer             admin.Client
+		taskExecutor           domain.ReplicationTaskExecutor
+		semaphoreTaskExecutor  domain.SemaphoreReplicationTaskExecutor
+		metricsClient          metrics.Client
+		throttleRetry          *backoff.ThrottleRetry
+		lastProcessedMessageID int64
+		lastRetrievedMessageID int64
+		ctx                    context.Context
+		cancelFn               context.CancelFunc
+		wg                     sync.WaitGroup
+		timeSource             clock.TimeSource
+		domainReplicationQueue domain.ReplicationQueue
+	}
 )
 
 func newDomainReplicationProcessor(
 	sourceCluster string,
+	currentCluster string,
 	logger log.Logger,
 	remotePeer admin.Client,
 	metricsClient metrics.Client,
 	taskExecutor domain.ReplicationTaskExecutor,
-	hostInfo *membership.HostInfo,
-	serviceResolver membership.ServiceResolver,
-	domainReplicationQueue persistence.DomainReplicationQueue,
+	semaphoreTaskExecutor domain.SemaphoreReplicationTaskExecutor,
+	hostInfo membership.HostInfo,
+	resolver membership.Resolver,
+	domainReplicationQueue domain.ReplicationQueue,
+	replicationMaxRetry time.Duration,
+	timeSource clock.TimeSource,
 ) *domainReplicationProcessor {
 	retryPolicy := backoff.NewExponentialRetryPolicy(taskProcessorErrorRetryWait)
 	retryPolicy.SetBackoffCoefficient(taskProcessorErrorRetryBackoffCoefficient)
-	retryPolicy.SetMaximumAttempts(taskProcessorErrorRetryMaxAttampts)
+	retryPolicy.SetExpirationInterval(replicationMaxRetry)
+	throttleRetry := backoff.NewThrottleRetry(
+		backoff.WithRetryPolicy(retryPolicy),
+		backoff.WithRetryableError(isTransientRetryableError),
+	)
 
+	ctx, cancel := context.WithCancel(context.Background())
 	return &domainReplicationProcessor{
 		hostInfo:               hostInfo,
-		serviceResolver:        serviceResolver,
+		membershipResolver:     resolver,
 		status:                 common.DaemonStatusInitialized,
 		sourceCluster:          sourceCluster,
+		currentCluster:         currentCluster,
 		logger:                 logger,
 		remotePeer:             remotePeer,
 		taskExecutor:           taskExecutor,
+		semaphoreTaskExecutor:  semaphoreTaskExecutor,
 		metricsClient:          metricsClient,
-		retryPolicy:            retryPolicy,
+		throttleRetry:          throttleRetry,
 		lastProcessedMessageID: -1,
 		lastRetrievedMessageID: -1,
-		done:                   make(chan struct{}),
+		ctx:                    ctx,
+		cancelFn:               cancel,
+		timeSource:             timeSource,
 		domainReplicationQueue: domainReplicationQueue,
 	}
 }
-
-type (
-	domainReplicationProcessor struct {
-		hostInfo               *membership.HostInfo
-		serviceResolver        membership.ServiceResolver
-		status                 int32
-		sourceCluster          string
-		logger                 log.Logger
-		remotePeer             admin.Client
-		taskExecutor           domain.ReplicationTaskExecutor
-		metricsClient          metrics.Client
-		retryPolicy            backoff.RetryPolicy
-		lastProcessedMessageID int64
-		lastRetrievedMessageID int64
-		done                   chan struct{}
-		domainReplicationQueue persistence.DomainReplicationQueue
-	}
-)
 
 func (p *domainReplicationProcessor) Start() {
 	if !atomic.CompareAndSwapInt32(&p.status, common.DaemonStatusInitialized, common.DaemonStatusStarted) {
 		return
 	}
 
+	p.wg.Add(1)
 	go p.processorLoop()
+	p.logger.Info("Domain replication processor started.")
 }
 
 func (p *domainReplicationProcessor) processorLoop() {
-	timer := time.NewTimer(getWaitDuration())
+	defer p.wg.Done()
+	dur := getWaitDuration()
+	timer := p.timeSource.NewTimer(dur)
+	defer timer.Stop()
 
 	for {
 		select {
-		case <-timer.C:
+		case <-timer.Chan():
 			p.fetchDomainReplicationTasks()
 			timer.Reset(getWaitDuration())
-		case <-p.done:
-			timer.Stop()
+		case <-p.ctx.Done():
 			return
 		}
 	}
@@ -130,7 +150,7 @@ func (p *domainReplicationProcessor) fetchDomainReplicationTasks() {
 	// for a small period of time two or more workers think they are the owner and try to execute
 	// the processing logic. This will not result in correctness issue as domain replication task
 	// processing will be protected by version check.
-	info, err := p.serviceResolver.Lookup(p.sourceCluster)
+	info, err := p.membershipResolver.Lookup(service.Worker, p.sourceCluster)
 	if err != nil {
 		p.logger.Info("Failed to lookup host info. Skip current run.")
 		return
@@ -141,10 +161,11 @@ func (p *domainReplicationProcessor) fetchDomainReplicationTasks() {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), fetchTaskRequestTimeout)
-	request := &replicator.GetDomainReplicationMessagesRequest{
-		LastRetrievedMessageId: common.Int64Ptr(p.lastRetrievedMessageID),
-		LastProcessedMessageId: common.Int64Ptr(p.lastProcessedMessageID),
+	ctx, cancel := context.WithTimeout(p.ctx, fetchTaskRequestTimeout)
+	request := &types.GetDomainReplicationMessagesRequest{
+		LastRetrievedMessageID: common.Int64Ptr(p.lastRetrievedMessageID),
+		LastProcessedMessageID: common.Int64Ptr(p.lastProcessedMessageID),
+		ClusterName:            p.currentCluster,
 	}
 	response, err := p.remotePeer.GetDomainReplicationMessages(ctx, request)
 	defer cancel()
@@ -158,17 +179,15 @@ func (p *domainReplicationProcessor) fetchDomainReplicationTasks() {
 
 	for taskIndex := range response.Messages.ReplicationTasks {
 		task := response.Messages.ReplicationTasks[taskIndex]
-		err := backoff.Retry(func() error {
+		err := p.throttleRetry.Do(p.ctx, func(ctx context.Context) error {
 			return p.handleDomainReplicationTask(task)
-		}, p.retryPolicy, isTransientRetryableError)
+		})
 
 		if err != nil {
-			p.metricsClient.IncCounter(metrics.DomainReplicationTaskScope, metrics.ReplicatorFailures)
 			p.logger.Error("Failed to apply domain replication tasks", tag.Error(err))
-
-			dlqErr := backoff.Retry(func() error {
+			dlqErr := p.throttleRetry.Do(context.Background(), func(ctx context.Context) error {
 				return p.putDomainReplicationTaskToDLQ(task)
-			}, p.retryPolicy, isTransientRetryableError)
+			})
 			if dlqErr != nil {
 				p.logger.Error("Failed to put replication tasks to DLQ", tag.Error(dlqErr))
 				p.metricsClient.IncCounter(metrics.DomainReplicationTaskScope, metrics.ReplicatorDLQFailures)
@@ -177,39 +196,63 @@ func (p *domainReplicationProcessor) fetchDomainReplicationTasks() {
 		}
 	}
 
-	p.lastProcessedMessageID = response.Messages.GetLastRetrievedMessageId()
-	p.lastRetrievedMessageID = response.Messages.GetLastRetrievedMessageId()
+	p.lastProcessedMessageID = response.Messages.GetLastRetrievedMessageID()
+	p.lastRetrievedMessageID = response.Messages.GetLastRetrievedMessageID()
 }
 
-func (p *domainReplicationProcessor) putDomainReplicationTaskToDLQ(
-	task *replicator.ReplicationTask,
-) error {
-
-	domainAttribute := task.GetDomainTaskAttributes()
-	if domainAttribute == nil {
-		return &workflow.InternalServiceError{
-			Message: "Domain replication task does not set domain task attribute",
+func (p *domainReplicationProcessor) putDomainReplicationTaskToDLQ(task *types.ReplicationTask) error {
+	switch task.GetTaskType() {
+	case types.ReplicationTaskTypeSemaphoreMetadata:
+		if task.GetSemaphoreMetadataTaskAttributes() == nil {
+			return &types.InternalServiceError{
+				Message: "Semaphore replication task does not set semaphore metadata task attribute",
+			}
 		}
+		// A semaphore metadata task has no domain name to tag.
+		p.metricsClient.Scope(
+			metrics.DomainReplicationTaskScope,
+		).IncCounter(metrics.DomainReplicationEnqueueDLQCount)
+	default:
+		domainAttribute := task.GetDomainTaskAttributes()
+		if domainAttribute == nil {
+			return &types.InternalServiceError{
+				Message: "Domain replication task does not set domain task attribute",
+			}
+		}
+		p.metricsClient.Scope(
+			metrics.DomainReplicationTaskScope,
+			metrics.DomainTag(domainAttribute.GetInfo().GetName()),
+		).IncCounter(metrics.DomainReplicationEnqueueDLQCount)
 	}
-	p.metricsClient.Scope(
-		metrics.DomainReplicationTaskScope,
-		metrics.DomainTag(domainAttribute.GetInfo().GetName()),
-	).IncCounter(metrics.DomainReplicationEnqueueDLQCount)
 	return p.domainReplicationQueue.PublishToDLQ(context.Background(), task)
 }
 
 func (p *domainReplicationProcessor) handleDomainReplicationTask(
-	task *replicator.ReplicationTask,
+	task *types.ReplicationTask,
 ) error {
 	p.metricsClient.IncCounter(metrics.DomainReplicationTaskScope, metrics.ReplicatorMessages)
-	sw := p.metricsClient.StartTimer(metrics.DomainReplicationTaskScope, metrics.ReplicatorLatency)
+	scope := p.metricsClient.Scope(metrics.DomainReplicationTaskScope)
+	sw := scope.StartTimerWithExponentialHistogram(metrics.ReplicatorLatency, metrics.ReplicatorLatencyHistogram)
 	defer sw.Stop()
 
-	return p.taskExecutor.Execute(task.DomainTaskAttributes)
+	var err error
+	switch task.GetTaskType() {
+	case types.ReplicationTaskTypeSemaphoreMetadata:
+		err = p.semaphoreTaskExecutor.Execute(task.SemaphoreMetadataTaskAttributes)
+	default:
+		err = p.taskExecutor.Execute(task.DomainTaskAttributes)
+	}
+	if err != nil {
+		p.metricsClient.IncCounter(metrics.DomainReplicationTaskScope, metrics.ReplicatorFailures)
+	}
+	return err
 }
 
 func (p *domainReplicationProcessor) Stop() {
-	close(p.done)
+	p.logger.Info("Domain replication processor stopping.")
+	p.cancelFn()
+	p.wg.Wait()
+	p.logger.Info("Domain replication processor stopped.")
 }
 
 func getWaitDuration() time.Duration {
@@ -218,7 +261,7 @@ func getWaitDuration() time.Duration {
 
 func isTransientRetryableError(err error) bool {
 	switch err.(type) {
-	case *shared.BadRequestError:
+	case *types.BadRequestError:
 		return false
 	default:
 		return true

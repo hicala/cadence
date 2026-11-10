@@ -28,7 +28,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"io/fs"
 	"log"
 	"sort"
 	"strings"
@@ -39,7 +40,7 @@ type (
 	// UpdateTask represents a task
 	// that executes a cassandra schema upgrade
 	UpdateTask struct {
-		db     DB
+		db     SchemaClient
 		config *UpdateConfig
 	}
 
@@ -54,12 +55,12 @@ type (
 		md5                  string
 	}
 
-	// changeSet represents all the changes
+	// ChangeSet represents all the changes
 	// corresponding to a single schema version
-	changeSet struct {
-		version  string
+	ChangeSet struct {
+		Version  string
 		manifest *manifest
-		cqlStmts []string
+		CqlStmts []string
 	}
 
 	// byVersion is a comparator type
@@ -84,8 +85,8 @@ var (
 	whitelistedCQLPrefixes = [4]string{"CREATE", "ALTER", "INSERT", "DROP"}
 )
 
-// NewUpdateSchemaTask returns a new instance of UpdateTask
-func newUpdateSchemaTask(db DB, config *UpdateConfig) *UpdateTask {
+// NewUpdateSchemaTask returns a new instance of UpdateTask.
+func NewUpdateSchemaTask(db SchemaClient, config *UpdateConfig) *UpdateTask {
 	return &UpdateTask{
 		db:     db,
 		config: config,
@@ -98,33 +99,39 @@ func (task *UpdateTask) Run() error {
 
 	log.Printf("UpdateSchemeTask started, config=%+v\n", config)
 
-	if config.IsDryRun {
-		if err := task.setupDryrunDatabase(); err != nil {
-			return fmt.Errorf("error creating dryrun database:%v", err.Error())
-		}
-	}
-
 	currVer, err := task.db.ReadSchemaVersion()
 	if err != nil {
 		return fmt.Errorf("error reading current schema version:%v", err.Error())
 	}
 
-	updates, err := task.buildChangeSet(currVer)
+	updates, err := task.BuildChangeSet(currVer)
 	if err != nil {
 		return err
 	}
 
-	err = task.executeUpdates(currVer, updates)
-	if err != nil {
-		return err
+	if config.IsDryRun {
+		log.Println("In DryRun mode, this command will only print queries without executing.....")
+		if len(updates) == 0 {
+			log.Println("Found zero updates to run")
+		}
+		for _, upd := range updates {
+			log.Printf("DryRun of updating to version: %s, manifest: %s \n", upd.Version, upd.manifest)
+			for _, stmt := range upd.CqlStmts {
+				log.Printf("DryRun query:%s \n", stmt)
+			}
+		}
+	} else {
+		err = task.executeUpdates(currVer, updates)
+		if err != nil {
+			return err
+		}
 	}
-
 	log.Printf("UpdateSchemeTask done\n")
 
 	return nil
 }
 
-func (task *UpdateTask) executeUpdates(currVer string, updates []changeSet) error {
+func (task *UpdateTask) executeUpdates(currVer string, updates []ChangeSet) error {
 
 	if len(updates) == 0 {
 		log.Printf("found zero updates from current version %v", currVer)
@@ -134,7 +141,7 @@ func (task *UpdateTask) executeUpdates(currVer string, updates []changeSet) erro
 	for _, cs := range updates {
 		csStart := time.Now()
 
-		err := task.execCQLStmts(cs.version, cs.cqlStmts)
+		err := task.execCQLStmts(cs.Version, cs.CqlStmts)
 		if err != nil {
 			return err
 		}
@@ -143,8 +150,8 @@ func (task *UpdateTask) executeUpdates(currVer string, updates []changeSet) erro
 			return err
 		}
 
-		log.Printf("Schema updated from %v to %v, elapsed %v\n", currVer, cs.version, time.Since(csStart))
-		currVer = cs.version
+		log.Printf("Schema updated from %v to %v, elapsed %v\n", currVer, cs.Version, time.Since(csStart))
+		currVer = cs.Version
 	}
 
 	log.Printf("All schema changes completed in %v\n", time.Since(updStart))
@@ -156,7 +163,7 @@ func (task *UpdateTask) execCQLStmts(ver string, stmts []string) error {
 	log.Printf("---- Executing updates for version %v ----\n", ver)
 	for _, stmt := range stmts {
 		log.Println(rmspaceRegex.ReplaceAllString(stmt, " "))
-		e := task.db.Exec(stmt)
+		e := task.db.ExecDDLQuery(stmt)
 		if e != nil {
 			return fmt.Errorf("error executing CQL statement:%v", e)
 		}
@@ -165,9 +172,9 @@ func (task *UpdateTask) execCQLStmts(ver string, stmts []string) error {
 	return nil
 }
 
-func (task *UpdateTask) updateSchemaVersion(oldVer string, cs *changeSet) error {
+func (task *UpdateTask) updateSchemaVersion(oldVer string, cs *ChangeSet) error {
 
-	err := task.db.UpdateSchemaVersion(cs.version, cs.manifest.MinCompatibleVersion)
+	err := task.db.UpdateSchemaVersion(cs.Version, cs.manifest.MinCompatibleVersion)
 	if err != nil {
 		return fmt.Errorf("failed to update schema_version table, err=%v", err.Error())
 	}
@@ -180,22 +187,20 @@ func (task *UpdateTask) updateSchemaVersion(oldVer string, cs *changeSet) error 
 	return nil
 }
 
-func (task *UpdateTask) buildChangeSet(currVer string) ([]changeSet, error) {
+func (task *UpdateTask) BuildChangeSet(currVer string) ([]ChangeSet, error) {
 
 	config := task.config
 
-	verDirs, err := readSchemaDir(config.SchemaDir, currVer, config.TargetVersion)
+	verDirs, err := readSchemaDir(config.SchemaFS, currVer, config.TargetVersion)
 	if err != nil {
 		return nil, fmt.Errorf("error listing schema dir:%v", err.Error())
 	}
 
-	var result []changeSet
+	var result []ChangeSet
 
 	for _, vd := range verDirs {
 
-		dirPath := config.SchemaDir + "/" + vd
-
-		m, e := readManifest(dirPath)
+		m, e := readManifest(config.SchemaFS, vd)
 		if e != nil {
 			return nil, fmt.Errorf("error processing manifest for version %v:%v", vd, e.Error())
 		}
@@ -211,7 +216,7 @@ func (task *UpdateTask) buildChangeSet(currVer string) ([]changeSet, error) {
 				vd, m.CurrVersion)
 		}
 
-		stmts, e := task.parseSQLStmts(dirPath, m)
+		stmts, e := task.parseSQLStmts(vd, m)
 		if e != nil {
 			return nil, e
 		}
@@ -221,10 +226,10 @@ func (task *UpdateTask) buildChangeSet(currVer string) ([]changeSet, error) {
 			return nil, fmt.Errorf("error processing version %v:%v", vd, e.Error())
 		}
 
-		cs := changeSet{}
+		cs := ChangeSet{}
 		cs.manifest = m
-		cs.cqlStmts = stmts
-		cs.version = m.CurrVersion
+		cs.CqlStmts = stmts
+		cs.Version = m.CurrVersion
 		result = append(result, cs)
 	}
 
@@ -237,7 +242,11 @@ func (task *UpdateTask) parseSQLStmts(dir string, manifest *manifest) ([]string,
 
 	for _, file := range manifest.SchemaUpdateCqlFiles {
 		path := dir + "/" + file
-		stmts, err := ParseFile(path)
+		f, err := task.config.SchemaFS.Open(path)
+		if err != nil {
+			return nil, fmt.Errorf("error opening file %v, err=%v", path, err)
+		}
+		stmts, err := ParseFile(f)
 		if err != nil {
 			return nil, fmt.Errorf("error parsing file %v, err=%v", path, err)
 		}
@@ -267,15 +276,19 @@ func validateCQLStmts(stmts []string) error {
 	return nil
 }
 
-func readManifest(dirPath string) (*manifest, error) {
-
-	filePath := dirPath + "/" + manifestFileName
-	jsonStr, err := ioutil.ReadFile(filePath)
+func readManifest(fileSystem fs.FS, subdir string) (*manifest, error) {
+	fsys, err := fs.Sub(fileSystem, subdir)
 	if err != nil {
 		return nil, err
 	}
-
-	jsonBlob := []byte(jsonStr)
+	file, err := fsys.Open(manifestFileName)
+	if err != nil {
+		return nil, err
+	}
+	jsonBlob, err := io.ReadAll(file)
+	if err != nil {
+		return nil, err
+	}
 
 	var manifest manifest
 	err = json.Unmarshal(jsonBlob, &manifest)
@@ -316,12 +329,11 @@ func readManifest(dirPath string) (*manifest, error) {
 // this method has an assumption that the subdirs containing the
 // schema changes will be of the form vx.x, where x.x is the version
 // returns error when
-//  - startVer <= endVer
-//  - endVer is empty and no subdirs have version >= startVer
-//  - endVer is non-empty and subdir with version == endVer is not found
-func readSchemaDir(dir string, startVer string, endVer string) ([]string, error) {
-
-	subdirs, err := ioutil.ReadDir(dir)
+//   - startVer >= endVer
+//   - endVer is empty and no subdirs have version >= startVer
+//   - endVer is non-empty and subdir with version == endVer is not found
+func readSchemaDir(fileSystem fs.FS, startVer string, endVer string) ([]string, error) {
+	subdirs, err := fs.ReadDir(fileSystem, ".")
 	if err != nil {
 		return nil, err
 	}
@@ -415,17 +427,6 @@ func filterDirectories(dirNames []string, startVer string, endVer string) ([]str
 	sort.Sort(byVersion(result))
 
 	return result, squashes, nil
-}
-
-// sets up a temporary dryrun database for
-// executing the cassandra schema update
-func (task *UpdateTask) setupDryrunDatabase() error {
-	setupConfig := &SetupConfig{
-		Overwrite:      true,
-		InitialVersion: "0.0",
-	}
-	setupTask := newSetupSchemaTask(task.db, setupConfig)
-	return setupTask.Run()
 }
 
 func dirToVersion(dir string) string {

@@ -1,4 +1,4 @@
-// Copyright (c) 2017 Uber Technologies, Inc.
+// Copyright (c) 2021 Uber Technologies, Inc.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -35,19 +35,25 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	apiv1 "github.com/uber/cadence-idl/go/proto/api/v1"
 	"go.uber.org/cadence/.gen/go/cadence/workflowserviceclient"
 	"go.uber.org/cadence/.gen/go/shared"
 	"go.uber.org/cadence/activity"
 	"go.uber.org/cadence/client"
+	"go.uber.org/cadence/compatibility"
 	"go.uber.org/cadence/encoded"
-	cworker "go.uber.org/cadence/worker"
+	"go.uber.org/cadence/worker"
 	"go.uber.org/cadence/workflow"
 	"go.uber.org/yarpc"
-	"go.uber.org/yarpc/transport/tchannel"
+	"go.uber.org/yarpc/transport/grpc"
 	"go.uber.org/zap"
 
-	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/log/tag"
+	"github.com/uber/cadence/common/service"
+
+	// Register default archivers
+	_ "github.com/uber/cadence/common/archiver/filestore"
+	_ "github.com/uber/cadence/common/archiver/s3store"
 )
 
 func init() {
@@ -57,62 +63,64 @@ func init() {
 	workflow.Register(testChildWorkflow)
 }
 
-type (
-	clientIntegrationSuite struct {
-		// override suite.Suite.Assertions with require.Assertions; this means that s.NotNil(nil) will stop the test,
-		// not merely log an error
-		*require.Assertions
-		IntegrationBase
-		wfService workflowserviceclient.Interface
-		wfClient  client.Client
-		worker    cworker.Worker
-		taskList  string
-	}
-)
-
 func TestClientIntegrationSuite(t *testing.T) {
+
 	flag.Parse()
-	suite.Run(t, new(clientIntegrationSuite))
+
+	clusterConfig, err := GetTestClusterConfig("testdata/clientintegrationtestcluster.yaml")
+	if err != nil {
+		panic(err)
+	}
+	testCluster := NewTestPersistenceConfig(t)
+
+	s := new(ClientIntegrationSuite)
+	params := IntegrationBaseParams{
+		PersistenceConfig: testCluster,
+		TestClusterConfig: clusterConfig,
+	}
+	s.IntegrationBase = NewIntegrationBase(params)
+	suite.Run(t, s)
 }
 
-func (s *clientIntegrationSuite) SetupSuite() {
-	s.setupSuite("testdata/clientintegrationtestcluster.yaml")
+func (s *ClientIntegrationSuite) SetupSuite() {
+	s.setupSuite()
 
 	var err error
 	s.wfService, err = s.buildServiceClient()
 	if err != nil {
 		s.Logger.Fatal("Error when build service client", tag.Error(err))
 	}
-	s.wfClient = client.NewClient(s.wfService, s.domainName, nil)
+	s.wfClient = client.NewClient(s.wfService, s.DomainName, nil)
 
 	s.taskList = "client-integration-test-tasklist"
-	s.worker = cworker.New(s.wfService, s.domainName, s.taskList, cworker.Options{})
+	s.worker = worker.New(s.wfService, s.DomainName, s.taskList, worker.Options{})
 	if err := s.worker.Start(); err != nil {
 		s.Logger.Fatal("Error when start worker", tag.Error(err))
+	} else {
+		s.Logger.Info("Worker started")
 	}
 }
 
-func (s *clientIntegrationSuite) TearDownSuite() {
-	s.tearDownSuite()
+func (s *ClientIntegrationSuite) TearDownSuite() {
+	s.worker.Stop()
+	s.TearDownBaseSuite()
 }
 
-func (s *clientIntegrationSuite) buildServiceClient() (workflowserviceclient.Interface, error) {
+func (s *ClientIntegrationSuite) buildServiceClient() (workflowserviceclient.Interface, error) {
 	cadenceClientName := "cadence-client"
-	cadenceFrontendService := common.FrontendServiceName
-	hostPort := "127.0.0.1:7104"
+	hostPort := "127.0.0.1:7114" // use grpc port
 	if TestFlags.FrontendAddr != "" {
 		hostPort = TestFlags.FrontendAddr
 	}
-
-	ch, err := tchannel.NewChannelTransport(tchannel.ServiceName(cadenceClientName))
-	if err != nil {
-		s.Logger.Fatal("Failed to create transport channel", tag.Error(err))
-	}
+	ch := grpc.NewTransport(
+		grpc.ServerMaxRecvMsgSize(32*1024*1024),
+		grpc.ClientMaxRecvMsgSize(32*1024*1024),
+	)
 
 	dispatcher := yarpc.NewDispatcher(yarpc.Config{
 		Name: cadenceClientName,
 		Outbounds: yarpc.Outbounds{
-			cadenceFrontendService: {Unary: ch.NewSingleOutbound(hostPort)},
+			service.Frontend: {Unary: ch.NewSingleOutbound(hostPort)},
 		},
 	})
 	if dispatcher == nil {
@@ -121,11 +129,19 @@ func (s *clientIntegrationSuite) buildServiceClient() (workflowserviceclient.Int
 	if err := dispatcher.Start(); err != nil {
 		s.Logger.Fatal("Failed to create outbound transport channel", tag.Error(err))
 	}
-
-	return workflowserviceclient.New(dispatcher.ClientConfig(cadenceFrontendService)), nil
+	cc := dispatcher.ClientConfig(service.Frontend)
+	return compatibility.NewThrift2ProtoAdapter(
+		compatibility.AdapterClients{
+			Domain:     apiv1.NewDomainAPIYARPCClient(cc),
+			Workflow:   apiv1.NewWorkflowAPIYARPCClient(cc),
+			Worker:     apiv1.NewWorkerAPIYARPCClient(cc),
+			Visibility: apiv1.NewVisibilityAPIYARPCClient(cc),
+			Schedule:   apiv1.NewScheduleAPIYARPCClient(cc),
+		},
+	), nil
 }
 
-func (s *clientIntegrationSuite) SetupTest() {
+func (s *ClientIntegrationSuite) SetupTest() {
 	// Have to define our overridden assertions in the test setup. If we did it earlier, s.T() will return nil
 	s.Assertions = require.New(s.T())
 }
@@ -194,19 +210,19 @@ func testDataConverterWorkflow(ctx workflow.Context, tl string) (string, error) 
 	return result + "," + result1, nil
 }
 
-func (s *clientIntegrationSuite) startWorkerWithDataConverter(tl string, dataConverter encoded.DataConverter) cworker.Worker {
-	opts := cworker.Options{}
+func (s *ClientIntegrationSuite) startWorkerWithDataConverter(tl string, dataConverter encoded.DataConverter) worker.Worker {
+	opts := worker.Options{}
 	if dataConverter != nil {
 		opts.DataConverter = dataConverter
 	}
-	worker := cworker.New(s.wfService, s.domainName, tl, opts)
+	worker := worker.New(s.wfService, s.DomainName, tl, opts)
 	if err := worker.Start(); err != nil {
 		s.Logger.Fatal("Error when start worker with data converter", tag.Error(err))
 	}
 	return worker
 }
 
-func (s *clientIntegrationSuite) TestClientDataConverter() {
+func (s *ClientIntegrationSuite) TestClientDataConverter() {
 	tl := "client-integration-data-converter-activity-tasklist"
 	dc := newTestDataConverter()
 	worker := s.startWorkerWithDataConverter(tl, dc)
@@ -238,7 +254,7 @@ func (s *clientIntegrationSuite) TestClientDataConverter() {
 	s.Equal(1, d.NumOfCallFromData)
 }
 
-func (s *clientIntegrationSuite) TestClientDataConverter_Failed() {
+func (s *ClientIntegrationSuite) TestClientDataConverter_Failed() {
 	tl := "client-integration-data-converter-activity-failed-tasklist"
 	worker := s.startWorkerWithDataConverter(tl, nil) // mismatch of data converter
 	defer worker.Stop()
@@ -341,7 +357,7 @@ func testChildWorkflow(ctx workflow.Context, totalCount, runCount int) (string, 
 	return "", workflow.NewContinueAsNewError(ctx, testChildWorkflow, totalCount, runCount)
 }
 
-func (s *clientIntegrationSuite) TestClientDataConverter_WithChild() {
+func (s *ClientIntegrationSuite) TestClientDataConverter_WithChild() {
 	dc := newTestDataConverter()
 	worker := s.startWorkerWithDataConverter(childTaskList, dc)
 	defer worker.Stop()
@@ -370,4 +386,138 @@ func (s *clientIntegrationSuite) TestClientDataConverter_WithChild() {
 	d := dc.(*testDataConverter)
 	s.Equal(3, d.NumOfCallToData)
 	s.Equal(2, d.NumOfCallFromData)
+}
+
+func (s *ClientIntegrationSuite) Test_StickyWorkerRestartDecisionTask_SLOW() {
+	testCases := []struct {
+		name       string
+		waitTime   time.Duration
+		doQuery    bool
+		doSignal   bool
+		delayCheck func(duration time.Duration) bool
+	}{
+		{
+			name:     "new_query_after_10s_no_delay",
+			waitTime: 10 * time.Second,
+			doQuery:  true,
+			delayCheck: func(duration time.Duration) bool {
+				return duration < 5*time.Second
+			},
+		},
+		{
+			name:     "new_query_immediately_expect_5s_delay",
+			waitTime: 0,
+			doQuery:  true,
+			delayCheck: func(duration time.Duration) bool {
+				return duration > 5*time.Second
+			},
+		},
+		{
+			name:     "new_workflow_task_after_10s_no_delay",
+			waitTime: 10 * time.Second,
+			doSignal: true,
+			delayCheck: func(duration time.Duration) bool {
+				return duration < 5*time.Second
+			},
+		},
+		{
+			name:     "new_workflow_task_immediately_expect_5s_delay",
+			waitTime: 0,
+			doSignal: true,
+			delayCheck: func(duration time.Duration) bool {
+				return duration > 5*time.Second
+			},
+		},
+	}
+	for _, tt := range testCases {
+		s.Run(tt.name, func() {
+			workflowFn := func(ctx workflow.Context) (string, error) {
+				workflow.SetQueryHandler(ctx, "test", func() (string, error) {
+					return "query works", nil
+				})
+
+				signalCh := workflow.GetSignalChannel(ctx, "test")
+				var msg string
+				signalCh.Receive(ctx, &msg)
+				return msg, nil
+			}
+
+			taskList := "task-list-" + tt.name
+
+			oldWorker := worker.New(s.wfService, s.DomainName, taskList, worker.Options{})
+			oldWorker.RegisterWorkflow(workflowFn)
+			if err := oldWorker.Start(); err != nil {
+				s.Logger.Fatal("Error when start worker", tag.Error(err))
+			}
+
+			id := "test-sticky-delay" + tt.name
+			workflowOptions := client.StartWorkflowOptions{
+				ID:                           id,
+				TaskList:                     taskList,
+				ExecutionStartToCloseTimeout: 20 * time.Second,
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 1000*time.Second)
+			defer cancel()
+			workflowRun, err := s.wfClient.ExecuteWorkflow(ctx, workflowOptions, workflowFn)
+			if err != nil {
+				s.Logger.Fatal("Start workflow failed with err", tag.Error(err))
+			}
+
+			s.NotNil(workflowRun)
+			s.True(workflowRun.GetRunID() != "")
+
+			findFirstWorkflowTaskCompleted := false
+		WaitForFirstWorkflowTaskComplete:
+			for i := 0; i < 10; i++ {
+				// wait until first workflow task completed (so we know sticky is set on workflow)
+				iter := s.wfClient.GetWorkflowHistory(ctx, id, "", false, 0)
+				for iter.HasNext() {
+					evt, err := iter.Next()
+					s.NoError(err)
+					if evt.GetEventType() == shared.EventTypeDecisionTaskCompleted {
+						findFirstWorkflowTaskCompleted = true
+						break WaitForFirstWorkflowTaskComplete
+					}
+				}
+				time.Sleep(time.Second)
+			}
+			s.True(findFirstWorkflowTaskCompleted)
+
+			// stop old worker
+			oldWorker.Stop()
+
+			// maybe wait for 10s, which will make matching aware the old sticky worker is unavailable
+			time.Sleep(tt.waitTime)
+
+			// start a new worker
+			newWorker := worker.New(s.wfService, s.DomainName, taskList, worker.Options{})
+			newWorker.RegisterWorkflow(workflowFn)
+			if err := newWorker.Start(); err != nil {
+				s.Logger.Fatal("Error when start worker", tag.Error(err))
+			}
+			defer newWorker.Stop()
+
+			startTime := time.Now()
+			// send a signal, and workflow should complete immediately, there should not be 5s delay
+			if tt.doSignal {
+				err = s.wfClient.SignalWorkflow(ctx, id, "", "test", "test")
+				s.NoError(err)
+
+				err = workflowRun.Get(ctx, nil)
+				s.NoError(err)
+			} else if tt.doQuery {
+				// send a signal, and workflow should complete immediately, there should not be 5s delay
+				queryResult, err := s.wfClient.QueryWorkflow(ctx, id, "", "test", "test")
+				s.NoError(err)
+
+				var queryResultStr string
+				err = queryResult.Get(&queryResultStr)
+				s.NoError(err)
+				s.Equal("query works", queryResultStr)
+			}
+			endTime := time.Now()
+			duration := endTime.Sub(startTime)
+			s.True(tt.delayCheck(duration), "delay check failed: %s", duration)
+		})
+	}
 }

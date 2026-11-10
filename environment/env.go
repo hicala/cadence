@@ -36,13 +36,44 @@ const (
 	CassandraPort = "CASSANDRA_DB_PORT"
 	// CassandraDefaultPort Cassandra default port
 	CassandraDefaultPort = "9042"
+	// CassandraUsername env
+	CassandraUsername = "CASSANDRA_DB_USERNAME"
+	// CassandraDefaultUsername Cassandra default username
+	CassandraDefaultUsername = ""
+	// CassandraPassword env
+	CassandraPassword = "CASSANDRA_DB_PASSWORD"
+	// CassandraDefaultPassword Cassandra default password
+	CassandraDefaultPassword = ""
+	// CassandraAllowedAuthenticators env
+	CassandraAllowedAuthenticators = "CASSANDRA_DB_ALLOWED_AUTHENTICATORS"
+	// CassandraProtoVersion env
+	CassandraProtoVersion = "CASSANDRA_PROTO_VERSION"
+	// CassandraDefaultProtoVersion Cassandra default protocol version
+	CassandraDefaultProtoVersion = "4"
+	// CassandraDefaultProtoVersionInteger Cassandra default protocol version int version
+	CassandraDefaultProtoVersionInteger = 4
 
 	// MySQLSeeds env
 	MySQLSeeds = "MYSQL_SEEDS"
 	// MySQLPort env
 	MySQLPort = "MYSQL_PORT"
-	// MySQLDefaultPort MySQL default port
+	// MySQLDefaultPort is MySQL default port
 	MySQLDefaultPort = "3306"
+	// MySQLUser env
+	MySQLUser = "MYSQL_USER"
+	// MySQLDefaultUser is default user
+	MySQLDefaultUser = "root"
+	// MySQLPassword env
+	MySQLPassword = "MYSQL_PASSWORD"
+	// MySQLDefaultPassword is default password
+	MySQLDefaultPassword = "cadence"
+
+	// MongoSeeds env
+	MongoSeeds = "MONGO_SEEDS"
+	// MongoPort env
+	MongoPort = "MONGO_PORT"
+	// MongoDefaultPort is Mongo default port
+	MongoDefaultPort = "27017"
 
 	// KafkaSeeds env
 	KafkaSeeds = "KAFKA_SEEDS"
@@ -57,6 +88,10 @@ const (
 	ESPort = "ES_PORT"
 	// ESDefaultPort ES default port
 	ESDefaultPort = "9200"
+	// ESVersion is the ElasticSearch version
+	ESVersion = "ES_VERSION"
+	// ESDefaultVersion is the default version
+	ESDefaultVersion = "v6"
 
 	// PostgresSeeds env
 	PostgresSeeds = "POSTGRES_SEEDS"
@@ -64,101 +99,98 @@ const (
 	PostgresPort = "POSTGRES_PORT"
 	// PostgresDefaultPort Postgres default port
 	PostgresDefaultPort = "5432"
+
+	// CLITransportProtocol env
+	CLITransportProtocol = "CADENCE_CLI_TRANSPORT_PROTOCOL"
+	// DefaultCLITransportProtocol  CLI default channel
+	DefaultCLITransportProtocol = "tchannel"
 )
 
+var envDefaults = map[string]string{
+	CassandraSeeds:        Localhost,
+	CassandraPort:         CassandraDefaultPort,
+	CassandraProtoVersion: CassandraDefaultProtoVersion,
+	MySQLSeeds:            Localhost,
+	MySQLPort:             MySQLDefaultPort,
+	PostgresSeeds:         Localhost,
+	PostgresPort:          PostgresDefaultPort,
+	KafkaSeeds:            Localhost,
+	KafkaPort:             KafkaDefaultPort,
+	ESSeeds:               Localhost,
+	ESPort:                ESDefaultPort,
+	CLITransportProtocol:  DefaultCLITransportProtocol,
+}
+
 // SetupEnv setup the necessary env
-func SetupEnv() {
-	if os.Getenv(CassandraSeeds) == "" {
-		err := os.Setenv(CassandraSeeds, Localhost)
-		if err != nil {
-			panic(fmt.Sprintf("error setting env %v", CassandraSeeds))
+func SetupEnv() error {
+	for k, v := range envDefaults {
+		if os.Getenv(k) == "" {
+			if err := setEnv(k, v); err != nil {
+				return err
+			}
 		}
 	}
-
-	if os.Getenv(CassandraPort) == "" {
-		err := os.Setenv(CassandraPort, CassandraDefaultPort)
-		if err != nil {
-			panic(fmt.Sprintf("error setting env %v", CassandraPort))
-		}
-	}
-
-	if os.Getenv(MySQLSeeds) == "" {
-		err := os.Setenv(MySQLSeeds, Localhost)
-		if err != nil {
-			panic(fmt.Sprintf("error setting env %v", MySQLSeeds))
-		}
-	}
-
-	if os.Getenv(MySQLPort) == "" {
-		err := os.Setenv(MySQLPort, MySQLDefaultPort)
-		if err != nil {
-			panic(fmt.Sprintf("error setting env %v", MySQLPort))
-		}
-	}
-
-	if os.Getenv(PostgresSeeds) == "" {
-		err := os.Setenv(PostgresSeeds, Localhost)
-		if err != nil {
-			panic(fmt.Sprintf("error setting env %v", PostgresSeeds))
-		}
-	}
-
-	if os.Getenv(PostgresPort) == "" {
-		err := os.Setenv(PostgresPort, PostgresDefaultPort)
-		if err != nil {
-			panic(fmt.Sprintf("error setting env %v", PostgresPort))
-		}
-	}
-
-	if os.Getenv(KafkaSeeds) == "" {
-		err := os.Setenv(KafkaSeeds, Localhost)
-		if err != nil {
-			panic(fmt.Sprintf("error setting env %v", KafkaSeeds))
-		}
-	}
-
-	if os.Getenv(KafkaPort) == "" {
-		err := os.Setenv(KafkaPort, KafkaDefaultPort)
-		if err != nil {
-			panic(fmt.Sprintf("error setting env %v", KafkaPort))
-		}
-	}
-
-	if os.Getenv(ESSeeds) == "" {
-		err := os.Setenv(ESSeeds, Localhost)
-		if err != nil {
-			panic(fmt.Sprintf("error setting env %v", ESSeeds))
-		}
-	}
-
-	if os.Getenv(ESPort) == "" {
-		err := os.Setenv(ESPort, ESDefaultPort)
-		if err != nil {
-			panic(fmt.Sprintf("error setting env %v", ESPort))
-		}
-	}
+	return nil
 }
 
 // GetCassandraAddress return the cassandra address
 func GetCassandraAddress() string {
-	addr := os.Getenv(CassandraSeeds)
-	if addr == "" {
-		addr = Localhost
+	if addr := os.Getenv(CassandraSeeds); addr != "" {
+		return addr
 	}
-	return addr
+
+	return envDefaults[CassandraSeeds]
 }
 
 // GetCassandraPort return the cassandra port
-func GetCassandraPort() int {
+func GetCassandraPort() (int, error) {
 	port := os.Getenv(CassandraPort)
 	if port == "" {
-		port = CassandraDefaultPort
+		port = envDefaults[CassandraPort]
 	}
-	p, err := strconv.Atoi(port)
-	if err != nil {
-		panic(fmt.Sprintf("error getting env %v", CassandraPort))
+
+	return strconv.Atoi(port)
+}
+
+// GetCassandraUsername return the cassandra username
+func GetCassandraUsername() string {
+	user := os.Getenv(CassandraUsername)
+	if user != "" {
+		return user
 	}
-	return p
+	return CassandraDefaultUsername
+}
+
+// GetCassandraPassword return the cassandra password
+func GetCassandraPassword() string {
+	pass := os.Getenv(CassandraPassword)
+	if pass != "" {
+		return pass
+	}
+
+	return CassandraDefaultPassword
+}
+
+// GetCassandraAllowedAuthenticators return the cassandra allowed authenticators
+func GetCassandraAllowedAuthenticators() []string {
+	var authenticators []string
+	configuredAuthenticators := os.Getenv(CassandraAllowedAuthenticators)
+	if configuredAuthenticators == "" {
+		return authenticators
+	}
+
+	authenticators = append(authenticators, configuredAuthenticators)
+	return authenticators
+}
+
+// GetCassandraProtoVersion return the cassandra protocol version
+func GetCassandraProtoVersion() (int, error) {
+	protoVersion := os.Getenv(CassandraProtoVersion)
+	if protoVersion == "" {
+		protoVersion = envDefaults[CassandraProtoVersion]
+	}
+
+	return strconv.Atoi(protoVersion)
 }
 
 // GetMySQLAddress return the MySQL address
@@ -171,16 +203,31 @@ func GetMySQLAddress() string {
 }
 
 // GetMySQLPort return the MySQL port
-func GetMySQLPort() int {
+func GetMySQLPort() (int, error) {
 	port := os.Getenv(MySQLPort)
 	if port == "" {
 		port = MySQLDefaultPort
 	}
-	p, err := strconv.Atoi(port)
-	if err != nil {
-		panic(fmt.Sprintf("error getting env %v", MySQLPort))
+
+	return strconv.Atoi(port)
+}
+
+// GetMySQLUser return the MySQL user
+func GetMySQLUser() string {
+	user := os.Getenv(MySQLUser)
+	if user == "" {
+		user = MySQLDefaultUser
 	}
-	return p
+	return user
+}
+
+// GetMySQLPassword return the MySQL password
+func GetMySQLPassword() string {
+	pw := os.Getenv(MySQLPassword)
+	if pw == "" {
+		pw = MySQLDefaultPassword
+	}
+	return pw
 }
 
 // GetPostgresAddress return the Postgres address
@@ -193,14 +240,46 @@ func GetPostgresAddress() string {
 }
 
 // GetPostgresPort return the Postgres port
-func GetPostgresPort() int {
+func GetPostgresPort() (int, error) {
 	port := os.Getenv(PostgresPort)
 	if port == "" {
 		port = PostgresDefaultPort
 	}
-	p, err := strconv.Atoi(port)
-	if err != nil {
-		panic(fmt.Sprintf("error getting env %v", PostgresPort))
+
+	return strconv.Atoi(port)
+}
+
+// GetESVersion return the ElasticSearch version
+func GetESVersion() string {
+	version := os.Getenv(ESVersion)
+	if version == "" {
+		version = ESDefaultVersion
 	}
-	return p
+	return version
+}
+
+// GetMongoAddress return the MySQL address
+func GetMongoAddress() string {
+	addr := os.Getenv(MongoSeeds)
+	if addr == "" {
+		addr = Localhost
+	}
+	return addr
+}
+
+// GetMongoPort return the MySQL port
+func GetMongoPort() (int, error) {
+	port := os.Getenv(MongoPort)
+	if port == "" {
+		port = MongoDefaultPort
+	}
+
+	return strconv.Atoi(port)
+}
+
+func setEnv(key string, val string) error {
+	if err := os.Setenv(key, val); err != nil {
+		return fmt.Errorf("setting env %q: %w", key, err)
+	}
+	return nil
 }

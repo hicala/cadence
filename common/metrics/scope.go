@@ -27,98 +27,184 @@ import (
 )
 
 type metricsScope struct {
-	scope          tally.Scope
-	rootScope      tally.Scope
-	defs           map[int]metricDefinition
-	isDomainTagged bool
+	scope           tally.Scope
+	rootScope       tally.Scope
+	defs            map[MetricIdx]metricDefinition
+	isDomainTagged  bool
+	migrationConfig MigrationConfig
 }
 
 func newMetricsScope(
 	rootScope tally.Scope,
 	scope tally.Scope,
-	defs map[int]metricDefinition,
+	defs map[MetricIdx]metricDefinition,
 	isDomain bool,
+	mc MigrationConfig,
 ) Scope {
 	return &metricsScope{
-		scope:          scope,
-		rootScope:      rootScope,
-		defs:           defs,
-		isDomainTagged: isDomain,
+		scope:           scope,
+		rootScope:       rootScope,
+		defs:            defs,
+		isDomainTagged:  isDomain,
+		migrationConfig: mc,
 	}
 }
 
-// NoopScope returns a noop scope of metrics
-func NoopScope(serviceIdx ServiceIdx) Scope {
-	return &metricsScope{
-		scope:     tally.NoopScope,
-		rootScope: tally.NoopScope,
-		defs:      getMetricDefs(serviceIdx),
-	}
-}
-
-func (m *metricsScope) IncCounter(id int) {
+func (m *metricsScope) IncCounter(id MetricIdx) {
 	m.AddCounter(id, 1)
 }
 
-func (m *metricsScope) AddCounter(id int, delta int64) {
+func (m *metricsScope) AddCounter(id MetricIdx, delta int64) {
 	def := m.defs[id]
-	m.scope.Counter(def.metricName.String()).Inc(delta)
+	if m.migrationConfig.Counter.EmitCounter(def.metricName.String()) {
+		m.scope.Counter(def.metricName.String()).Inc(delta)
+	}
 	if !def.metricRollupName.Empty() {
-		m.rootScope.Counter(def.metricRollupName.String()).Inc(delta)
+		if m.migrationConfig.Counter.EmitCounter(def.metricRollupName.String()) {
+			m.rootScope.Counter(def.metricRollupName.String()).Inc(delta)
+		}
 	}
 }
 
-func (m *metricsScope) UpdateGauge(id int, value float64) {
+func (m *metricsScope) UpdateGauge(id MetricIdx, value float64) {
 	def := m.defs[id]
-	m.scope.Gauge(def.metricName.String()).Update(value)
+	if m.migrationConfig.Gauge.EmitGauge(def.metricName.String()) {
+		m.scope.Gauge(def.metricName.String()).Update(value)
+	}
 	if !def.metricRollupName.Empty() {
-		m.scope.Gauge(def.metricRollupName.String()).Update(value)
+		if m.migrationConfig.Gauge.EmitGauge(def.metricRollupName.String()) {
+			m.rootScope.Gauge(def.metricRollupName.String()).Update(value)
+		}
 	}
 }
 
-func (m *metricsScope) StartTimer(id int) Stopwatch {
+func (m *metricsScope) StartTimer(id MetricIdx) Stopwatch {
 	def := m.defs[id]
-	timer := m.scope.Timer(def.metricName.String())
+	var timers []tally.Timer
+
+	// Check the metric's own name first
+	if m.migrationConfig.EmitTimer(def.metricName.String()) {
+		timers = append(timers, m.scope.Timer(def.metricName.String()))
+	}
+
+	// Then check for rollup or domain-tagged dual-emit
 	switch {
 	case !def.metricRollupName.Empty():
-		return NewStopwatch(timer, m.rootScope.Timer(def.metricRollupName.String()))
+		// Check the rollup name separately
+		if m.migrationConfig.EmitTimer(def.metricRollupName.String()) {
+			timers = append(timers, m.rootScope.Timer(def.metricRollupName.String()))
+		}
 	case m.isDomainTagged:
-		timerAll := m.scope.Tagged(map[string]string{domain: domainAllValue}).Timer(def.metricName.String())
-		return NewStopwatch(timer, timerAll)
-	default:
-		return NewStopwatch(timer)
+		// Dual emit to domain=all aggregate if the metric name is allowed
+		if m.migrationConfig.EmitTimer(def.metricName.String()) {
+			timers = append(timers, m.scope.Tagged(map[string]string{domain: allValue}).Timer(def.metricName.String()))
+		}
 	}
+
+	if len(timers) == 0 {
+		return Stopwatch{} // noop
+	}
+	return NewStopwatch(timers...)
 }
 
-func (m *metricsScope) RecordTimer(id int, d time.Duration) {
+// StartTimerWithExponentialHistogram dual-emits to the named timer and the
+// named exponential histogram when Stop is called on the returned Stopwatch.
+// The histogram emission goes through the same path as ExponentialHistogram so
+// it picks up exponential bucket definitions, rollups, and migration-config
+// gating. The histogram metric must be defined with exponentialBuckets in
+// defs.go.
+func (m *metricsScope) StartTimerWithExponentialHistogram(timerID MetricIdx, histogramID MetricIdx) Stopwatch {
+	sw := m.StartTimer(timerID)
+	return newStopwatchWithCallback(sw.timers, func(d time.Duration) {
+		m.ExponentialHistogram(histogramID, d)
+	})
+}
+
+func (m *metricsScope) RecordTimer(id MetricIdx, d time.Duration) {
 	def := m.defs[id]
-	m.scope.Timer(def.metricName.String()).Record(d)
+	if m.migrationConfig.EmitTimer(def.metricName.String()) {
+		m.scope.Timer(def.metricName.String()).Record(d)
+	}
 	switch {
 	case !def.metricRollupName.Empty():
-		m.rootScope.Timer(def.metricRollupName.String()).Record(d)
+		if m.migrationConfig.EmitTimer(def.metricRollupName.String()) {
+			m.rootScope.Timer(def.metricRollupName.String()).Record(d)
+		}
 	case m.isDomainTagged:
-		m.scope.Tagged(map[string]string{domain: domainAllValue}).Timer(def.metricName.String()).Record(d)
+		// N.B. - Dual emit here so that we can see aggregate timer stats across all
+		// domains along with the individual domains stats
+		if m.migrationConfig.EmitTimer(def.metricName.String()) {
+			m.scope.Tagged(map[string]string{domain: allValue}).Timer(def.metricName.String()).Record(d)
+		}
 	}
 }
 
-func (m *metricsScope) RecordHistogramDuration(id int, value time.Duration) {
+func (m *metricsScope) RecordHistogramDuration(id MetricIdx, value time.Duration) {
 	def := m.defs[id]
-	m.scope.Histogram(def.metricName.String(), m.getBuckets(id)).RecordDuration(value)
-	if !def.metricRollupName.Empty() {
-		m.rootScope.Histogram(def.metricRollupName.String(), m.getBuckets(id)).RecordDuration(value)
+	if m.migrationConfig.Histogram.EmitHistogram(def.metricName.String()) {
+		m.scope.Histogram(def.metricName.String(), m.getBuckets(id)).RecordDuration(value)
+	}
+	switch {
+	case !def.metricRollupName.Empty():
+		if m.migrationConfig.Histogram.EmitHistogram(def.metricRollupName.String()) {
+			m.rootScope.Histogram(def.metricRollupName.String(), m.getBuckets(id)).RecordDuration(value)
+		}
+	case m.isDomainTagged:
+		if m.migrationConfig.Histogram.EmitHistogram(def.metricName.String()) {
+			m.scope.Tagged(map[string]string{domain: allValue}).Histogram(def.metricName.String(), m.getBuckets(id)).RecordDuration(value)
+		}
 	}
 }
 
-func (m *metricsScope) RecordHistogramValue(id int, value float64) {
+func (m *metricsScope) RecordHistogramValue(id MetricIdx, value float64) {
 	def := m.defs[id]
-	m.scope.Histogram(def.metricName.String(), m.getBuckets(id)).RecordValue(value)
+	if m.migrationConfig.Histogram.EmitHistogram(def.metricName.String()) {
+		m.scope.Histogram(def.metricName.String(), m.getBuckets(id)).RecordValue(value)
+	}
 	if !def.metricRollupName.Empty() {
-		m.rootScope.Histogram(def.metricRollupName.String(), m.getBuckets(id)).RecordValue(value)
+		if m.migrationConfig.Histogram.EmitHistogram(def.metricRollupName.String()) {
+			m.rootScope.Histogram(def.metricRollupName.String(), m.getBuckets(id)).RecordValue(value)
+		}
+	}
+}
+
+func (m *metricsScope) ExponentialHistogram(id MetricIdx, value time.Duration) {
+	def := m.defs[id]
+	if m.migrationConfig.Histogram.EmitHistogram(def.metricName.String()) {
+		m.scope.Tagged(def.exponentialBuckets.tags()).Histogram(def.metricName.String(), def.exponentialBuckets.buckets()).RecordDuration(value)
+	}
+	switch {
+	case !def.metricRollupName.Empty():
+		if m.migrationConfig.Histogram.EmitHistogram(def.metricRollupName.String()) {
+			m.rootScope.Tagged(def.exponentialBuckets.tags()).Histogram(def.metricRollupName.String(), def.exponentialBuckets.buckets()).RecordDuration(value)
+		}
+	case m.isDomainTagged:
+		if m.migrationConfig.Histogram.EmitHistogram(def.metricName.String()) {
+			m.scope.Tagged(def.exponentialBuckets.tags()).Tagged(map[string]string{domain: allValue}).Histogram(def.metricName.String(), def.exponentialBuckets.buckets()).RecordDuration(value)
+		}
+	}
+}
+
+func (m *metricsScope) IntExponentialHistogram(id MetricIdx, value int) {
+	def := m.defs[id]
+	floatValue := float64(value)
+	if m.migrationConfig.Histogram.EmitHistogram(def.metricName.String()) {
+		m.scope.Tagged(def.intExponentialBuckets.tags()).Histogram(def.metricName.String(), def.intValueBuckets).RecordValue(floatValue)
+	}
+	switch {
+	case !def.metricRollupName.Empty():
+		if m.migrationConfig.Histogram.EmitHistogram(def.metricRollupName.String()) {
+			m.rootScope.Tagged(def.intExponentialBuckets.tags()).Histogram(def.metricRollupName.String(), def.intValueBuckets).RecordValue(floatValue)
+		}
+	case m.isDomainTagged:
+		if m.migrationConfig.Histogram.EmitHistogram(def.metricName.String()) {
+			m.scope.Tagged(def.intExponentialBuckets.tags()).Tagged(map[string]string{domain: allValue}).Histogram(def.metricName.String(), def.intValueBuckets).RecordValue(floatValue)
+		}
 	}
 }
 
 func (m *metricsScope) Tagged(tags ...Tag) Scope {
-	domainTagged := false
+	domainTagged := m.isDomainTagged
 	tagMap := make(map[string]string, len(tags))
 	for _, tag := range tags {
 		if isDomainTagged(tag) {
@@ -126,10 +212,10 @@ func (m *metricsScope) Tagged(tags ...Tag) Scope {
 		}
 		tagMap[tag.Key()] = tag.Value()
 	}
-	return newMetricsScope(m.rootScope, m.scope.Tagged(tagMap), m.defs, domainTagged)
+	return newMetricsScope(m.rootScope, m.scope.Tagged(tagMap), m.defs, domainTagged, m.migrationConfig)
 }
 
-func (m *metricsScope) getBuckets(id int) tally.Buckets {
+func (m *metricsScope) getBuckets(id MetricIdx) tally.Buckets {
 	if m.defs[id].buckets != nil {
 		return m.defs[id].buckets
 	}
@@ -137,5 +223,5 @@ func (m *metricsScope) getBuckets(id int) tally.Buckets {
 }
 
 func isDomainTagged(tag Tag) bool {
-	return tag.Key() == domain && tag.Value() != domainAllValue
+	return tag.Key() == domain && tag.Value() != allValue
 }

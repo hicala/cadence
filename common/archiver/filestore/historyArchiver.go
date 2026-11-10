@@ -41,12 +41,12 @@ import (
 	"path"
 	"strconv"
 
-	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/archiver"
 	"github.com/uber/cadence/common/backoff"
 	"github.com/uber/cadence/common/log/tag"
-	"github.com/uber/cadence/common/service/config"
+	"github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/common/util"
 )
 
@@ -85,14 +85,14 @@ type (
 // NewHistoryArchiver creates a new archiver.HistoryArchiver based on filestore
 func NewHistoryArchiver(
 	container *archiver.HistoryBootstrapContainer,
-	config *config.FilestoreArchiver,
+	config *Config,
 ) (archiver.HistoryArchiver, error) {
 	return newHistoryArchiver(container, config, nil)
 }
 
 func newHistoryArchiver(
 	container *archiver.HistoryBootstrapContainer,
-	config *config.FilestoreArchiver,
+	config *Config,
 	historyIterator archiver.HistoryIterator,
 ) (*historyArchiver, error) {
 	fileMode, err := strconv.ParseUint(config.FileMode, 0, 32)
@@ -119,7 +119,7 @@ func (h *historyArchiver) Archive(
 ) (err error) {
 	featureCatalog := archiver.GetFeatureCatalog(opts...)
 	defer func() {
-		if err != nil && !common.IsPersistenceTransientError(err) && featureCatalog.NonRetriableError != nil {
+		if err != nil && !persistence.IsTransientError(err) && featureCatalog.NonRetriableError != nil {
 			err = featureCatalog.NonRetriableError()
 		}
 	}()
@@ -141,12 +141,20 @@ func (h *historyArchiver) Archive(
 		historyIterator = archiver.NewHistoryIterator(ctx, request, h.container.HistoryV2Manager, targetHistoryBlobSize)
 	}
 
-	historyBatches := []*shared.History{}
+	historyBatches := []*types.History{}
 	for historyIterator.HasNext() {
 		historyBlob, err := getNextHistoryBlob(ctx, historyIterator)
 		if err != nil {
+			if common.IsEntityNotExistsError(err) {
+				// workflow history no longer exists, may due to duplicated archival signal
+				// this may happen even in the middle of iterating history as two archival signals
+				// can be processed concurrently.
+				logger.Info(archiver.ArchiveSkippedInfoMsg)
+				return nil
+			}
+
 			logger := logger.WithTags(tag.ArchivalArchiveFailReason(archiver.ErrReasonReadHistory), tag.Error(err))
-			if !common.IsPersistenceTransientError(err) {
+			if !persistence.IsTransientError(err) {
 				logger.Error(archiver.ArchiveNonRetriableErrorMsg)
 			} else {
 				logger.Error(archiver.ArchiveTransientErrorMsg)
@@ -154,9 +162,10 @@ func (h *historyArchiver) Archive(
 			return err
 		}
 
-		if historyMutated(request, historyBlob.Body, *historyBlob.Header.IsLast) {
-			logger.Error(archiver.ArchiveNonRetriableErrorMsg, tag.ArchivalArchiveFailReason(archiver.ErrReasonHistoryMutated))
-			return archiver.ErrHistoryMutated
+		if archiver.IsHistoryMutated(request, historyBlob.Body, *historyBlob.Header.IsLast, logger) {
+			if !featureCatalog.ArchiveIncompleteHistory() {
+				return archiver.ErrHistoryMutated
+			}
 		}
 
 		historyBatches = append(historyBatches, historyBlob.Body...)
@@ -189,27 +198,27 @@ func (h *historyArchiver) Get(
 	request *archiver.GetHistoryRequest,
 ) (*archiver.GetHistoryResponse, error) {
 	if err := h.ValidateURI(URI); err != nil {
-		return nil, &shared.BadRequestError{Message: archiver.ErrInvalidURI.Error()}
+		return nil, &types.BadRequestError{Message: archiver.ErrInvalidURI.Error()}
 	}
 
 	if err := archiver.ValidateGetRequest(request); err != nil {
-		return nil, &shared.BadRequestError{Message: archiver.ErrInvalidGetHistoryRequest.Error()}
+		return nil, &types.BadRequestError{Message: archiver.ErrInvalidGetHistoryRequest.Error()}
 	}
 
 	dirPath := URI.Path()
 	exists, err := util.DirectoryExists(dirPath)
 	if err != nil {
-		return nil, &shared.InternalServiceError{Message: err.Error()}
+		return nil, &types.InternalServiceError{Message: err.Error()}
 	}
 	if !exists {
-		return nil, &shared.BadRequestError{Message: archiver.ErrHistoryNotExist.Error()}
+		return nil, &types.BadRequestError{Message: archiver.ErrHistoryNotExist.Error()}
 	}
 
 	var token *getHistoryToken
 	if request.NextPageToken != nil {
 		token, err = deserializeGetHistoryToken(request.NextPageToken)
 		if err != nil {
-			return nil, &shared.BadRequestError{Message: archiver.ErrNextPageTokenCorrupted.Error()}
+			return nil, &types.BadRequestError{Message: archiver.ErrNextPageTokenCorrupted.Error()}
 		}
 	} else if request.CloseFailoverVersion != nil {
 		token = &getHistoryToken{
@@ -219,7 +228,7 @@ func (h *historyArchiver) Get(
 	} else {
 		highestVersion, err := getHighestVersion(dirPath, request)
 		if err != nil {
-			return nil, &shared.InternalServiceError{Message: err.Error()}
+			return nil, &types.InternalServiceError{Message: err.Error()}
 		}
 		token = &getHistoryToken{
 			CloseFailoverVersion: *highestVersion,
@@ -231,20 +240,20 @@ func (h *historyArchiver) Get(
 	filepath := path.Join(dirPath, filename)
 	exists, err = util.FileExists(filepath)
 	if err != nil {
-		return nil, &shared.InternalServiceError{Message: err.Error()}
+		return nil, &types.InternalServiceError{Message: err.Error()}
 	}
 	if !exists {
-		return nil, &shared.EntityNotExistsError{Message: archiver.ErrHistoryNotExist.Error()}
+		return nil, &types.EntityNotExistsError{Message: archiver.ErrHistoryNotExist.Error()}
 	}
 
 	encodedHistoryBatches, err := util.ReadFile(filepath)
 	if err != nil {
-		return nil, &shared.InternalServiceError{Message: err.Error()}
+		return nil, &types.InternalServiceError{Message: err.Error()}
 	}
 
 	historyBatches, err := decodeHistoryBatches(encodedHistoryBatches)
 	if err != nil {
-		return nil, &shared.InternalServiceError{Message: err.Error()}
+		return nil, &types.InternalServiceError{Message: err.Error()}
 	}
 	historyBatches = historyBatches[token.NextBatchIdx:]
 
@@ -264,7 +273,7 @@ func (h *historyArchiver) Get(
 		token.NextBatchIdx += numOfBatches
 		nextToken, err := serializeToken(token)
 		if err != nil {
-			return nil, &shared.InternalServiceError{Message: err.Error()}
+			return nil, &types.InternalServiceError{Message: err.Error()}
 		}
 		response.NextPageToken = nextToken
 	}
@@ -282,18 +291,22 @@ func (h *historyArchiver) ValidateURI(URI archiver.URI) error {
 
 func getNextHistoryBlob(ctx context.Context, historyIterator archiver.HistoryIterator) (*archiver.HistoryBlob, error) {
 	historyBlob, err := historyIterator.Next()
-	op := func() error {
+	op := func(ctx context.Context) error {
 		historyBlob, err = historyIterator.Next()
 		return err
 	}
+	throttleRetry := backoff.NewThrottleRetry(
+		backoff.WithRetryPolicy(common.CreatePersistenceRetryPolicy()),
+		backoff.WithRetryableError(persistence.IsTransientError),
+	)
 	for err != nil {
 		if contextExpired(ctx) {
 			return nil, archiver.ErrContextTimeout
 		}
-		if !common.IsPersistenceTransientError(err) {
+		if !persistence.IsTransientError(err) {
 			return nil, err
 		}
-		err = backoff.Retry(op, common.CreatePersistenceRetryPolicy(), common.IsPersistenceTransientError)
+		err = throttleRetry.Do(ctx, op)
 	}
 	return historyBlob, nil
 }

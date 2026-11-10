@@ -20,12 +20,13 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination retryer_mock.go -package persistence github.com/uber/cadence/common/persistence Retryer
+
 package persistence
 
 import (
 	"context"
 
-	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/backoff"
 )
 
@@ -40,13 +41,16 @@ type Retryer interface {
 	DeleteWorkflowExecution(context.Context, *DeleteWorkflowExecutionRequest) error
 	DeleteCurrentWorkflowExecution(context.Context, *DeleteCurrentWorkflowExecutionRequest) error
 	GetShardID() int
+	GetHistoryTasks(context.Context, *GetHistoryTasksRequest) (*GetHistoryTasksResponse, error)
+	CompleteHistoryTask(ctx context.Context, request *CompleteHistoryTaskRequest) error
 }
 
 type (
 	persistenceRetryer struct {
 		execManager    ExecutionManager
 		historyManager HistoryManager
-		policy         backoff.RetryPolicy
+		throttleRetry  *backoff.ThrottleRetry
+		shardID        ShardID
 	}
 )
 
@@ -56,11 +60,43 @@ func NewPersistenceRetryer(
 	historyManager HistoryManager,
 	policy backoff.RetryPolicy,
 ) Retryer {
+	return newPersistenceRetryer(execManager, historyManager, policy, nil)
+}
+
+// NewPersistenceRetryerWithShardID constructs a new Retryer that populates empty request shard IDs.
+func NewPersistenceRetryerWithShardID(
+	execManager ExecutionManager,
+	historyManager HistoryManager,
+	policy backoff.RetryPolicy,
+	shardID int,
+) Retryer {
+	requestShardID := shardID
+	return newPersistenceRetryer(execManager, historyManager, policy, &requestShardID)
+}
+
+func newPersistenceRetryer(
+	execManager ExecutionManager,
+	historyManager HistoryManager,
+	policy backoff.RetryPolicy,
+	shardID ShardID,
+) Retryer {
 	return &persistenceRetryer{
 		execManager:    execManager,
 		historyManager: historyManager,
-		policy:         policy,
+		shardID:        shardID,
+		throttleRetry: backoff.NewThrottleRetry(
+			backoff.WithRetryPolicy(policy),
+			backoff.WithRetryableError(IsTransientError),
+		),
 	}
+}
+
+func (pr *persistenceRetryer) requestShardID() ShardID {
+	if pr.shardID == nil {
+		return nil
+	}
+	shardID := *pr.shardID
+	return &shardID
 }
 
 // ListConcreteExecutions retries ListConcreteExecutions
@@ -68,14 +104,16 @@ func (pr *persistenceRetryer) ListConcreteExecutions(
 	ctx context.Context,
 	req *ListConcreteExecutionsRequest,
 ) (*ListConcreteExecutionsResponse, error) {
+	if req.ShardID == nil {
+		req.ShardID = pr.requestShardID()
+	}
 	var resp *ListConcreteExecutionsResponse
-	op := func() error {
+	op := func(ctx context.Context) error {
 		var err error
 		resp, err = pr.execManager.ListConcreteExecutions(ctx, req)
 		return err
 	}
-	var err error
-	err = backoff.Retry(op, pr.policy, common.IsPersistenceTransientError)
+	err := pr.throttleRetry.Do(ctx, op)
 	if err == nil {
 		return resp, nil
 	}
@@ -87,13 +125,16 @@ func (pr *persistenceRetryer) GetWorkflowExecution(
 	ctx context.Context,
 	req *GetWorkflowExecutionRequest,
 ) (*GetWorkflowExecutionResponse, error) {
+	if req.ShardID == nil {
+		req.ShardID = pr.requestShardID()
+	}
 	var resp *GetWorkflowExecutionResponse
-	op := func() error {
+	op := func(ctx context.Context) error {
 		var err error
 		resp, err = pr.execManager.GetWorkflowExecution(ctx, req)
 		return err
 	}
-	err := backoff.Retry(op, pr.policy, common.IsPersistenceTransientError)
+	err := pr.throttleRetry.Do(ctx, op)
 	if err != nil {
 		return nil, err
 	}
@@ -105,13 +146,16 @@ func (pr *persistenceRetryer) GetCurrentExecution(
 	ctx context.Context,
 	req *GetCurrentExecutionRequest,
 ) (*GetCurrentExecutionResponse, error) {
+	if req.ShardID == nil {
+		req.ShardID = pr.requestShardID()
+	}
 	var resp *GetCurrentExecutionResponse
-	op := func() error {
+	op := func(ctx context.Context) error {
 		var err error
 		resp, err = pr.execManager.GetCurrentExecution(ctx, req)
 		return err
 	}
-	err := backoff.Retry(op, pr.policy, common.IsPersistenceTransientError)
+	err := pr.throttleRetry.Do(ctx, op)
 	if err != nil {
 		return nil, err
 	}
@@ -123,14 +167,16 @@ func (pr *persistenceRetryer) ListCurrentExecutions(
 	ctx context.Context,
 	req *ListCurrentExecutionsRequest,
 ) (*ListCurrentExecutionsResponse, error) {
+	if req.ShardID == nil {
+		req.ShardID = pr.requestShardID()
+	}
 	var resp *ListCurrentExecutionsResponse
-	op := func() error {
+	op := func(ctx context.Context) error {
 		var err error
 		resp, err = pr.execManager.ListCurrentExecutions(ctx, req)
 		return err
 	}
-	var err error
-	err = backoff.Retry(op, pr.policy, common.IsPersistenceTransientError)
+	err := pr.throttleRetry.Do(ctx, op)
 	if err == nil {
 		return resp, nil
 	}
@@ -142,13 +188,16 @@ func (pr *persistenceRetryer) IsWorkflowExecutionExists(
 	ctx context.Context,
 	req *IsWorkflowExecutionExistsRequest,
 ) (*IsWorkflowExecutionExistsResponse, error) {
+	if req.ShardID == nil {
+		req.ShardID = pr.requestShardID()
+	}
 	var resp *IsWorkflowExecutionExistsResponse
-	op := func() error {
+	op := func(ctx context.Context) error {
 		var err error
 		resp, err = pr.execManager.IsWorkflowExecutionExists(ctx, req)
 		return err
 	}
-	err := backoff.Retry(op, pr.policy, common.IsPersistenceTransientError)
+	err := pr.throttleRetry.Do(ctx, op)
 	if err != nil {
 		return nil, err
 	}
@@ -161,12 +210,12 @@ func (pr *persistenceRetryer) ReadHistoryBranch(
 	req *ReadHistoryBranchRequest,
 ) (*ReadHistoryBranchResponse, error) {
 	var resp *ReadHistoryBranchResponse
-	op := func() error {
+	op := func(ctx context.Context) error {
 		var err error
 		resp, err = pr.historyManager.ReadHistoryBranch(ctx, req)
 		return err
 	}
-	err := backoff.Retry(op, pr.policy, common.IsPersistenceTransientError)
+	err := pr.throttleRetry.Do(ctx, op)
 	if err != nil {
 		return nil, err
 	}
@@ -178,10 +227,13 @@ func (pr *persistenceRetryer) DeleteWorkflowExecution(
 	ctx context.Context,
 	req *DeleteWorkflowExecutionRequest,
 ) error {
-	op := func() error {
+	if req.ShardID == nil {
+		req.ShardID = pr.requestShardID()
+	}
+	op := func(ctx context.Context) error {
 		return pr.execManager.DeleteWorkflowExecution(ctx, req)
 	}
-	return backoff.Retry(op, pr.policy, common.IsPersistenceTransientError)
+	return pr.throttleRetry.Do(ctx, op)
 }
 
 // DeleteCurrentWorkflowExecution retries DeleteCurrentWorkflowExecution
@@ -189,13 +241,58 @@ func (pr *persistenceRetryer) DeleteCurrentWorkflowExecution(
 	ctx context.Context,
 	req *DeleteCurrentWorkflowExecutionRequest,
 ) error {
-	op := func() error {
+	if req.ShardID == nil {
+		req.ShardID = pr.requestShardID()
+	}
+	op := func(ctx context.Context) error {
 		return pr.execManager.DeleteCurrentWorkflowExecution(ctx, req)
 	}
-	return backoff.Retry(op, pr.policy, common.IsPersistenceTransientError)
+	return pr.throttleRetry.Do(ctx, op)
 }
 
-// GetShardID return shard id
+// GetShardID returns the configured shard ID.
+// It panics if the retryer was constructed without an explicit shard ID
+// (via NewPersistenceRetryer instead of NewPersistenceRetryerWithShardID).
 func (pr *persistenceRetryer) GetShardID() int {
-	return pr.execManager.GetShardID()
+	if pr.shardID == nil {
+		panic("GetShardID called on a Retryer without a configured shard ID; use NewPersistenceRetryerWithShardID")
+	}
+	return *pr.shardID
+}
+
+// GetHistoryTasks retries GetHistoryTasks
+func (pr *persistenceRetryer) GetHistoryTasks(
+	ctx context.Context,
+	req *GetHistoryTasksRequest,
+) (*GetHistoryTasksResponse, error) {
+	if req.ShardID == nil {
+		req.ShardID = pr.requestShardID()
+	}
+	var resp *GetHistoryTasksResponse
+	op := func(ctx context.Context) error {
+		var err error
+		resp, err = pr.execManager.GetHistoryTasks(ctx, req)
+		return err
+	}
+	err := pr.throttleRetry.Do(ctx, op)
+	if err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+// CompleteHistoryTask is a retryable version of CompleteHistoryTask method
+func (pr *persistenceRetryer) CompleteHistoryTask(
+	ctx context.Context,
+	request *CompleteHistoryTaskRequest,
+) error {
+	if request.ShardID == nil {
+		request.ShardID = pr.requestShardID()
+	}
+	op := func(ctx context.Context) error {
+		return pr.execManager.CompleteHistoryTask(ctx, request)
+	}
+
+	return pr.throttleRetry.Do(ctx, op)
 }

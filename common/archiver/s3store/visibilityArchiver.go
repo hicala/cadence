@@ -23,23 +23,22 @@ package s3store
 import (
 	"context"
 
-	"github.com/uber/cadence/common/metrics"
-
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 
-	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common/archiver"
 	"github.com/uber/cadence/common/log/tag"
-	"github.com/uber/cadence/common/service/config"
+	"github.com/uber/cadence/common/metrics"
+	"github.com/uber/cadence/common/types"
 )
 
 type (
 	visibilityArchiver struct {
 		container   *archiver.VisibilityBootstrapContainer
 		s3cli       s3iface.S3API
+		region      string
 		queryParser QueryParser
 	}
 
@@ -71,14 +70,14 @@ const (
 // NewVisibilityArchiver creates a new archiver.VisibilityArchiver based on s3
 func NewVisibilityArchiver(
 	container *archiver.VisibilityBootstrapContainer,
-	config *config.S3Archiver,
+	config *Config,
 ) (archiver.VisibilityArchiver, error) {
 	return newVisibilityArchiver(container, config)
 }
 
 func newVisibilityArchiver(
 	container *archiver.VisibilityBootstrapContainer,
-	config *config.S3Archiver) (*visibilityArchiver, error) {
+	config *Config) (*visibilityArchiver, error) {
 	s3Config := &aws.Config{
 		Endpoint:         config.Endpoint,
 		Region:           aws.String(config.Region),
@@ -91,6 +90,7 @@ func newVisibilityArchiver(
 	return &visibilityArchiver{
 		container:   container,
 		s3cli:       s3.New(sess),
+		region:      config.Region,
 		queryParser: NewQueryParser(),
 	}, nil
 }
@@ -103,7 +103,7 @@ func (v *visibilityArchiver) Archive(
 ) (err error) {
 	scope := v.container.MetricsClient.Scope(metrics.VisibilityArchiverScope, metrics.DomainTag(request.DomainName))
 	featureCatalog := archiver.GetFeatureCatalog(opts...)
-	sw := scope.StartTimer(metrics.CadenceLatency)
+	sw := scope.StartTimerWithExponentialHistogram(metrics.CadenceLatency, metrics.CadenceLatencyHistogram)
 	logger := archiver.TagLoggerWithArchiveVisibilityRequestAndURI(v.container.Logger, request, URI.String())
 	archiveFailReason := ""
 	defer func() {
@@ -140,8 +140,8 @@ func (v *visibilityArchiver) Archive(
 	indexes := createIndexesToArchive(request)
 	// Upload archive to all indexes
 	for _, element := range indexes {
-		key := constructTimestampIndex(URI.Path(), request.DomainID, element.primaryIndex, element.primaryIndexValue, element.secondaryIndex, element.secondaryIndexTimestamp, request.RunID)
-		if err := upload(ctx, v.s3cli, URI, key, encodedVisibilityRecord); err != nil {
+		key := constructTimestampIndex(s3KeyPath(URI), request.DomainID, element.primaryIndex, element.primaryIndexValue, element.secondaryIndex, element.secondaryIndexTimestamp, request.RunID)
+		if err := upload(ctx, v.s3cli, URI, v.region, key, encodedVisibilityRecord); err != nil {
 			archiveFailReason = errWriteKey
 			return err
 		}
@@ -164,16 +164,16 @@ func (v *visibilityArchiver) Query(
 	request *archiver.QueryVisibilityRequest,
 ) (*archiver.QueryVisibilityResponse, error) {
 	if err := softValidateURI(URI); err != nil {
-		return nil, &shared.BadRequestError{Message: archiver.ErrInvalidURI.Error()}
+		return nil, &types.BadRequestError{Message: archiver.ErrInvalidURI.Error()}
 	}
 
 	if err := archiver.ValidateQueryRequest(request); err != nil {
-		return nil, &shared.BadRequestError{Message: archiver.ErrInvalidQueryVisibilityRequest.Error()}
+		return nil, &types.BadRequestError{Message: archiver.ErrInvalidQueryVisibilityRequest.Error()}
 	}
 
 	parsedQuery, err := v.queryParser.Parse(request.Query)
 	if err != nil {
-		return nil, &shared.BadRequestError{Message: err.Error()}
+		return nil, &types.BadRequestError{Message: err.Error()}
 	}
 
 	return v.query(ctx, URI, &queryVisibilityRequest{
@@ -201,25 +201,30 @@ func (v *visibilityArchiver) query(
 		primaryIndex = primaryIndexKeyWorkflowID
 		primaryIndexValue = request.parsedQuery.workflowID
 	}
-	var prefix = constructVisibilitySearchPrefix(URI.Path(), request.domainID, primaryIndex, *primaryIndexValue, secondaryIndexKeyCloseTimeout) + "/"
+	keyPath := s3KeyPath(URI)
+	var prefix = constructVisibilitySearchPrefix(keyPath, request.domainID, primaryIndex, *primaryIndexValue, secondaryIndexKeyCloseTimeout) + "/"
 	if request.parsedQuery.closeTime != nil {
-		prefix = constructTimeBasedSearchKey(URI.Path(), request.domainID, primaryIndex, *primaryIndexValue, secondaryIndexKeyCloseTimeout, *request.parsedQuery.closeTime, *request.parsedQuery.searchPrecision)
+		prefix = constructTimeBasedSearchKey(keyPath, request.domainID, primaryIndex, *primaryIndexValue, secondaryIndexKeyCloseTimeout, *request.parsedQuery.closeTime, *request.parsedQuery.searchPrecision)
 	}
 	if request.parsedQuery.startTime != nil {
-		prefix = constructTimeBasedSearchKey(URI.Path(), request.domainID, primaryIndex, *primaryIndexValue, secondaryIndexKeyStartTimeout, *request.parsedQuery.startTime, *request.parsedQuery.searchPrecision)
+		prefix = constructTimeBasedSearchKey(keyPath, request.domainID, primaryIndex, *primaryIndexValue, secondaryIndexKeyStartTimeout, *request.parsedQuery.startTime, *request.parsedQuery.searchPrecision)
 	}
 
+	bucket, err := s3Bucket(URI, v.region)
+	if err != nil {
+		return nil, &types.BadRequestError{Message: err.Error()}
+	}
 	results, err := v.s3cli.ListObjectsV2WithContext(ctx, &s3.ListObjectsV2Input{
-		Bucket:            aws.String(URI.Hostname()),
+		Bucket:            aws.String(bucket),
 		Prefix:            aws.String(prefix),
 		MaxKeys:           aws.Int64(int64(request.pageSize)),
 		ContinuationToken: token,
 	})
 	if err != nil {
 		if isRetryableError(err) {
-			return nil, &shared.InternalServiceError{Message: err.Error()}
+			return nil, &types.InternalServiceError{Message: err.Error()}
 		}
-		return nil, &shared.BadRequestError{Message: err.Error()}
+		return nil, &types.BadRequestError{Message: err.Error()}
 	}
 	if len(results.Contents) == 0 {
 		return &archiver.QueryVisibilityResponse{}, nil
@@ -230,14 +235,14 @@ func (v *visibilityArchiver) query(
 		response.NextPageToken = serializeQueryVisibilityToken(*results.NextContinuationToken)
 	}
 	for _, item := range results.Contents {
-		encodedRecord, err := download(ctx, v.s3cli, URI, *item.Key)
+		encodedRecord, err := download(ctx, v.s3cli, URI, v.region, *item.Key)
 		if err != nil {
-			return nil, &shared.InternalServiceError{Message: err.Error()}
+			return nil, &types.InternalServiceError{Message: err.Error()}
 		}
 
 		record, err := decodeVisibilityRecord(encodedRecord)
 		if err != nil {
-			return nil, &shared.InternalServiceError{Message: err.Error()}
+			return nil, &types.InternalServiceError{Message: err.Error()}
 		}
 		response.Executions = append(response.Executions, convertToExecutionInfo(record))
 	}
@@ -249,5 +254,5 @@ func (v *visibilityArchiver) ValidateURI(URI archiver.URI) error {
 	if err != nil {
 		return err
 	}
-	return bucketExists(context.TODO(), v.s3cli, URI)
+	return bucketExists(context.TODO(), v.s3cli, URI, v.region)
 }

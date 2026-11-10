@@ -21,81 +21,122 @@
 package quotas
 
 import (
-	"sync"
+	"context"
+	"strings"
+)
+
+const (
+	// since a domain name doesn't contain a slash, it is safe to use it as a separator for task list keys
+	taskListKeySeparator = "/"
 )
 
 // MultiStageRateLimiter indicates a domain specific rate limit policy
 type MultiStageRateLimiter struct {
-	sync.RWMutex
-	rps            RPSFunc
-	domainRPS      RPSKeyFunc
-	domainLimiters map[string]*DynamicRateLimiter
-	globalLimiter  *DynamicRateLimiter
+	domainLimiters   ICollection[string]
+	taskListLimiters ICollection[string] // optional
+	globalLimiter    Limiter
 }
 
-// NewMultiStageRateLimiter returns a new domain quota rate limiter. This is about
-// an order of magnitude slower than
-func NewMultiStageRateLimiter(rps RPSFunc, domainRps RPSKeyFunc) *MultiStageRateLimiter {
-	rl := &MultiStageRateLimiter{
-		rps:            rps,
-		domainRPS:      domainRps,
-		domainLimiters: map[string]*DynamicRateLimiter{},
-		globalLimiter:  NewDynamicRateLimiter(rps),
+type TaskListKey struct {
+	Domain   string
+	TaskList string
+}
+
+func (k TaskListKey) String() string {
+	return k.Domain + taskListKeySeparator + k.TaskList
+}
+
+func ParseTaskListKey(key string) TaskListKey {
+	parts := strings.SplitN(key, taskListKeySeparator, 2)
+	if len(parts) != 2 {
+		return TaskListKey{}
 	}
-	return rl
+	return TaskListKey{
+		Domain:   parts[0],
+		TaskList: parts[1],
+	}
+}
+
+// NewMultiStageRateLimiter returns a new quota rate limiter. This is about
+// an order of magnitude slower than
+func NewMultiStageRateLimiter(global Limiter, domainLimiters ICollection[string], taskListLimiters ICollection[string]) *MultiStageRateLimiter {
+	return &MultiStageRateLimiter{
+		domainLimiters:   domainLimiters,
+		taskListLimiters: taskListLimiters,
+		globalLimiter:    global,
+	}
 }
 
 // Allow attempts to allow a request to go through. The method returns
 // immediately with a true or false indicating if the request can make
 // progress
-func (d *MultiStageRateLimiter) Allow(info Info) bool {
+func (d *MultiStageRateLimiter) Allow(info Info) (allowed bool) {
 	domain := info.Domain
-	if len(domain) == 0 {
-		return d.globalLimiter.Allow()
-	}
+	taskList := info.TaskList
 
-	// check if we have a per-domain limiter - if not create a default one for
-	// the domain.
-	d.RLock()
-	limiter, ok := d.domainLimiters[domain]
-	d.RUnlock()
-
-	if !ok {
-		// create a new limiter
-		domainLimiter := NewDynamicRateLimiter(
-			func() float64 {
-				return d.domainRPS(domain)
-			},
-		)
-
-		// verify that it is needed and add to map
-		d.Lock()
-		limiter, ok = d.domainLimiters[domain]
-		if !ok {
-			d.domainLimiters[domain] = domainLimiter
-			limiter = domainLimiter
+	if taskList != "" && d.taskListLimiters != nil {
+		taskListKey := TaskListKey{
+			Domain:   domain,
+			TaskList: taskList,
 		}
-		d.Unlock()
+		rsv := d.taskListLimiters.For(taskListKey.String()).Reserve()
+		defer func() {
+			rsv.Used(allowed) // returns the token if allowed but not used
+		}()
+
+		if !rsv.Allow() {
+			return false
+		}
 	}
 
-	// take a reservation with the domain limiter first
-	rsv := limiter.Reserve()
-	if !rsv.OK() {
-		return false
-	}
+	if domain != "" && d.domainLimiters != nil {
+		// take a reservation with the domain limiter first
+		rsv := d.domainLimiters.For(domain).Reserve()
+		defer func() {
+			rsv.Used(allowed) // returns the token if allowed but not used
+		}()
 
-	// check whether the reservation is valid now, otherwise
-	// cancel and return right away so we can drop the request
-	if rsv.Delay() != 0 {
-		rsv.Cancel()
-		return false
+		if !rsv.Allow() {
+			return false
+		}
 	}
 
 	// ensure that the reservation does not break the global rate limit, if it
 	// does, cancel the reservation and do not allow to proceed.
 	if !d.globalLimiter.Allow() {
-		rsv.Cancel()
 		return false
 	}
 	return true
+}
+
+// Wait waits up till the context deadline for a rate limit token to allow the request
+// to go through. This waits on the per-domain limiter, then waits on the global limiter.
+func (d *MultiStageRateLimiter) Wait(ctx context.Context, info Info) error {
+	domain := info.Domain
+	taskList := info.TaskList
+
+	// A limitation: if the task-list limiter allows but the domain
+	// limiter denies, the task-list token is consumed.
+	if taskList != "" && d.taskListLimiters != nil {
+		taskListKey := TaskListKey{
+			Domain:   domain,
+			TaskList: taskList,
+		}
+		if err := d.taskListLimiters.For(taskListKey.String()).Wait(ctx); err != nil {
+			return err
+		}
+	}
+
+	if domain != "" && d.domainLimiters != nil {
+		if err := d.domainLimiters.For(domain).Wait(ctx); err != nil {
+			return err
+		}
+	}
+
+	// A limitation in this implementation is that when domain limiter
+	// allows but global limiter does not, we have already consumed a token
+	// from the domain limiter and cannot return it, because Wait() doesn't
+	// return a reservation. This should not affect throughput since
+	// global limiter is the bottleneck in this situation.
+	return d.globalLimiter.Wait(ctx)
 }

@@ -18,18 +18,30 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination loadbalancer_mock.go -package matching github.com/uber/cadence/client/matching LoadBalancer,WeightedLoadBalancer
+
 package matching
 
 import (
 	"fmt"
 	"math/rand"
-	"strings"
 
-	"github.com/uber/cadence/.gen/go/shared"
-	"github.com/uber/cadence/common/service/dynamicconfig"
+	"github.com/uber/cadence/common/constants"
+	"github.com/uber/cadence/common/types"
 )
 
 type (
+	// WriteRequest is the interface for all types of AddTask* requests
+	WriteRequest interface {
+		ReadRequest
+		GetPartitionConfig() map[string]string
+	}
+	// ReadRequest is the interface for all types of Poll* requests
+	ReadRequest interface {
+		GetDomainUUID() string
+		GetTaskList() *types.TaskList
+		GetForwardedFrom() string
+	}
 	// LoadBalancer is the interface for implementers of
 	// component that distributes add/poll api calls across
 	// available task list partitions when possible
@@ -41,96 +53,90 @@ type (
 		// to a parent partition in which case, no load balancing should be
 		// performed
 		PickWritePartition(
-			domainID string,
-			taskList shared.TaskList,
 			taskListType int,
-			forwardedFrom string,
+			request WriteRequest,
 		) string
 
 		// PickReadPartition returns the task list partition to send a poller to.
 		// Input is name of the original task list as specified by caller. When
 		// forwardedFrom is non-empty, no load balancing should be done.
 		PickReadPartition(
-			domainID string,
-			taskList shared.TaskList,
 			taskListType int,
-			forwardedFrom string,
+			request ReadRequest,
+			isolationGroup string,
 		) string
+
+		// UpdateWeight updates the weight of a task list partition.
+		// Input is name of the original task list as specified by caller. When
+		// the original task list is a partition, no update should be done.
+		UpdateWeight(
+			taskListType int,
+			request ReadRequest,
+			partition string,
+			info *types.LoadBalancerHints,
+		)
+	}
+	WeightedLoadBalancer interface {
+		LoadBalancer
+		PickBetween(domainID, taskListName string, taskListType int, partitions []int) int
 	}
 
 	defaultLoadBalancer struct {
-		nReadPartitions  dynamicconfig.IntPropertyFnWithTaskListInfoFilters
-		nWritePartitions dynamicconfig.IntPropertyFnWithTaskListInfoFilters
-		domainIDToName   func(string) (string, error)
+		provider PartitionConfigProvider
 	}
-)
-
-const (
-	taskListPartitionPrefix = "/__cadence_sys/"
 )
 
 // NewLoadBalancer returns an instance of matching load balancer that
 // can help distribute api calls across task list partitions
 func NewLoadBalancer(
-	domainIDToName func(string) (string, error),
-	dc *dynamicconfig.Collection,
+	provider PartitionConfigProvider,
 ) LoadBalancer {
 	return &defaultLoadBalancer{
-		domainIDToName:   domainIDToName,
-		nReadPartitions:  dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingNumTasklistReadPartitions, 1),
-		nWritePartitions: dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingNumTasklistWritePartitions, 1),
+		provider: provider,
 	}
 }
 
 func (lb *defaultLoadBalancer) PickWritePartition(
-	domainID string,
-	taskList shared.TaskList,
-	taskListType int,
-	forwardedFrom string,
+	taskListType int, req WriteRequest,
 ) string {
-	return lb.pickPartition(domainID, taskList, taskListType, forwardedFrom, lb.nWritePartitions)
+	nPartitions := lb.provider.GetNumberOfWritePartitions(req.GetDomainUUID(), *req.GetTaskList(), taskListType)
+	return lb.pickPartition(*req.GetTaskList(), req.GetForwardedFrom(), nPartitions)
+
 }
 
 func (lb *defaultLoadBalancer) PickReadPartition(
-	domainID string,
-	taskList shared.TaskList,
-	taskListType int,
-	forwardedFrom string,
+	taskListType int, req ReadRequest, _ string,
 ) string {
-	return lb.pickPartition(domainID, taskList, taskListType, forwardedFrom, lb.nReadPartitions)
+	n := lb.provider.GetNumberOfReadPartitions(req.GetDomainUUID(), *req.GetTaskList(), taskListType)
+	return lb.pickPartition(*req.GetTaskList(), req.GetForwardedFrom(), n)
+
 }
 
 func (lb *defaultLoadBalancer) pickPartition(
-	domainID string,
-	taskList shared.TaskList,
-	taskListType int,
+	taskList types.TaskList,
 	forwardedFrom string,
-	nPartitions dynamicconfig.IntPropertyFnWithTaskListInfoFilters,
+	nPartitions int,
 ) string {
 
-	if forwardedFrom != "" || taskList.GetKind() == shared.TaskListKindSticky {
+	if nPartitions <= 1 {
 		return taskList.GetName()
 	}
 
-	if strings.HasPrefix(taskList.GetName(), taskListPartitionPrefix) {
-		// this should never happen when forwardedFrom is empty
-		return taskList.GetName()
-	}
+	p := rand.Intn(nPartitions)
+	return getPartitionTaskListName(taskList.GetName(), p)
+}
 
-	domainName, err := lb.domainIDToName(domainID)
-	if err != nil {
-		return taskList.GetName()
-	}
+func (lb *defaultLoadBalancer) UpdateWeight(
+	taskListType int,
+	req ReadRequest,
+	partition string,
+	info *types.LoadBalancerHints,
+) {
+}
 
-	n := nPartitions(domainName, taskList.GetName(), taskListType)
-	if n <= 0 {
-		return taskList.GetName()
+func getPartitionTaskListName(root string, partition int) string {
+	if partition <= 0 {
+		return root
 	}
-
-	p := rand.Intn(n)
-	if p == 0 {
-		return taskList.GetName()
-	}
-
-	return fmt.Sprintf("%v%v/%v", taskListPartitionPrefix, taskList.GetName(), p)
+	return fmt.Sprintf("%v%v/%v", constants.ReservedTaskListPrefix, root, partition)
 }

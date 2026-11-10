@@ -26,18 +26,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
 	"github.com/pborman/uuid"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"go.uber.org/mock/gomock"
 
-	"github.com/uber/cadence/.gen/go/replicator"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/cache"
 	"github.com/uber/cadence/common/cluster"
+	"github.com/uber/cadence/common/dynamicconfig/dynamicproperties"
 	"github.com/uber/cadence/common/persistence"
-	"github.com/uber/cadence/common/service/dynamicconfig"
+	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/service/history/config"
 	"github.com/uber/cadence/service/history/shard"
 )
@@ -47,12 +47,12 @@ type (
 		suite.Suite
 		*require.Assertions
 
-		controller          *gomock.Controller
-		coordinator         *MockCoordinator
-		mockShard           *shard.TestContext
-		mockDomainCache     *cache.MockDomainCache
-		mockClusterMetadata *cluster.MockMetadata
-		markerNotifier      *markerNotifierImpl
+		controller      *gomock.Controller
+		coordinator     *MockCoordinator
+		mockShard       *shard.TestContext
+		mockDomainCache *cache.MockDomainCache
+		clusterMetadata cluster.Metadata
+		markerNotifier  *markerNotifierImpl
 	}
 )
 
@@ -66,9 +66,10 @@ func (s *markerNotifierSuite) SetupTest() {
 	s.controller = gomock.NewController(s.T())
 
 	config := config.NewForTest()
-	config.NotifyFailoverMarkerInterval = dynamicconfig.GetDurationPropertyFn(time.Millisecond)
+	config.NotifyFailoverMarkerInterval = dynamicproperties.GetDurationPropertyFn(time.Millisecond)
 	s.coordinator = NewMockCoordinator(s.controller)
 	s.mockShard = shard.NewTestContext(
+		s.T(),
 		s.controller,
 		&persistence.ShardInfo{
 			ShardID:          10,
@@ -77,8 +78,7 @@ func (s *markerNotifierSuite) SetupTest() {
 		},
 		config,
 	)
-	s.mockClusterMetadata = s.mockShard.Resource.ClusterMetadata
-	s.mockClusterMetadata.EXPECT().GetCurrentClusterName().Return(cluster.TestCurrentClusterName).AnyTimes()
+	s.clusterMetadata = s.mockShard.Resource.ClusterMetadata
 	mockShardManager := s.mockShard.Resource.ShardMgr
 	mockShardManager.On("UpdateShard", mock.Anything, mock.Anything).Return(nil)
 	s.mockDomainCache = s.mockShard.Resource.DomainCache
@@ -116,10 +116,10 @@ func (s *markerNotifierSuite) TestNotifyPendingFailoverMarker() {
 		EmitMetric: true,
 	}
 	replicationConfig := &persistence.DomainReplicationConfig{
-		ActiveClusterName: s.mockClusterMetadata.GetCurrentClusterName(),
+		ActiveClusterName: s.clusterMetadata.GetCurrentClusterName(),
 		Clusters: []*persistence.ClusterReplicationConfig{
 			{
-				s.mockClusterMetadata.GetCurrentClusterName(),
+				ClusterName: s.clusterMetadata.GetCurrentClusterName(),
 			},
 		},
 	}
@@ -131,15 +131,15 @@ func (s *markerNotifierSuite) TestNotifyPendingFailoverMarker() {
 		replicationConfig,
 		1,
 		endTime,
-		s.mockClusterMetadata,
+		0, 0, 0,
 	)
 	s.mockDomainCache.EXPECT().GetDomainByID(domainID).Return(domainEntry, nil).AnyTimes()
-	task := &replicator.FailoverMarkerAttributes{
-		DomainID:        common.StringPtr(domainID),
-		FailoverVersion: common.Int64Ptr(1),
+	task := &types.FailoverMarkerAttributes{
+		DomainID:        domainID,
+		FailoverVersion: 1,
 		CreationTime:    common.Int64Ptr(1),
 	}
-	tasks := []*replicator.FailoverMarkerAttributes{task}
+	tasks := []*types.FailoverMarkerAttributes{task}
 	respCh := make(chan error, 1)
 	err := s.mockShard.AddingPendingFailoverMarker(task)
 	s.NoError(err)
@@ -148,10 +148,10 @@ func (s *markerNotifierSuite) TestNotifyPendingFailoverMarker() {
 	s.coordinator.EXPECT().NotifyFailoverMarkers(
 		int32(s.mockShard.GetShardID()),
 		tasks,
-	).Do(
+	).AnyTimes().Do(
 		func(
 			shardID int32,
-			markers []*replicator.FailoverMarkerAttributes,
+			markers []*types.FailoverMarkerAttributes,
 		) {
 			if count == 0 {
 				count++
@@ -160,7 +160,6 @@ func (s *markerNotifierSuite) TestNotifyPendingFailoverMarker() {
 			if count == 1 {
 				close(s.markerNotifier.shutdownCh)
 			}
-			return
 		},
 	)
 

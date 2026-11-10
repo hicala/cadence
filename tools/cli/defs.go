@@ -25,12 +25,17 @@ import (
 	"time"
 
 	"github.com/fatih/color"
-	"github.com/olekukonko/tablewriter"
-	s "go.uber.org/cadence/.gen/go/shared"
+
+	"github.com/uber/cadence/common/types"
 )
 
 const (
-	localHostPort = "127.0.0.1:7933"
+	localHost    = "127.0.0.1"
+	tchannelPort = localHost + ":7933"
+	grpcPort     = localHost + ":7833"
+
+	grpcTransport   = "grpc"
+	thriftTransport = "tchannel"
 
 	maxOutputStringLength = 200 // max length for output string
 	maxWorkflowTypeLength = 32  // max item length for output workflow type in table
@@ -59,7 +64,7 @@ const (
 	defaultDecisionTimeoutInSeconds = 10
 	defaultPageSizeForList          = 500
 	defaultPageSizeForScan          = 2000
-	defaultWorkflowIDReusePolicy    = s.WorkflowIdReusePolicyAllowDuplicateFailedOnly
+	defaultWorkflowIDReusePolicy    = types.WorkflowIDReusePolicyAllowDuplicateFailedOnly
 
 	workflowStatusNotSet = -1
 	showErrorStackEnv    = `CADENCE_CLI_SHOW_STACKS`
@@ -75,11 +80,22 @@ var envKeysForUserName = []string{
 	"HOME",
 }
 
+const resetTypeFirstDecisionCompleted = "FirstDecisionCompleted"
+const resetTypeLastDecisionCompleted = "LastDecisionCompleted"
+const resetTypeLastContinuedAsNew = "LastContinuedAsNew"
+const resetTypeBadBinary = "BadBinary"
+const resetTypeDecisionCompletedTime = "DecisionCompletedTime"
+const resetTypeFirstDecisionScheduled = "FirstDecisionScheduled"
+const resetTypeLastDecisionScheduled = "LastDecisionScheduled"
+
 var resetTypesMap = map[string]string{
-	"FirstDecisionCompleted": "",
-	"LastDecisionCompleted":  "",
-	"LastContinuedAsNew":     "",
-	"BadBinary":              FlagResetBadBinaryChecksum,
+	resetTypeFirstDecisionCompleted: "",
+	resetTypeLastDecisionCompleted:  "",
+	resetTypeLastContinuedAsNew:     "",
+	resetTypeBadBinary:              FlagResetBadBinaryChecksum,
+	resetTypeDecisionCompletedTime:  "",
+	resetTypeFirstDecisionScheduled: "",
+	resetTypeLastDecisionScheduled:  "",
 }
 
 type jsonType int
@@ -88,36 +104,36 @@ const (
 	jsonTypeInput jsonType = iota
 	jsonTypeMemo
 	jsonTypeHeader
+	jsonTypeSignal
 )
 
 var (
-	cFactory ClientFactory
-
 	colorRed     = color.New(color.FgRed).SprintFunc()
 	colorMagenta = color.New(color.FgMagenta).SprintFunc()
 	colorGreen   = color.New(color.FgGreen).SprintFunc()
 
-	tableHeaderBlue         = tablewriter.Colors{tablewriter.FgHiBlueColor}
 	optionErr               = "there is something wrong with your command options"
 	osExit                  = os.Exit
-	workflowClosedStatusMap = map[string]s.WorkflowExecutionCloseStatus{
-		"completed":      s.WorkflowExecutionCloseStatusCompleted,
-		"failed":         s.WorkflowExecutionCloseStatusFailed,
-		"canceled":       s.WorkflowExecutionCloseStatusCanceled,
-		"terminated":     s.WorkflowExecutionCloseStatusTerminated,
-		"continuedasnew": s.WorkflowExecutionCloseStatusContinuedAsNew,
-		"continueasnew":  s.WorkflowExecutionCloseStatusContinuedAsNew,
-		"timedout":       s.WorkflowExecutionCloseStatusTimedOut,
+	workflowClosedStatusMap = map[string]types.WorkflowExecutionCloseStatus{
+		"completed":        types.WorkflowExecutionCloseStatusCompleted,
+		"failed":           types.WorkflowExecutionCloseStatusFailed,
+		"canceled":         types.WorkflowExecutionCloseStatusCanceled,
+		"terminated":       types.WorkflowExecutionCloseStatusTerminated,
+		"continued_as_new": types.WorkflowExecutionCloseStatusContinuedAsNew,
+		"timed_out":        types.WorkflowExecutionCloseStatusTimedOut,
 		// below are some alias
-		"c":         s.WorkflowExecutionCloseStatusCompleted,
-		"complete":  s.WorkflowExecutionCloseStatusCompleted,
-		"f":         s.WorkflowExecutionCloseStatusFailed,
-		"fail":      s.WorkflowExecutionCloseStatusFailed,
-		"cancel":    s.WorkflowExecutionCloseStatusCanceled,
-		"terminate": s.WorkflowExecutionCloseStatusTerminated,
-		"term":      s.WorkflowExecutionCloseStatusTerminated,
-		"continue":  s.WorkflowExecutionCloseStatusContinuedAsNew,
-		"cont":      s.WorkflowExecutionCloseStatusContinuedAsNew,
-		"timeout":   s.WorkflowExecutionCloseStatusTimedOut,
+		"c":              types.WorkflowExecutionCloseStatusCompleted,
+		"complete":       types.WorkflowExecutionCloseStatusCompleted,
+		"f":              types.WorkflowExecutionCloseStatusFailed,
+		"fail":           types.WorkflowExecutionCloseStatusFailed,
+		"cancel":         types.WorkflowExecutionCloseStatusCanceled,
+		"terminate":      types.WorkflowExecutionCloseStatusTerminated,
+		"term":           types.WorkflowExecutionCloseStatusTerminated,
+		"continue":       types.WorkflowExecutionCloseStatusContinuedAsNew,
+		"cont":           types.WorkflowExecutionCloseStatusContinuedAsNew,
+		"continuedasnew": types.WorkflowExecutionCloseStatusContinuedAsNew,
+		"continueasnew":  types.WorkflowExecutionCloseStatusContinuedAsNew,
+		"timedout":       types.WorkflowExecutionCloseStatusTimedOut,
+		"timeout":        types.WorkflowExecutionCloseStatusTimedOut,
 	}
 )

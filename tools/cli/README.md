@@ -1,12 +1,16 @@
 Documentation for the Cadence command line interface is located at our [main site](https://cadenceworkflow.io/docs/cli/).
 
-## Quick Start
-Run `make bins` from the project root. You should see an executable file called `cadence`. Try a few example commands to 
-get started:   
-`./cadence` for help on top level commands and global options   
-`./cadence domain` for help on domain operations  
-`./cadence workflow` for help on workflow operations  
-`./cadence tasklist` for help on tasklist operations  
-(`./cadence help`, `./cadence help [domain|workflow]` will also print help messages)
+### Build CLI binary locally
 
-**Note:** Make sure you have a Cadence server running before using the CLI.
+To build the CLI tool locally check out the version tag (e.g. `git checkout v0.21.3`) and run `make tools`. 
+This produces an executable called cadence.
+
+Run help command with a local build:
+````
+./cadence --help
+````
+
+Command to describe a domain would look like this:
+````
+./cadence --domain samples-domain domain describe
+````

@@ -22,16 +22,17 @@ package task
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
-	"github.com/golang/mock/gomock"
+	"go.uber.org/mock/gomock"
 
-	workflow "github.com/uber/cadence/.gen/go/shared"
-	"github.com/uber/cadence/common"
+	"github.com/uber/cadence/common/constants"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/service/history/execution"
 	"github.com/uber/cadence/service/history/shard"
 )
@@ -45,11 +46,10 @@ type (
 // InitializeLoggerForTask creates a new logger with additional tags for task info
 func InitializeLoggerForTask(
 	shardID int,
-	task Info,
+	task persistence.Task,
 	logger log.Logger,
 ) log.Logger {
-
-	taskLogger := logger.WithTags(
+	return logger.WithTags(
 		tag.ShardID(shardID),
 		tag.TaskID(task.GetTaskID()),
 		tag.TaskVisibilityTimestamp(task.GetVisibilityTimestamp().UnixNano()),
@@ -59,28 +59,13 @@ func InitializeLoggerForTask(
 		tag.WorkflowID(task.GetWorkflowID()),
 		tag.WorkflowRunID(task.GetRunID()),
 	)
-
-	switch task := task.(type) {
-	case *persistence.TimerTaskInfo:
-		taskLogger = taskLogger.WithTags(
-			tag.WorkflowTimeoutType(int64(task.TimeoutType)),
-		)
-	case *persistence.TransferTaskInfo:
-		// noop
-	case *persistence.ReplicationTaskInfo:
-		// noop
-	default:
-		taskLogger.Error(fmt.Sprintf("Unknown queue task type: %v", task))
-	}
-
-	return taskLogger
 }
 
 // GetTransferTaskMetricsScope returns the metrics scope index for transfer task
 func GetTransferTaskMetricsScope(
 	taskType int,
 	isActive bool,
-) int {
+) metrics.ScopeIdx {
 	switch taskType {
 	case persistence.TransferTaskTypeActivityTask:
 		if isActive {
@@ -127,6 +112,31 @@ func GetTransferTaskMetricsScope(
 			return metrics.TransferActiveTaskUpsertWorkflowSearchAttributesScope
 		}
 		return metrics.TransferStandbyTaskUpsertWorkflowSearchAttributesScope
+	case persistence.TransferTaskTypeRecordWorkflowClosed:
+		if isActive {
+			return metrics.TransferActiveTaskRecordWorkflowClosedScope
+		}
+		return metrics.TransferStandbyTaskRecordWorkflowClosedScope
+	case persistence.TransferTaskTypeRecordChildExecutionCompleted:
+		if isActive {
+			return metrics.TransferActiveTaskRecordChildExecutionCompletedScope
+		}
+		return metrics.TransferStandbyTaskRecordChildExecutionCompletedScope
+	case persistence.TransferTaskTypeApplyParentClosePolicy:
+		if isActive {
+			return metrics.TransferActiveTaskApplyParentClosePolicyScope
+		}
+		return metrics.TransferStandbyTaskApplyParentClosePolicyScope
+	case persistence.TransferTaskTypeAcquireSemaphore:
+		if isActive {
+			return metrics.TransferActiveTaskAcquireSemaphoreScope
+		}
+		return metrics.TransferStandbyTaskAcquireSemaphoreScope
+	case persistence.TransferTaskTypeReleaseSemaphore:
+		if isActive {
+			return metrics.TransferActiveTaskReleaseSemaphoreScope
+		}
+		return metrics.TransferStandbyTaskReleaseSemaphoreScope
 	default:
 		if isActive {
 			return metrics.TransferActiveQueueProcessorScope
@@ -139,7 +149,7 @@ func GetTransferTaskMetricsScope(
 func GetTimerTaskMetricScope(
 	taskType int,
 	isActive bool,
-) int {
+) metrics.ScopeIdx {
 	switch taskType {
 	case persistence.TaskTypeDecisionTimeout:
 		if isActive {
@@ -176,6 +186,11 @@ func GetTimerTaskMetricScope(
 			return metrics.TimerActiveTaskWorkflowBackoffTimerScope
 		}
 		return metrics.TimerStandbyTaskWorkflowBackoffTimerScope
+	case persistence.TaskTypeSemaphoreAcquireTimeout:
+		if isActive {
+			return metrics.TimerActiveTaskSemaphoreAcquireTimeoutScope
+		}
+		return metrics.TimerStandbyTaskSemaphoreAcquireTimeoutScope
 	default:
 		if isActive {
 			return metrics.TimerActiveQueueProcessorScope
@@ -191,12 +206,8 @@ func verifyTaskVersion(
 	domainID string,
 	version int64,
 	taskVersion int64,
-	task interface{},
+	task persistence.Task,
 ) (bool, error) {
-
-	if !shard.GetService().GetClusterMetadata().IsGlobalDomainEnabled() {
-		return true, nil
-	}
 
 	// the first return value is whether this task is valid for further processing
 	domainEntry, err := shard.GetDomainCache().GetDomainByID(domainID)
@@ -215,18 +226,19 @@ func verifyTaskVersion(
 	return true, nil
 }
 
-// load mutable state, if mutable state's next event ID <= task ID, will attempt to refresh
-// if still mutable state's next event ID <= task ID, will return nil, nil
-func loadMutableStateForTimerTask(
+// load mutable state, if mutable state's next event ID <= task event ID, will attempt to refresh
+// if still mutable state's next event ID <= task event ID, will return nil, nil
+func loadMutableState(
 	ctx context.Context,
 	wfContext execution.Context,
-	timerTask *persistence.TimerTaskInfo,
-	metricsClient metrics.Client,
+	task persistence.Task,
+	metricsScope metrics.Scope,
 	logger log.Logger,
+	eventID int64,
 ) (execution.MutableState, error) {
 	msBuilder, err := wfContext.LoadWorkflowExecution(ctx)
 	if err != nil {
-		if _, ok := err.(*workflow.EntityNotExistsError); ok {
+		if _, ok := err.(*types.EntityNotExistsError); ok {
 			// this could happen if this is a duplicate processing of the task, and the execution has already completed.
 			return nil, nil
 		}
@@ -237,12 +249,12 @@ func loadMutableStateForTimerTask(
 	// check to see if cache needs to be refreshed as we could potentially have stale workflow execution
 	// the exception is decision consistently fail
 	// there will be no event generated, thus making the decision schedule ID == next event ID
-	isDecisionRetry := timerTask.TaskType == persistence.TaskTypeDecisionTimeout &&
-		executionInfo.DecisionScheduleID == timerTask.EventID &&
+	isDecisionRetry := (task.GetTaskType() == persistence.TaskTypeDecisionTimeout || task.GetTaskType() == persistence.TransferTaskTypeDecisionTask) &&
+		executionInfo.DecisionScheduleID == eventID &&
 		executionInfo.DecisionAttempt > 0
 
-	if timerTask.EventID >= msBuilder.GetNextEventID() && !isDecisionRetry {
-		metricsClient.IncCounter(metrics.TimerQueueProcessorScope, metrics.StaleMutableStateCounter)
+	if eventID >= msBuilder.GetNextEventID() && !isDecisionRetry {
+		metricsScope.IncCounter(metrics.StaleMutableStateCounter)
 		wfContext.Clear()
 
 		msBuilder, err = wfContext.LoadWorkflowExecution(ctx)
@@ -250,56 +262,19 @@ func loadMutableStateForTimerTask(
 			return nil, err
 		}
 		// after refresh, still mutable state's next event ID <= task ID
-		if timerTask.EventID >= msBuilder.GetNextEventID() {
-			logger.Info("Timer Task Processor: task event ID >= MS NextEventID, skip.",
-				tag.WorkflowEventID(timerTask.EventID),
-				tag.WorkflowNextEventID(msBuilder.GetNextEventID()))
-			return nil, nil
-		}
-	}
-	return msBuilder, nil
-}
-
-// load mutable state, if mutable state's next event ID <= task ID, will attempt to refresh
-// if still mutable state's next event ID <= task ID, will return nil, nil
-func loadMutableStateForTransferTask(
-	ctx context.Context,
-	wfContext execution.Context,
-	transferTask *persistence.TransferTaskInfo,
-	metricsClient metrics.Client,
-	logger log.Logger,
-) (execution.MutableState, error) {
-
-	msBuilder, err := wfContext.LoadWorkflowExecution(ctx)
-	if err != nil {
-		if _, ok := err.(*workflow.EntityNotExistsError); ok {
-			// this could happen if this is a duplicate processing of the task, and the execution has already completed.
-			return nil, nil
-		}
-		return nil, err
-	}
-	executionInfo := msBuilder.GetExecutionInfo()
-
-	// check to see if cache needs to be refreshed as we could potentially have stale workflow execution
-	// the exception is decision consistently fail
-	// there will be no event generated, thus making the decision schedule ID == next event ID
-	isDecisionRetry := transferTask.TaskType == persistence.TransferTaskTypeDecisionTask &&
-		executionInfo.DecisionScheduleID == transferTask.ScheduleID &&
-		executionInfo.DecisionAttempt > 0
-
-	if transferTask.ScheduleID >= msBuilder.GetNextEventID() && !isDecisionRetry {
-		metricsClient.IncCounter(metrics.TransferQueueProcessorScope, metrics.StaleMutableStateCounter)
-		wfContext.Clear()
-
-		msBuilder, err = wfContext.LoadWorkflowExecution(ctx)
-		if err != nil {
-			return nil, err
-		}
-		// after refresh, still mutable state's next event ID <= task ID
-		if transferTask.ScheduleID >= msBuilder.GetNextEventID() {
-			logger.Info("Transfer Task Processor: task event ID >= MS NextEventID, skip.",
-				tag.WorkflowScheduleID(transferTask.ScheduleID),
-				tag.WorkflowNextEventID(msBuilder.GetNextEventID()))
+		if eventID >= msBuilder.GetNextEventID() {
+			domainName := msBuilder.GetDomainEntry().GetInfo().Name
+			metricsScope.Tagged(metrics.DomainTag(domainName)).IncCounter(metrics.DataInconsistentCounter)
+			logger.Error("Task Processor: task event ID >= MS NextEventID, skip.",
+				tag.WorkflowDomainName(domainName),
+				tag.WorkflowDomainID(task.GetDomainID()),
+				tag.WorkflowID(task.GetWorkflowID()),
+				tag.WorkflowRunID(task.GetRunID()),
+				tag.TaskType(task.GetTaskType()),
+				tag.TaskID(task.GetTaskID()),
+				tag.WorkflowEventID(eventID),
+				tag.WorkflowNextEventID(msBuilder.GetNextEventID()),
+			)
 			return nil, nil
 		}
 	}
@@ -315,7 +290,7 @@ func timeoutWorkflow(
 		if err := execution.FailDecision(
 			mutableState,
 			decision,
-			workflow.DecisionTaskFailedCauseForceCloseDecision,
+			types.DecisionTaskFailedCauseForceCloseDecision,
 		); err != nil {
 			return err
 		}
@@ -332,14 +307,14 @@ func retryWorkflow(
 	mutableState execution.MutableState,
 	eventBatchFirstEventID int64,
 	parentDomainName string,
-	continueAsNewAttributes *workflow.ContinueAsNewWorkflowExecutionDecisionAttributes,
+	continueAsNewAttributes *types.ContinueAsNewWorkflowExecutionDecisionAttributes,
 ) (execution.MutableState, error) {
 
 	if decision, ok := mutableState.GetInFlightDecision(); ok {
 		if err := execution.FailDecision(
 			mutableState,
 			decision,
-			workflow.DecisionTaskFailedCauseForceCloseDecision,
+			types.DecisionTaskFailedCauseForceCloseDecision,
 		); err != nil {
 			return nil, err
 		}
@@ -348,7 +323,7 @@ func retryWorkflow(
 	_, newMutableState, err := mutableState.AddContinueAsNewEvent(
 		ctx,
 		eventBatchFirstEventID,
-		common.EmptyEventID,
+		constants.EmptyEventID,
 		parentDomainName,
 		continueAsNewAttributes,
 	)
@@ -359,13 +334,64 @@ func retryWorkflow(
 }
 
 func getWorkflowExecution(
-	taskInfo Info,
-) workflow.WorkflowExecution {
+	taskInfo persistence.Task,
+) types.WorkflowExecution {
 
-	return workflow.WorkflowExecution{
-		WorkflowId: common.StringPtr(taskInfo.GetWorkflowID()),
-		RunId:      common.StringPtr(taskInfo.GetRunID()),
+	return types.WorkflowExecution{
+		WorkflowID: taskInfo.GetWorkflowID(),
+		RunID:      taskInfo.GetRunID(),
 	}
+}
+
+func shouldPushToMatching(
+	ctx context.Context,
+	shard shard.Context,
+	taskInfo persistence.Task,
+) (bool, error) {
+	domainEntry, err := shard.GetDomainCache().GetDomainByID(taskInfo.GetDomainID())
+	if err != nil {
+		return false, err
+	}
+
+	if !domainEntry.GetReplicationConfig().IsActiveActive() {
+		// Preserve the behavior of active-standby and local domains. Always push to matching
+		return true, nil
+	}
+
+	// For active-active domains, only push to matching if the workflow is active in current cluster
+	// We may revisit this logic in the future. Current idea is to not pollute tasklists with passive workflows of active-active domains
+	// because they would cause head-of-line blocking in the tasklist. Passive task completion logic doesn't apply to active-active domains.
+	activeClusterInfo, err := shard.GetActiveClusterManager().GetActiveClusterInfoByWorkflow(ctx, taskInfo.GetDomainID(), taskInfo.GetWorkflowID(), taskInfo.GetRunID())
+	if err != nil {
+		return false, err
+	}
+	if activeClusterInfo.ActiveClusterName != shard.GetClusterMetadata().GetCurrentClusterName() {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+func getClusterAttributesForTask(
+	ctx context.Context,
+	shard shard.Context,
+	taskInfo persistence.Task,
+) (*types.ClusterAttribute, error) {
+	domainEntry, err := shard.GetDomainCache().GetDomainByID(taskInfo.GetDomainID())
+	if err != nil {
+		return nil, errors.Join(errDomainEntryNotFound, err)
+	}
+
+	if !domainEntry.GetReplicationConfig().IsActiveActive() {
+		return nil, nil
+	}
+
+	activeClusterSelectionPolicy, err := shard.GetActiveClusterManager().GetActiveClusterSelectionPolicyForWorkflow(ctx, taskInfo.GetDomainID(), taskInfo.GetWorkflowID(), taskInfo.GetRunID())
+	if err != nil || activeClusterSelectionPolicy == nil {
+		return nil, errors.Join(errActiveClusterSelectionPolicyNotFound, err)
+	}
+
+	return activeClusterSelectionPolicy.ClusterAttribute, nil
 }
 
 // NewMockTaskMatcher creates a gomock matcher for mock Task
@@ -386,3 +412,6 @@ func (m *mockTaskMatcher) Matches(x interface{}) bool {
 func (m *mockTaskMatcher) String() string {
 	return fmt.Sprintf("is equal to %v", m.task)
 }
+
+var errActiveClusterSelectionPolicyNotFound = errors.New("active cluster selection policy not found")
+var errDomainEntryNotFound = errors.New("domain entry not found")

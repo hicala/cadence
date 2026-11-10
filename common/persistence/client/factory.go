@@ -18,24 +18,36 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination factory_mock.go
+
 package client
 
 import (
 	"sync"
+	"time"
 
-	"github.com/uber/cadence/common/log/tag"
-
-	"github.com/uber/cadence/common"
-	"github.com/uber/cadence/common/persistence/serialization"
-
+	"github.com/uber/cadence/common/clock"
+	"github.com/uber/cadence/common/codec"
+	"github.com/uber/cadence/common/config"
+	"github.com/uber/cadence/common/constants"
+	es "github.com/uber/cadence/common/elasticsearch"
 	"github.com/uber/cadence/common/log"
+	"github.com/uber/cadence/common/log/tag"
+	"github.com/uber/cadence/common/messaging"
 	"github.com/uber/cadence/common/metrics"
 	p "github.com/uber/cadence/common/persistence"
-	"github.com/uber/cadence/common/persistence/cassandra"
+	"github.com/uber/cadence/common/persistence/elasticsearch"
+	"github.com/uber/cadence/common/persistence/nosql"
+	pinotVisibility "github.com/uber/cadence/common/persistence/pinot"
+	"github.com/uber/cadence/common/persistence/serialization"
 	"github.com/uber/cadence/common/persistence/sql"
+	"github.com/uber/cadence/common/persistence/wrappers/errorinjectors"
+	"github.com/uber/cadence/common/persistence/wrappers/metered"
+	"github.com/uber/cadence/common/persistence/wrappers/ratelimited"
+	"github.com/uber/cadence/common/persistence/wrappers/sampled"
+	pnt "github.com/uber/cadence/common/pinot"
 	"github.com/uber/cadence/common/quotas"
-	"github.com/uber/cadence/common/service/config"
-	"github.com/uber/cadence/common/service/dynamicconfig"
+	"github.com/uber/cadence/common/service"
 )
 
 type (
@@ -51,14 +63,27 @@ type (
 		NewShardManager() (p.ShardManager, error)
 		// NewHistoryManager returns a new history manager
 		NewHistoryManager() (p.HistoryManager, error)
-		// NewMetadataManager returns a new metadata manager
-		NewMetadataManager() (p.MetadataManager, error)
-		// NewExecutionManager returns a new execution manager for a given shardID
-		NewExecutionManager(shardID int) (p.ExecutionManager, error)
+		// NewDomainManager returns a new metadata manager
+		NewDomainManager() (p.DomainManager, error)
+		// NewDomainAuditManager returns a new domain audit manager
+		NewDomainAuditManager() (p.DomainAuditManager, error)
+		// NewSemaphoreMetadataManager returns a new semaphore metadata manager
+		NewSemaphoreMetadataManager() (p.SemaphoreMetadataManager, error)
+		// NewSemaphoreTokenManager returns a new semaphore token manager
+		NewSemaphoreTokenManager() (p.SemaphoreTokenManager, error)
+		// NewSemaphoreTaskManager returns a new semaphore task (task queue) manager
+		NewSemaphoreTaskManager() (p.SemaphoreTaskManager, error)
+		// NewHistoryTaskDLQManager returns a new history task DLQ manager
+		NewHistoryTaskDLQManager() (p.HistoryTaskDLQManager, error)
+		// NewExecutionManager returns a new execution manager
+		NewExecutionManager() (p.ExecutionManager, error)
 		// NewVisibilityManager returns a new visibility manager
-		NewVisibilityManager() (p.VisibilityManager, error)
-		// NewDomainReplicationQueue returns a new queue for domain replication
-		NewDomainReplicationQueue() (p.DomainReplicationQueue, error)
+		NewVisibilityManager(params *Params, serviceConfig *service.Config) (p.VisibilityManager, error)
+		// NewDomainReplicationQueueManager returns a new queue for domain replication
+		NewDomainReplicationQueueManager() (p.QueueManager, error)
+		// NewConfigStoreManager returns a new config store manager
+		NewConfigStoreManager() (p.ConfigStoreManager, error)
+		NewAdminDBs() ([]p.AdminDB, error)
 	}
 	// DataStoreFactory is a low level interface to be implemented by a datastore
 	// Examples of datastores are cassandra, mysql etc
@@ -69,17 +94,30 @@ type (
 		NewTaskStore() (p.TaskStore, error)
 		// NewShardStore returns a new shard store
 		NewShardStore() (p.ShardStore, error)
-		// NewHistoryV2Store returns a new historyV2 store
-		NewHistoryV2Store() (p.HistoryStore, error)
-		// NewMetadataStore returns a new metadata store
-		NewMetadataStore() (p.MetadataStore, error)
-		// NewExecutionStore returns an execution store for given shardID
-		NewExecutionStore(shardID int) (p.ExecutionStore, error)
+		// NewHistoryStore returns a new history store
+		NewHistoryStore() (p.HistoryStore, error)
+		// NewDomainStore returns a new metadata store
+		NewDomainStore() (p.DomainStore, error)
+		// NewDomainAuditStore returns a new domain audit store
+		NewDomainAuditStore() (p.DomainAuditStore, error)
+		// NewSemaphoreMetadataStore returns a new semaphore metadata store
+		NewSemaphoreMetadataStore() (p.SemaphoreMetadataStore, error)
+		// NewSemaphoreTokenStore returns a new semaphore token store
+		NewSemaphoreTokenStore() (p.SemaphoreTokenStore, error)
+		// NewSemaphoreTaskStore returns a new semaphore task (task queue) store
+		NewSemaphoreTaskStore() (p.SemaphoreTaskStore, error)
+		// NewHistoryDLQTaskStore returns a new history DLQ task store
+		NewHistoryDLQTaskStore() (p.HistoryDLQTaskStore, error)
+		// NewExecutionStore returns an execution store
+		NewExecutionStore() (p.ExecutionStore, error)
 		// NewVisibilityStore returns a new visibility store,
 		// TODO We temporarily using sortByCloseTime to determine whether or not ListClosedWorkflowExecutions should
 		// be ordering by CloseTime. This will be removed when implementing https://github.com/uber/cadence/issues/3621
 		NewVisibilityStore(sortByCloseTime bool) (p.VisibilityStore, error)
-		NewQueue(queueType p.QueueType) (p.Queue, error)
+		NewQueue(queueType p.QueueType) (p.QueueStore, error)
+		// NewConfigStore returns a new config store
+		NewConfigStore() (p.ConfigStore, error)
+		NewAdminDBs(pType p.DBType) ([]p.AdminDB, error)
 	}
 
 	// Datastore represents a datastore
@@ -94,6 +132,7 @@ type (
 		logger        log.Logger
 		datastores    map[storeType]Datastore
 		clusterName   string
+		dc            *p.DynamicConfiguration
 	}
 
 	storeType int
@@ -107,6 +146,7 @@ const (
 	storeTypeExecution
 	storeTypeVisibility
 	storeTypeQueue
+	storeTypeConfigStore
 )
 
 var storeTypes = []storeType{
@@ -117,6 +157,7 @@ var storeTypes = []storeType{
 	storeTypeExecution,
 	storeTypeVisibility,
 	storeTypeQueue,
+	storeTypeConfigStore,
 }
 
 // NewFactory returns an implementation of factory that vends persistence objects based on
@@ -128,16 +169,18 @@ var storeTypes = []storeType{
 // given configuration. In addition, all objects will emit metrics automatically
 func NewFactory(
 	cfg *config.Persistence,
-	persistenceMaxQPS dynamicconfig.IntPropertyFn,
+	persistenceMaxQPS quotas.RPSFunc,
 	clusterName string,
 	metricsClient metrics.Client,
 	logger log.Logger,
+	dc *p.DynamicConfiguration,
 ) Factory {
 	factory := &factoryImpl{
 		config:        cfg,
 		metricsClient: metricsClient,
 		logger:        logger,
 		clusterName:   clusterName,
+		dc:            dc,
 	}
 	limiters := buildRatelimiters(cfg, persistenceMaxQPS)
 	factory.init(clusterName, limiters)
@@ -152,11 +195,14 @@ func (f *factoryImpl) NewTaskManager() (p.TaskManager, error) {
 		return nil, err
 	}
 	result := p.NewTaskManager(store)
+	if errorRate := f.dc.ErrorInjectionRate(); errorRate != 0 {
+		result = errorinjectors.NewTaskManager(result, errorRate, f.logger, time.Now())
+	}
 	if ds.ratelimit != nil {
-		result = p.NewTaskPersistenceRateLimitedClient(result, ds.ratelimit, f.logger)
+		result = ratelimited.NewTaskManager(result, ds.ratelimit, quotas.NewCallerBypass(f.dc.RateLimiterBypassCallerTypes))
 	}
 	if f.metricsClient != nil {
-		result = p.NewTaskPersistenceMetricsClient(result, f.metricsClient, f.logger)
+		result = metered.NewTaskManager(result, f.metricsClient, f.logger, f.config)
 	}
 	return result, nil
 }
@@ -168,12 +214,15 @@ func (f *factoryImpl) NewShardManager() (p.ShardManager, error) {
 	if err != nil {
 		return nil, err
 	}
-	result := p.NewShardManager(store)
+	result := p.NewShardManager(store, f.dc)
+	if errorRate := f.dc.ErrorInjectionRate(); errorRate != 0 {
+		result = errorinjectors.NewShardManager(result, errorRate, f.logger, time.Now())
+	}
 	if ds.ratelimit != nil {
-		result = p.NewShardPersistenceRateLimitedClient(result, ds.ratelimit, f.logger)
+		result = ratelimited.NewShardManager(result, ds.ratelimit, quotas.NewCallerBypass(f.dc.RateLimiterBypassCallerTypes))
 	}
 	if f.metricsClient != nil {
-		result = p.NewShardPersistenceMetricsClient(result, f.metricsClient, f.logger)
+		result = metered.NewShardManager(result, f.metricsClient, f.logger, f.config)
 	}
 	return result, nil
 }
@@ -181,65 +230,333 @@ func (f *factoryImpl) NewShardManager() (p.ShardManager, error) {
 // NewHistoryManager returns a new history manager
 func (f *factoryImpl) NewHistoryManager() (p.HistoryManager, error) {
 	ds := f.datastores[storeTypeHistory]
-	store, err := ds.factory.NewHistoryV2Store()
+	store, err := ds.factory.NewHistoryStore()
 	if err != nil {
 		return nil, err
 	}
-	result := p.NewHistoryV2ManagerImpl(store, f.logger, f.config.TransactionSizeLimit)
+	result := p.NewHistoryV2ManagerImpl(store, f.logger, p.NewPayloadSerializer(), codec.NewThriftRWEncoder(), f.dc.TransactionSizeLimit)
+	if errorRate := f.dc.ErrorInjectionRate(); errorRate != 0 {
+		result = errorinjectors.NewHistoryManager(result, errorRate, f.logger, time.Now())
+	}
 	if ds.ratelimit != nil {
-		result = p.NewHistoryV2PersistenceRateLimitedClient(result, ds.ratelimit, f.logger)
+		result = ratelimited.NewHistoryManager(result, ds.ratelimit, quotas.NewCallerBypass(f.dc.RateLimiterBypassCallerTypes))
 	}
 	if f.metricsClient != nil {
-		result = p.NewHistoryV2PersistenceMetricsClient(result, f.metricsClient, f.logger)
+		result = metered.NewHistoryManager(result, f.metricsClient, f.logger, f.config)
 	}
 	return result, nil
 }
 
-// NewMetadataManager returns a new metadata manager
-func (f *factoryImpl) NewMetadataManager() (p.MetadataManager, error) {
+// NewDomainManager returns a new metadata manager
+func (f *factoryImpl) NewDomainManager() (p.DomainManager, error) {
 	var err error
-	var store p.MetadataStore
+	var store p.DomainStore
 	ds := f.datastores[storeTypeMetadata]
-	store, err = ds.factory.NewMetadataStore()
+	store, err = ds.factory.NewDomainStore()
 	if err != nil {
 		return nil, err
 	}
-
-	result := p.NewMetadataManagerImpl(store, f.logger)
+	result := p.NewDomainManagerImpl(store, f.logger, p.NewPayloadSerializer(), f.dc)
+	if errorRate := f.dc.ErrorInjectionRate(); errorRate != 0 {
+		result = errorinjectors.NewDomainManager(result, errorRate, f.logger, time.Now())
+	}
 	if ds.ratelimit != nil {
-		result = p.NewMetadataPersistenceRateLimitedClient(result, ds.ratelimit, f.logger)
+		result = ratelimited.NewDomainManager(result, ds.ratelimit, quotas.NewCallerBypass(f.dc.RateLimiterBypassCallerTypes))
 	}
 	if f.metricsClient != nil {
-		result = p.NewMetadataPersistenceMetricsClient(result, f.metricsClient, f.logger)
+		result = metered.NewDomainManager(result, f.metricsClient, f.logger, f.config)
 	}
 	return result, nil
 }
 
-// NewExecutionManager returns a new execution manager for a given shardID
-func (f *factoryImpl) NewExecutionManager(shardID int) (p.ExecutionManager, error) {
-	ds := f.datastores[storeTypeExecution]
-	store, err := ds.factory.NewExecutionStore(shardID)
+// NewDomainAuditManager returns a new domain audit manager
+func (f *factoryImpl) NewDomainAuditManager() (p.DomainAuditManager, error) {
+	var err error
+	var store p.DomainAuditStore
+
+	ds := f.datastores[storeTypeMetadata]
+	store, err = ds.factory.NewDomainAuditStore()
 	if err != nil {
 		return nil, err
 	}
-	result := p.NewExecutionManagerImpl(store, f.logger)
+	if store == nil {
+		return nil, nil
+	}
+	result := p.NewDomainAuditManagerImpl(store, f.logger, p.NewPayloadSerializer(), f.dc)
+	return result, nil
+}
+
+// NewSemaphoreMetadataManager returns a new semaphore metadata manager
+func (f *factoryImpl) NewSemaphoreMetadataManager() (p.SemaphoreMetadataManager, error) {
+	var err error
+	var store p.SemaphoreMetadataStore
+
+	ds := f.datastores[storeTypeMetadata]
+	store, err = ds.factory.NewSemaphoreMetadataStore()
+	if err != nil {
+		return nil, err
+	}
+	if store == nil {
+		return nil, nil
+	}
+	result := p.NewSemaphoreMetadataManagerImpl(store, f.logger)
+	return result, nil
+}
+
+// NewSemaphoreTokenManager returns a new semaphore token manager
+func (f *factoryImpl) NewSemaphoreTokenManager() (p.SemaphoreTokenManager, error) {
+	var err error
+	var store p.SemaphoreTokenStore
+
+	ds := f.datastores[storeTypeMetadata]
+	store, err = ds.factory.NewSemaphoreTokenStore()
+	if err != nil {
+		return nil, err
+	}
+	if store == nil {
+		return nil, nil
+	}
+	result := p.NewSemaphoreTokenManagerImpl(store, f.logger)
+	return result, nil
+}
+
+// NewSemaphoreTaskManager returns a new semaphore task (task queue) manager
+func (f *factoryImpl) NewSemaphoreTaskManager() (p.SemaphoreTaskManager, error) {
+	var err error
+	var store p.SemaphoreTaskStore
+
+	ds := f.datastores[storeTypeMetadata]
+	store, err = ds.factory.NewSemaphoreTaskStore()
+	if err != nil {
+		return nil, err
+	}
+	if store == nil {
+		return nil, nil
+	}
+	result := p.NewSemaphoreTaskManagerImpl(store, f.logger)
+	return result, nil
+}
+
+// NewHistoryTaskDLQManager returns a new history task DLQ manager
+func (f *factoryImpl) NewHistoryTaskDLQManager() (p.HistoryTaskDLQManager, error) {
+	ds := f.datastores[storeTypeExecution]
+	store, err := ds.factory.NewHistoryDLQTaskStore()
+	if err != nil {
+		return nil, err
+	}
+	parser, err := serialization.NewParser(f.dc)
+	if err != nil {
+		return nil, err
+	}
+	taskSerializer := serialization.NewTaskSerializer(parser)
+	result := p.NewHistoryTaskDLQManager(store, taskSerializer, f.logger)
+	if errorRate := f.dc.ErrorInjectionRate(); errorRate != 0 {
+		result = errorinjectors.NewHistoryTaskDLQManager(result, errorRate, f.logger, time.Now())
+	}
 	if ds.ratelimit != nil {
-		result = p.NewWorkflowExecutionPersistenceRateLimitedClient(result, ds.ratelimit, f.logger)
+		result = ratelimited.NewHistoryTaskDLQManager(result, ds.ratelimit, quotas.NewCallerBypass(f.dc.RateLimiterBypassCallerTypes))
 	}
 	if f.metricsClient != nil {
-		result = p.NewWorkflowExecutionPersistenceMetricsClient(result, f.metricsClient, f.logger)
+		result = metered.NewHistoryTaskDLQManager(result, f.metricsClient, f.logger, f.config)
+	}
+	return result, nil
+}
+
+// NewExecutionManager returns a new execution manager
+func (f *factoryImpl) NewExecutionManager() (p.ExecutionManager, error) {
+	ds := f.datastores[storeTypeExecution]
+	store, err := ds.factory.NewExecutionStore()
+	if err != nil {
+		return nil, err
+	}
+	result := p.NewExecutionManagerImpl(store, f.logger, p.NewPayloadSerializer(), f.dc)
+	if errorRate := f.dc.ErrorInjectionRate(); errorRate != 0 {
+		result = errorinjectors.NewExecutionManager(result, errorRate, f.logger, time.Now())
+	}
+	if ds.ratelimit != nil {
+		result = ratelimited.NewExecutionManager(result, ds.ratelimit, quotas.NewCallerBypass(f.dc.RateLimiterBypassCallerTypes))
+	}
+	if f.metricsClient != nil {
+		result = metered.NewExecutionManager(result, f.metricsClient, f.logger, f.config, f.dc.EnableShardIDMetrics)
 	}
 	return result, nil
 }
 
 // NewVisibilityManager returns a new visibility manager
-func (f *factoryImpl) NewVisibilityManager() (p.VisibilityManager, error) {
-	visConfig := f.config.VisibilityConfig
+func (f *factoryImpl) NewVisibilityManager(
+	params *Params,
+	resourceConfig *service.Config,
+) (p.VisibilityManager, error) {
+	if resourceConfig.ReadVisibilityStoreName == nil && resourceConfig.WriteVisibilityStoreName == nil {
+		// No need to create visibility manager as no read/write needed
+		return nil, nil
+	}
+	var visibilityFromDB, visibilityFromES, visibilityFromPinot, visibilityFromOS p.VisibilityManager
+	var err error
+	if params.PersistenceConfig.VisibilityStore != "" {
+		visibilityFromDB, err = f.newDBVisibilityManager(resourceConfig)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	switch params.PersistenceConfig.AdvancedVisibilityStore {
+	case constants.PinotVisibilityStoreName:
+		visibilityFromPinot, err = setupPinotVisibilityManager(params, resourceConfig, f.logger, f.dc, quotas.NewCallerBypass(f.dc.RateLimiterBypassCallerTypes))
+		if err != nil {
+			f.logger.Fatal("Creating Pinot advanced visibility manager failed", tag.Error(err))
+		}
+
+		visibilityMgrs := map[string]p.VisibilityManager{
+			constants.VisibilityModeDB:    visibilityFromDB,
+			constants.VisibilityModePinot: visibilityFromPinot,
+		}
+
+		if params.PinotConfig.Migration.Enabled {
+			visibilityFromES, err = setupESVisibilityManager(params, resourceConfig, f.logger, f.dc, quotas.NewCallerBypass(f.dc.RateLimiterBypassCallerTypes))
+			if err != nil {
+				f.logger.Fatal("Creating ES advanced visibility manager failed", tag.Error(err))
+			}
+
+			visibilityMgrs[constants.VisibilityModeES] = visibilityFromES
+		}
+
+		return p.NewVisibilityHybridManager(
+			visibilityMgrs,
+			resourceConfig.ReadVisibilityStoreName,
+			resourceConfig.WriteVisibilityStoreName,
+			resourceConfig.EnableLogCustomerQueryParameter,
+			constants.PinotPersistenceName,
+			f.logger,
+		), nil
+	case constants.OSVisibilityStoreName:
+		visibilityFromOS, err = setupOSVisibilityManager(params, resourceConfig, f.logger, f.dc, quotas.NewCallerBypass(f.dc.RateLimiterBypassCallerTypes))
+		if err != nil {
+			f.logger.Fatal("Creating OS advanced visibility manager failed", tag.Error(err))
+		}
+
+		visibilityMgrs := map[string]p.VisibilityManager{
+			constants.VisibilityModeDB: visibilityFromDB,
+			constants.VisibilityModeOS: visibilityFromOS,
+		}
+		if params.OSConfig.Migration.Enabled {
+			visibilityFromES, err = setupESVisibilityManager(params, resourceConfig, f.logger, f.dc, quotas.NewCallerBypass(f.dc.RateLimiterBypassCallerTypes))
+			if err != nil {
+				f.logger.Fatal("Creating ES advanced visibility manager failed", tag.Error(err))
+			}
+
+			visibilityMgrs[constants.VisibilityModeES] = visibilityFromES
+		}
+		return p.NewVisibilityHybridManager(
+			visibilityMgrs,
+			resourceConfig.ReadVisibilityStoreName,
+			resourceConfig.WriteVisibilityStoreName,
+			resourceConfig.EnableLogCustomerQueryParameter,
+			constants.ESPersistenceName,
+			f.logger,
+		), nil
+	case constants.ESVisibilityStoreName:
+		visibilityFromES, err = setupESVisibilityManager(params, resourceConfig, f.logger, f.dc, quotas.NewCallerBypass(f.dc.RateLimiterBypassCallerTypes))
+		if err != nil {
+			f.logger.Fatal("Creating advanced visibility manager failed", tag.Error(err))
+		}
+		visibilityMgrs := map[string]p.VisibilityManager{
+			constants.VisibilityModeDB: visibilityFromDB,
+			constants.VisibilityModeES: visibilityFromES,
+		}
+		return p.NewVisibilityHybridManager(
+			visibilityMgrs,
+			resourceConfig.ReadVisibilityStoreName,
+			resourceConfig.WriteVisibilityStoreName,
+			resourceConfig.EnableLogCustomerQueryParameter,
+			constants.ESPersistenceName,
+			f.logger,
+		), nil
+	default:
+		visibilityMgrs := map[string]p.VisibilityManager{
+			constants.VisibilityModeDB: visibilityFromDB,
+		}
+		if visibilityFromDB != nil {
+			return p.NewVisibilityHybridManager(
+				visibilityMgrs,
+				resourceConfig.ReadVisibilityStoreName,
+				resourceConfig.WriteVisibilityStoreName,
+				resourceConfig.EnableLogCustomerQueryParameter,
+				visibilityFromDB.GetName(), // db has multiple different stores
+				f.logger,
+			), nil
+		}
+		return nil, nil // no visibility manager available for write
+	}
+}
+
+// NewESVisibilityManager create a visibility manager for ElasticSearch
+// In history, it only needs kafka producer for writing data;
+// In frontend, it only needs ES client and related config for reading data
+func newPinotVisibilityManager(
+	pinotClient pnt.GenericClient,
+	visibilityConfig *service.Config,
+	producer messaging.Producer,
+	metricsClient metrics.Client,
+	log log.Logger,
+	dc *p.DynamicConfiguration,
+	callerBypass quotas.CallerBypass,
+) p.VisibilityManager {
+	visibilityFromPinotStore := pinotVisibility.NewPinotVisibilityStore(pinotClient, visibilityConfig, producer, log)
+	visibilityFromPinot := p.NewVisibilityManagerImpl(visibilityFromPinotStore, log, dc)
+
+	// wrap with rate limiter
+	if visibilityConfig.PersistenceMaxQPS != nil && visibilityConfig.PersistenceMaxQPS() != 0 {
+		pinotRateLimiter := quotas.NewDynamicRateLimiter(visibilityConfig.PersistenceMaxQPS.AsFloat64())
+		visibilityFromPinot = ratelimited.NewVisibilityManager(visibilityFromPinot, pinotRateLimiter, callerBypass)
+	}
+
+	if metricsClient != nil {
+		// wrap with metrics
+		visibilityFromPinot = pinotVisibility.NewPinotVisibilityMetricsClient(visibilityFromPinot, metricsClient, log)
+	}
+
+	return visibilityFromPinot
+}
+
+// NewESVisibilityManager create a visibility manager for ElasticSearch
+// In history, it only needs kafka producer for writing data;
+// In frontend, it only needs ES client and related config for reading data
+func newESVisibilityManager(
+	indexName string,
+	esClient es.GenericClient,
+	visibilityConfig *service.Config,
+	producer messaging.Producer,
+	metricsClient metrics.Client,
+	log log.Logger,
+	dc *p.DynamicConfiguration,
+	callerBypass quotas.CallerBypass,
+) p.VisibilityManager {
+
+	visibilityFromESStore := elasticsearch.NewElasticSearchVisibilityStore(esClient, indexName, producer, visibilityConfig, log)
+	visibilityFromES := p.NewVisibilityManagerImpl(visibilityFromESStore, log, dc)
+
+	// wrap with rate limiter
+	if visibilityConfig.PersistenceMaxQPS != nil && visibilityConfig.PersistenceMaxQPS() != 0 {
+		esRateLimiter := quotas.NewDynamicRateLimiter(visibilityConfig.PersistenceMaxQPS.AsFloat64())
+		visibilityFromES = ratelimited.NewVisibilityManager(visibilityFromES, esRateLimiter, callerBypass)
+	}
+	if metricsClient != nil {
+		// wrap with metrics
+		visibilityFromES = elasticsearch.NewVisibilityMetricsClient(visibilityFromES, metricsClient, log)
+	}
+
+	return visibilityFromES
+}
+
+func (f *factoryImpl) newDBVisibilityManager(
+	visibilityConfig *service.Config,
+) (p.VisibilityManager, error) {
 	enableReadFromClosedExecutionV2 := false
-	if visConfig != nil && visConfig.EnableReadFromClosedExecutionV2 != nil {
-		enableReadFromClosedExecutionV2 = visConfig.EnableReadFromClosedExecutionV2()
+	if visibilityConfig.EnableReadDBVisibilityFromClosedExecutionV2 != nil {
+		enableReadFromClosedExecutionV2 = visibilityConfig.EnableReadDBVisibilityFromClosedExecutionV2()
 	} else {
-		f.logger.Warn("missing visibility and EnableReadFromClosedExecutionV2 config", tag.Value(visConfig))
+		f.logger.Warn("missing visibility and EnableReadFromClosedExecutionV2 config", tag.Value(visibilityConfig))
 	}
 
 	ds := f.datastores[storeTypeVisibility]
@@ -247,37 +564,115 @@ func (f *factoryImpl) NewVisibilityManager() (p.VisibilityManager, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	result := p.NewVisibilityManagerImpl(store, f.logger)
-	if ds.ratelimit != nil {
-		result = p.NewVisibilityPersistenceRateLimitedClient(result, ds.ratelimit, f.logger)
+	result := p.NewVisibilityManagerImpl(store, f.logger, f.dc)
+	if errorRate := f.dc.ErrorInjectionRate(); errorRate != 0 {
+		result = errorinjectors.NewVisibilityManager(result, errorRate, f.logger, time.Now())
 	}
-	if visConfig != nil && visConfig.EnableSampling() {
-		result = p.NewVisibilitySamplingClient(result, visConfig, f.metricsClient, f.logger)
+	if ds.ratelimit != nil {
+		result = ratelimited.NewVisibilityManager(result, ds.ratelimit, quotas.NewCallerBypass(f.dc.RateLimiterBypassCallerTypes))
+	}
+	if visibilityConfig.EnableDBVisibilitySampling != nil && visibilityConfig.EnableDBVisibilitySampling() {
+		result = sampled.NewVisibilityManager(result, sampled.Params{
+			Config: &sampled.Config{
+				VisibilityClosedMaxQPS: visibilityConfig.WriteDBVisibilityClosedMaxQPS,
+				VisibilityListMaxQPS:   visibilityConfig.DBVisibilityListMaxQPS,
+				VisibilityOpenMaxQPS:   visibilityConfig.WriteDBVisibilityOpenMaxQPS,
+			},
+			MetricClient:           f.metricsClient,
+			Logger:                 f.logger,
+			TimeSource:             clock.NewRealTimeSource(),
+			RateLimiterFactoryFunc: sampled.NewDomainToBucketMap,
+		})
 	}
 	if f.metricsClient != nil {
-		result = p.NewVisibilityPersistenceMetricsClient(result, f.metricsClient, f.logger)
+		result = metered.NewVisibilityManager(result, f.metricsClient, f.logger, f.config)
 	}
 
 	return result, nil
 }
 
-func (f *factoryImpl) NewDomainReplicationQueue() (p.DomainReplicationQueue, error) {
+func (f *factoryImpl) NewDomainReplicationQueueManager() (p.QueueManager, error) {
 	ds := f.datastores[storeTypeQueue]
 	store, err := ds.factory.NewQueue(p.DomainReplicationQueueType)
 	if err != nil {
 		return nil, err
 	}
-
 	result := p.NewQueueManager(store)
+	if errorRate := f.dc.ErrorInjectionRate(); errorRate != 0 {
+		result = errorinjectors.NewQueueManager(result, errorRate, f.logger, time.Now())
+	}
 	if ds.ratelimit != nil {
-		result = p.NewQueuePersistenceRateLimitedClient(result, ds.ratelimit, f.logger)
+		result = ratelimited.NewQueueManager(result, ds.ratelimit, quotas.NewCallerBypass(f.dc.RateLimiterBypassCallerTypes))
 	}
 	if f.metricsClient != nil {
-		result = p.NewQueuePersistenceMetricsClient(result, f.metricsClient, f.logger)
+		result = metered.NewQueueManager(result, f.metricsClient, f.logger, f.config)
 	}
 
-	return p.NewDomainReplicationQueue(result, f.clusterName, f.metricsClient, f.logger), nil
+	return result, nil
+}
+
+func (f *factoryImpl) NewConfigStoreManager() (p.ConfigStoreManager, error) {
+	ds := f.datastores[storeTypeConfigStore]
+	store, err := ds.factory.NewConfigStore()
+	if err != nil {
+		return nil, err
+	}
+	result := p.NewConfigStoreManagerImpl(store, f.logger)
+	if errorRate := f.dc.ErrorInjectionRate(); errorRate != 0 {
+		result = errorinjectors.NewConfigStoreManager(result, errorRate, f.logger, time.Now())
+	}
+	if ds.ratelimit != nil {
+		result = ratelimited.NewConfigStoreManager(result, ds.ratelimit, quotas.NewCallerBypass(f.dc.RateLimiterBypassCallerTypes))
+	}
+	if f.metricsClient != nil {
+		result = metered.NewConfigStoreManager(result, f.metricsClient, f.logger, f.config)
+	}
+
+	return result, nil
+}
+
+func (f *factoryImpl) NewAdminDBs() ([]p.AdminDB, error) {
+	ds := f.datastores[storeTypeExecution]
+	dbs, err := ds.factory.NewAdminDBs(p.DBTypeDefault)
+	if err != nil {
+		return nil, err
+	}
+	// init sets this value in the map only if we're using DB based visibility
+	visibility, ok := f.datastores[storeTypeVisibility]
+	if ok {
+		vDBs, vErr := visibility.factory.NewAdminDBs(p.DBTypeVisibility)
+		if vErr != nil {
+			return nil, vErr
+		}
+		dbs = append(dbs, vDBs...)
+	}
+	// Advanced visibility operates different from "regular" datastores:
+	// - They use a fixed datastore name based on the plugin
+	// - They may fallback to other stores, or be migrating between them, and that's implemented in the visibility store
+	//
+	// As a result, we just check whether the plugin is configured and include it. The user might have configured ES
+	// but not actually be using it, but we don't really have a way to tell.
+
+	esConfig, ok := f.config.DataStores[constants.ESVisibilityStoreName]
+	if ok && esConfig.ElasticSearch != nil {
+		db, dbErr := elasticsearch.NewAdminDB(esConfig.ElasticSearch, f.logger)
+		if dbErr != nil {
+			return nil, dbErr
+		}
+		dbs = append(dbs, db)
+	}
+	osConfig, ok := f.config.DataStores[constants.OSVisibilityStoreName]
+	// OS is secretly ElasticSearch
+	if ok && osConfig.ElasticSearch != nil {
+		db, dbErr := elasticsearch.NewAdminDB(osConfig.ElasticSearch, f.logger)
+		if dbErr != nil {
+			return nil, dbErr
+		}
+		dbs = append(dbs, db)
+	}
+	// TODO: Pinot support
+
+	return dbs, nil
 }
 
 // Close closes this factory
@@ -289,22 +684,32 @@ func (f *factoryImpl) Close() {
 func (f *factoryImpl) init(clusterName string, limiters map[string]quotas.Limiter) {
 	f.datastores = make(map[storeType]Datastore, len(storeTypes))
 	defaultCfg := f.config.DataStores[f.config.DefaultStore]
+	if defaultCfg.Cassandra != nil {
+		f.logger.Warn("Cassandra config is deprecated, please use NoSQL with pluginName of cassandra.")
+	}
 	defaultDataStore := Datastore{ratelimit: limiters[f.config.DefaultStore]}
 	switch {
-	case defaultCfg.Cassandra != nil:
-		defaultDataStore.factory = cassandra.NewFactory(*defaultCfg.Cassandra, clusterName, f.logger)
+	case defaultCfg.NoSQL != nil:
+		parser := f.getParser()
+		taskSerializer := serialization.NewTaskSerializer(parser)
+		shardedNoSQLConfig := defaultCfg.NoSQL.ConvertToShardedNoSQLConfig()
+		defaultDataStore.factory = nosql.NewFactory(*shardedNoSQLConfig, clusterName, f.logger, f.metricsClient, taskSerializer, parser, f.dc)
+	case defaultCfg.ShardedNoSQL != nil:
+		parser := f.getParser()
+		taskSerializer := serialization.NewTaskSerializer(parser)
+		defaultDataStore.factory = nosql.NewFactory(*defaultCfg.ShardedNoSQL, clusterName, f.logger, f.metricsClient, taskSerializer, parser, f.dc)
 	case defaultCfg.SQL != nil:
-		var decodingTypes []common.EncodingType
-		for _, dt := range defaultCfg.SQL.DecodingTypes {
-			decodingTypes = append(decodingTypes, common.EncodingType(dt))
+		if defaultCfg.SQL.EncodingType == "" {
+			defaultCfg.SQL.EncodingType = string(constants.EncodingTypeThriftRW)
 		}
-		defaultDataStore.factory = sql.NewFactory(
-			*defaultCfg.SQL,
-			clusterName,
-			f.logger,
-			getSQLParser(f.logger, common.EncodingType(defaultCfg.SQL.EncodingType), decodingTypes...))
+		if len(defaultCfg.SQL.DecodingTypes) == 0 {
+			defaultCfg.SQL.DecodingTypes = []string{
+				string(constants.EncodingTypeThriftRW),
+			}
+		}
+		defaultDataStore.factory = sql.NewFactory(*defaultCfg.SQL, clusterName, f.logger, f.getParser(), f.dc)
 	default:
-		f.logger.Fatal("invalid config: one of cassandra or sql params must be specified")
+		f.logger.Fatal("invalid config: one of nosql or sql params must be specified for defaultDataStore")
 	}
 
 	for _, st := range storeTypes {
@@ -313,42 +718,72 @@ func (f *factoryImpl) init(clusterName string, limiters map[string]quotas.Limite
 		}
 	}
 
-	visibilityCfg := f.config.DataStores[f.config.VisibilityStore]
+	visibilityCfg, ok := f.config.DataStores[f.config.VisibilityStore]
+	if !ok {
+		f.logger.Info("no visibilityStore is configured, will use advancedVisibilityStore")
+		// NOTE: f.datastores[storeTypeVisibility] will be nil
+		return
+	}
+
+	if visibilityCfg.Cassandra != nil {
+		f.logger.Warn("Cassandra config is deprecated, please use NoSQL with pluginName of cassandra.")
+	}
 	visibilityDataStore := Datastore{ratelimit: limiters[f.config.VisibilityStore]}
 	switch {
-	case visibilityCfg.Cassandra != nil:
-		visibilityDataStore.factory = cassandra.NewFactory(*visibilityCfg.Cassandra, clusterName, f.logger)
+	case visibilityCfg.NoSQL != nil:
+		parser := f.getParser()
+		taskSerializer := serialization.NewTaskSerializer(parser)
+		shardedNoSQLConfig := visibilityCfg.NoSQL.ConvertToShardedNoSQLConfig()
+		visibilityDataStore.factory = nosql.NewFactory(*shardedNoSQLConfig, clusterName, f.logger, f.metricsClient, taskSerializer, parser, f.dc)
 	case visibilityCfg.SQL != nil:
-		var decodingTypes []common.EncodingType
-		for _, dt := range visibilityCfg.SQL.DecodingTypes {
-			decodingTypes = append(decodingTypes, common.EncodingType(dt))
-		}
-		visibilityDataStore.factory = sql.NewFactory(
-			*visibilityCfg.SQL,
-			clusterName,
-			f.logger,
-			getSQLParser(f.logger, common.EncodingType(visibilityCfg.SQL.EncodingType), decodingTypes...))
+		visibilityDataStore.factory = sql.NewFactory(*visibilityCfg.SQL, clusterName, f.logger, f.getParser(), f.dc)
 	default:
-		f.logger.Fatal("invalid config: one of cassandra or sql params must be specified")
+		f.logger.Fatal("invalid config: one of nosql or sql params must be specified for visibilityStore")
 	}
 
 	f.datastores[storeTypeVisibility] = visibilityDataStore
 }
 
-func getSQLParser(logger log.Logger, encodingType common.EncodingType, decodingTypes ...common.EncodingType) serialization.Parser {
-	parser, err := serialization.NewParser(encodingType, decodingTypes...)
+func (f *factoryImpl) getParser() serialization.Parser {
+	parser, err := serialization.NewParser(f.dc)
 	if err != nil {
-		logger.Fatal("failed to construct sql parser", tag.Error(err))
+		f.logger.Fatal("failed to construct parser", tag.Error(err))
 	}
 	return parser
 }
 
-func buildRatelimiters(cfg *config.Persistence, maxQPS dynamicconfig.IntPropertyFn) map[string]quotas.Limiter {
+func buildRatelimiters(cfg *config.Persistence, maxQPS quotas.RPSFunc) map[string]quotas.Limiter {
 	result := make(map[string]quotas.Limiter, len(cfg.DataStores))
 	for dsName := range cfg.DataStores {
 		if maxQPS != nil && maxQPS() > 0 {
-			result[dsName] = quotas.NewDynamicRateLimiter(func() float64 { return float64(maxQPS()) })
+			result[dsName] = quotas.NewDynamicRateLimiter(maxQPS)
 		}
 	}
 	return result
+}
+
+func setupPinotVisibilityManager(params *Params, resourceConfig *service.Config, logger log.Logger, dc *p.DynamicConfiguration, callerBypass quotas.CallerBypass) (p.VisibilityManager, error) {
+	visibilityProducer, err := params.MessagingClient.NewProducer(constants.PinotVisibilityAppName)
+	if err != nil {
+		return nil, err
+	}
+	return newPinotVisibilityManager(params.PinotClient, resourceConfig, visibilityProducer, params.MetricsClient, logger, dc, callerBypass), nil
+}
+
+func setupESVisibilityManager(params *Params, resourceConfig *service.Config, logger log.Logger, dc *p.DynamicConfiguration, callerBypass quotas.CallerBypass) (p.VisibilityManager, error) {
+	visibilityIndexName := params.ESConfig.Indices[constants.VisibilityAppName]
+	visibilityProducer, err := params.MessagingClient.NewProducer(constants.VisibilityAppName)
+	if err != nil {
+		return nil, err
+	}
+	return newESVisibilityManager(visibilityIndexName, params.ESClient, resourceConfig, visibilityProducer, params.MetricsClient, logger, dc, callerBypass), nil
+}
+
+func setupOSVisibilityManager(params *Params, resourceConfig *service.Config, logger log.Logger, dc *p.DynamicConfiguration, callerBypass quotas.CallerBypass) (p.VisibilityManager, error) {
+	visibilityIndexName := params.OSConfig.Indices[constants.VisibilityAppName]
+	visibilityProducer, err := params.MessagingClient.NewProducer(constants.VisibilityAppName)
+	if err != nil {
+		return nil, err
+	}
+	return newESVisibilityManager(visibilityIndexName, params.OSClient, resourceConfig, visibilityProducer, params.MetricsClient, logger, dc, callerBypass), nil
 }

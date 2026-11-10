@@ -24,13 +24,13 @@ import (
 	"sort"
 	"testing"
 
-	gomock "github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"github.com/uber-go/tally"
+	"go.uber.org/mock/gomock"
 
 	"github.com/uber/cadence/common/log"
-	"github.com/uber/cadence/common/log/loggerimpl"
+	"github.com/uber/cadence/common/log/testlogger"
 	"github.com/uber/cadence/common/metrics"
 	t "github.com/uber/cadence/common/task"
 	"github.com/uber/cadence/service/history/task"
@@ -62,8 +62,8 @@ func (s *processingQueueSuite) SetupTest() {
 
 	s.controller = gomock.NewController(s.T())
 
-	s.logger = loggerimpl.NewDevelopmentForTest(s.Suite)
-	s.metricsClient = metrics.NewClient(tally.NoopScope, metrics.History)
+	s.logger = testlogger.New(s.Suite.T())
+	s.metricsClient = metrics.NewClient(tally.NoopScope, metrics.History, metrics.MigrationConfig{})
 }
 
 func (s *processingQueueSuite) TearDownTest() {
@@ -110,6 +110,140 @@ func (s *processingQueueSuite) TestAddTasks() {
 	s.Equal(newReadLevel, queue.state.readLevel)
 }
 
+func (s *processingQueueSuite) TestGetTask_TaskNotFound_Error() {
+	ackLevel := testKey{ID: 1}
+	maxLevel := testKey{ID: 10}
+
+	taskKeys := []task.Key{
+		testKey{ID: 2},
+		testKey{ID: 3},
+		testKey{ID: 5},
+		testKey{ID: 9},
+	}
+	tasks := make(map[task.Key]task.Task)
+	for _, key := range taskKeys {
+		mockTask := task.NewMockTask(s.controller)
+		mockTask.EXPECT().GetDomainID().Return("some random domainID").AnyTimes()
+		mockTask.EXPECT().GetWorkflowID().Return("some random workflowID").AnyTimes()
+		mockTask.EXPECT().GetRunID().Return("some random runID").AnyTimes()
+		mockTask.EXPECT().GetTaskType().Return(0).AnyTimes()
+		tasks[key] = mockTask
+	}
+
+	queue := s.newTestProcessingQueue(
+		0,
+		ackLevel,
+		ackLevel,
+		maxLevel,
+		NewDomainFilter(nil, true),
+		make(map[task.Key]task.Task),
+	)
+
+	newReadLevel := testKey{ID: 10}
+	queue.AddTasks(tasks, newReadLevel)
+	s.Len(queue.outstandingTasks, len(taskKeys))
+
+	task, err := queue.GetTask(testKey{ID: 100})
+	s.Nil(task)
+	s.Error(err)
+}
+
+func (s *processingQueueSuite) TestGetTask_Success() {
+	ackLevel := testKey{ID: 1}
+	maxLevel := testKey{ID: 10}
+
+	taskKeys := []task.Key{
+		testKey{ID: 2},
+		testKey{ID: 3},
+		testKey{ID: 5},
+		testKey{ID: 9},
+	}
+	tasks := make(map[task.Key]task.Task)
+	for _, key := range taskKeys {
+		mockTask := task.NewMockTask(s.controller)
+		mockTask.EXPECT().GetDomainID().Return("some random domainID").AnyTimes()
+		mockTask.EXPECT().GetWorkflowID().Return("some random workflowID").AnyTimes()
+		mockTask.EXPECT().GetRunID().Return("some random runID").AnyTimes()
+		mockTask.EXPECT().GetTaskType().Return(0).AnyTimes()
+		tasks[key] = mockTask
+	}
+
+	queue := s.newTestProcessingQueue(
+		0,
+		ackLevel,
+		ackLevel,
+		maxLevel,
+		NewDomainFilter(nil, true),
+		make(map[task.Key]task.Task),
+	)
+
+	newReadLevel := testKey{ID: 10}
+	queue.AddTasks(tasks, newReadLevel)
+	s.Len(queue.outstandingTasks, len(taskKeys))
+
+	task, err := queue.GetTask(testKey{ID: 3})
+	s.NoError(err)
+	s.Equal(tasks[testKey{ID: 3}], task)
+}
+
+func (s *processingQueueSuite) TestGetTasks_Success() {
+	ackLevel := testKey{ID: 1}
+	maxLevel := testKey{ID: 10}
+
+	taskKeys := []task.Key{
+		testKey{ID: 2},
+		testKey{ID: 3},
+		testKey{ID: 5},
+		testKey{ID: 9},
+	}
+	tasks := make(map[task.Key]task.Task)
+	for _, key := range taskKeys {
+		mockTask := task.NewMockTask(s.controller)
+		mockTask.EXPECT().GetTaskID().Return(int64(key.(testKey).ID)).AnyTimes()
+		mockTask.EXPECT().GetDomainID().Return("some random domainID").AnyTimes()
+		mockTask.EXPECT().GetWorkflowID().Return("some random workflowID").AnyTimes()
+		mockTask.EXPECT().GetRunID().Return("some random runID").AnyTimes()
+		mockTask.EXPECT().GetTaskType().Return(0).AnyTimes()
+		tasks[key] = mockTask
+	}
+
+	queue := s.newTestProcessingQueue(
+		0,
+		ackLevel,
+		ackLevel,
+		maxLevel,
+		NewDomainFilter(nil, true),
+		make(map[task.Key]task.Task),
+	)
+
+	newReadLevel := testKey{ID: 10}
+	queue.AddTasks(tasks, newReadLevel)
+	s.Len(queue.outstandingTasks, len(taskKeys))
+
+	outstandingTasks := queue.GetTasks()
+	for _, outstandingTask := range outstandingTasks {
+		task := tasks[testKey{ID: int(outstandingTask.GetTaskID())}]
+		s.Equal(outstandingTask, task)
+	}
+}
+
+func (s *processingQueueSuite) TestGetTasks_EmptyResult() {
+	ackLevel := testKey{ID: 1}
+	maxLevel := testKey{ID: 10}
+
+	queue := s.newTestProcessingQueue(
+		0,
+		ackLevel,
+		ackLevel,
+		maxLevel,
+		NewDomainFilter(nil, true),
+		make(map[task.Key]task.Task),
+	)
+
+	outstandingTasks := queue.GetTasks()
+	s.Equal(0, len(outstandingTasks))
+}
+
 func (s *processingQueueSuite) TestUpdateAckLevel_WithPendingTasks() {
 	ackLevel := testKey{ID: 1}
 	maxLevel := testKey{ID: 10}
@@ -124,7 +258,7 @@ func (s *processingQueueSuite) TestUpdateAckLevel_WithPendingTasks() {
 	taskStates := []t.State{
 		t.TaskStateAcked,
 		t.TaskStateAcked,
-		t.TaskStateNacked,
+		t.TaskStatePending,
 		t.TaskStateAcked,
 		t.TaskStatePending,
 	}

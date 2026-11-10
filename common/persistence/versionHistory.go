@@ -24,8 +24,8 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/uber/cadence/.gen/go/shared"
-	"github.com/uber/cadence/common"
+	"github.com/uber/cadence/common/constants"
+	"github.com/uber/cadence/common/types"
 )
 
 // NewVersionHistoryItem create a new version history item
@@ -34,7 +34,7 @@ func NewVersionHistoryItem(
 	inputVersion int64,
 ) *VersionHistoryItem {
 
-	if inputEventID < 0 || (inputVersion < 0 && inputVersion != common.EmptyVersion) {
+	if inputEventID < 0 || (inputVersion < 0 && inputVersion != constants.EmptyVersion) {
 		panic(fmt.Sprintf(
 			"invalid version history item event ID: %v, version: %v",
 			inputEventID,
@@ -45,16 +45,14 @@ func NewVersionHistoryItem(
 	return &VersionHistoryItem{EventID: inputEventID, Version: inputVersion}
 }
 
-// NewVersionHistoryItemFromThrift create a new version history item from thrift object
-func NewVersionHistoryItemFromThrift(
-	input *shared.VersionHistoryItem,
+// NewVersionHistoryItemFromInternalType create a new version history item from internal type object
+func NewVersionHistoryItemFromInternalType(
+	input *types.VersionHistoryItem,
 ) *VersionHistoryItem {
-
 	if input == nil {
-		panic("version history item is null")
+		return nil
 	}
-
-	return NewVersionHistoryItem(input.GetEventID(), input.GetVersion())
+	return NewVersionHistoryItem(input.EventID, input.Version)
 }
 
 // Duplicate duplicate VersionHistoryItem
@@ -63,26 +61,18 @@ func (item *VersionHistoryItem) Duplicate() *VersionHistoryItem {
 	return NewVersionHistoryItem(item.EventID, item.Version)
 }
 
-// ToThrift return thrift format of version history item
-func (item *VersionHistoryItem) ToThrift() *shared.VersionHistoryItem {
-
-	return &shared.VersionHistoryItem{
-		EventID: common.Int64Ptr(item.EventID),
-		Version: common.Int64Ptr(item.Version),
+// ToInternalType return internal format of version history item
+func (item *VersionHistoryItem) ToInternalType() *types.VersionHistoryItem {
+	if item == nil {
+		return nil
+	}
+	return &types.VersionHistoryItem{
+		EventID: item.EventID,
+		Version: item.Version,
 	}
 }
 
-// GetEventID return the event ID
-func (item *VersionHistoryItem) GetEventID() int64 {
-	return item.EventID
-}
-
-// GetVersion return the event ID
-func (item *VersionHistoryItem) GetVersion() int64 {
-	return item.Version
-}
-
-// Equals test if this version history itme and input version history item  are the same
+// Equals test if this version history item and input version history item are the same
 func (item *VersionHistoryItem) Equals(input *VersionHistoryItem) bool {
 	return item.Version == input.Version && item.EventID == input.EventID
 }
@@ -109,18 +99,18 @@ func NewVersionHistory(
 	return versionHistory
 }
 
-// NewVersionHistoryFromThrift create a new version history from thrift object
-func NewVersionHistoryFromThrift(
-	input *shared.VersionHistory,
+// NewVersionHistoryFromInternalType create a new version history from internal type object
+func NewVersionHistoryFromInternalType(
+	input *types.VersionHistory,
 ) *VersionHistory {
 
 	if input == nil {
-		panic("version history is null")
+		return nil
 	}
 
-	items := []*VersionHistoryItem{}
+	items := make([]*VersionHistoryItem, 0, len(input.Items))
 	for _, item := range input.Items {
-		items = append(items, NewVersionHistoryItemFromThrift(item))
+		items = append(items, NewVersionHistoryItemFromInternalType(item))
 	}
 	return NewVersionHistory(input.BranchToken, items)
 }
@@ -131,17 +121,20 @@ func (v *VersionHistory) Duplicate() *VersionHistory {
 	return NewVersionHistory(v.BranchToken, v.Items)
 }
 
-// ToThrift return thrift format of version history
-func (v *VersionHistory) ToThrift() *shared.VersionHistory {
+// ToInternalType return internal format of version history
+func (v *VersionHistory) ToInternalType() *types.VersionHistory {
+	if v == nil {
+		return nil
+	}
 
 	token := make([]byte, len(v.BranchToken))
 	copy(token, v.BranchToken)
-	items := []*shared.VersionHistoryItem{}
+	items := []*types.VersionHistoryItem{}
 	for _, item := range v.Items {
-		items = append(items, item.ToThrift())
+		items = append(items, item.ToInternalType())
 	}
 
-	tHistory := &shared.VersionHistory{
+	tHistory := &types.VersionHistory{
 		BranchToken: token,
 		Items:       items,
 	}
@@ -154,7 +147,7 @@ func (v *VersionHistory) DuplicateUntilLCAItem(
 ) (*VersionHistory, error) {
 
 	versionHistory := NewVersionHistory(nil, nil)
-	notFoundErr := &shared.BadRequestError{
+	notFoundErr := &types.BadRequestError{
 		Message: "version history does not contains the LCA item.",
 	}
 	for _, item := range v.Items {
@@ -211,14 +204,14 @@ func (v *VersionHistory) AddOrUpdateItem(
 
 	lastItem := v.Items[len(v.Items)-1]
 	if item.Version < lastItem.Version {
-		return &shared.BadRequestError{Message: fmt.Sprintf(
+		return &types.BadRequestError{Message: fmt.Sprintf(
 			"cannot update version history with a lower version %v. Last version: %v",
 			item.Version, lastItem.Version,
 		)}
 	}
 
 	if item.EventID <= lastItem.EventID {
-		return &shared.BadRequestError{Message: fmt.Sprintf(
+		return &types.BadRequestError{Message: fmt.Sprintf(
 			"cannot add version history with a lower event id %v. Last event id: %v",
 			item.EventID, lastItem.EventID,
 		)}
@@ -239,17 +232,16 @@ func (v *VersionHistory) AddOrUpdateItem(
 func (v *VersionHistory) ContainsItem(
 	item *VersionHistoryItem,
 ) bool {
-
-	prevEventID := common.FirstEventID - 1
+	prevEventID := constants.FirstEventID - 1
 	for _, currentItem := range v.Items {
-		if item.GetVersion() == currentItem.GetVersion() {
-			if prevEventID < item.GetEventID() && item.GetEventID() <= currentItem.GetEventID() {
+		if item.Version == currentItem.Version {
+			if prevEventID < item.EventID && item.EventID <= currentItem.EventID {
 				return true
 			}
-		} else if item.GetVersion() < currentItem.GetVersion() {
+		} else if item.Version < currentItem.Version {
 			return false
 		}
-		prevEventID = currentItem.GetEventID()
+		prevEventID = currentItem.EventID
 	}
 	return false
 }
@@ -279,7 +271,7 @@ func (v *VersionHistory) FindLCAItem(
 		}
 	}
 
-	return nil, &shared.BadRequestError{
+	return nil, &types.BadRequestError{
 		Message: "version history is malformed. No joint point found.",
 	}
 }
@@ -303,7 +295,7 @@ func (v *VersionHistory) IsLCAAppendable(
 func (v *VersionHistory) GetFirstItem() (*VersionHistoryItem, error) {
 
 	if len(v.Items) == 0 {
-		return nil, &shared.BadRequestError{Message: "version history is empty."}
+		return nil, &types.BadRequestError{Message: "version history is empty."}
 	}
 
 	return v.Items[0].Duplicate(), nil
@@ -311,11 +303,9 @@ func (v *VersionHistory) GetFirstItem() (*VersionHistoryItem, error) {
 
 // GetLastItem return the last version history item
 func (v *VersionHistory) GetLastItem() (*VersionHistoryItem, error) {
-
 	if len(v.Items) == 0 {
-		return nil, &shared.BadRequestError{Message: "version history is empty."}
+		return nil, &types.BadRequestError{Message: "version history is empty"}
 	}
-
 	return v.Items[len(v.Items)-1].Duplicate(), nil
 }
 
@@ -328,19 +318,19 @@ func (v *VersionHistory) GetEventVersion(
 	if err != nil {
 		return 0, err
 	}
-	if eventID < common.FirstEventID || eventID > lastItem.GetEventID() {
-		return 0, &shared.BadRequestError{Message: "input event ID is not in range."}
+	if eventID < constants.FirstEventID || eventID > lastItem.EventID {
+		return 0, &types.BadRequestError{Message: "input event ID is not in range."}
 	}
 
 	// items are sorted by eventID & version
 	// so the fist item with item event ID >= input event ID
 	// the item version is the result
 	for _, currentItem := range v.Items {
-		if eventID <= currentItem.GetEventID() {
-			return currentItem.GetVersion(), nil
+		if eventID <= currentItem.EventID {
+			return currentItem.Version, nil
 		}
 	}
-	return 0, &shared.BadRequestError{Message: "input event ID is not in range."}
+	return 0, &types.BadRequestError{Message: "input event ID is not in range."}
 }
 
 // IsEmpty indicate whether version history is empty
@@ -374,24 +364,21 @@ func (v *VersionHistory) Equals(
 func NewVersionHistories(
 	versionHistory *VersionHistory,
 ) *VersionHistories {
-
 	if versionHistory == nil {
-		panic("version history cannot be null")
+		return nil
 	}
-
 	return &VersionHistories{
 		CurrentVersionHistoryIndex: 0,
 		Histories:                  []*VersionHistory{versionHistory},
 	}
 }
 
-// NewVersionHistoriesFromThrift create a new version histories from thrift object
-func NewVersionHistoriesFromThrift(
-	input *shared.VersionHistories,
+// NewVersionHistoriesFromInternalType create a new version histories from internal type object
+func NewVersionHistoriesFromInternalType(
+	input *types.VersionHistories,
 ) *VersionHistories {
-
 	if input == nil {
-		panic("version histories is null")
+		return nil
 	}
 	if len(input.Histories) == 0 {
 		panic("version histories cannot have empty")
@@ -399,9 +386,9 @@ func NewVersionHistoriesFromThrift(
 
 	currentVersionHistoryIndex := int(input.GetCurrentVersionHistoryIndex())
 
-	versionHistories := NewVersionHistories(NewVersionHistoryFromThrift(input.Histories[0]))
+	versionHistories := NewVersionHistories(NewVersionHistoryFromInternalType(input.Histories[0]))
 	for i := 1; i < len(input.Histories); i++ {
-		_, _, err := versionHistories.AddVersionHistory(NewVersionHistoryFromThrift(input.Histories[i]))
+		_, _, err := versionHistories.AddVersionHistory(NewVersionHistoryFromInternalType(input.Histories[i]))
 		if err != nil {
 			panic(fmt.Sprintf("unable to initialize version histories: %v", err))
 		}
@@ -416,6 +403,9 @@ func NewVersionHistoriesFromThrift(
 
 // Duplicate duplicate VersionHistories
 func (h *VersionHistories) Duplicate() *VersionHistories {
+	if h == nil {
+		return nil
+	}
 
 	currentVersionHistoryIndex := h.CurrentVersionHistoryIndex
 	histories := []*VersionHistory{}
@@ -429,17 +419,17 @@ func (h *VersionHistories) Duplicate() *VersionHistories {
 	}
 }
 
-// ToThrift return thrift format of version histories
-func (h *VersionHistories) ToThrift() *shared.VersionHistories {
+// ToInternalType return internal format of version histories
+func (h *VersionHistories) ToInternalType() *types.VersionHistories {
 
 	currentVersionHistoryIndex := h.CurrentVersionHistoryIndex
-	histories := []*shared.VersionHistory{}
+	histories := []*types.VersionHistory{}
 	for _, history := range h.Histories {
-		histories = append(histories, history.ToThrift())
+		histories = append(histories, history.ToInternalType())
 	}
 
-	return &shared.VersionHistories{
-		CurrentVersionHistoryIndex: common.Int32Ptr(int32(currentVersionHistoryIndex)),
+	return &types.VersionHistories{
+		CurrentVersionHistoryIndex: int32(currentVersionHistoryIndex),
 		Histories:                  histories,
 	}
 }
@@ -450,7 +440,7 @@ func (h *VersionHistories) GetVersionHistory(
 ) (*VersionHistory, error) {
 
 	if branchIndex < 0 || branchIndex >= len(h.Histories) {
-		return nil, &shared.BadRequestError{Message: "invalid branch index."}
+		return nil, &types.BadRequestError{Message: fmt.Sprintf("getting branch index: %d, available branch count: %d", branchIndex, len(h.Histories))}
 	}
 
 	return h.Histories[branchIndex], nil
@@ -462,7 +452,7 @@ func (h *VersionHistories) AddVersionHistory(
 ) (bool, int, error) {
 
 	if v == nil {
-		return false, 0, &shared.BadRequestError{Message: "version histories is null."}
+		return false, 0, &types.BadRequestError{Message: "version histories is null."}
 	}
 
 	// assuming existing version histories inside are valid
@@ -481,7 +471,7 @@ func (h *VersionHistories) AddVersionHistory(
 	}
 
 	if incomingFirstItem.Version != currentFirstItem.Version {
-		return false, 0, &shared.BadRequestError{Message: "version history first item does not match."}
+		return false, 0, &types.BadRequestError{Message: "version history first item does not match."}
 	}
 
 	// TODO maybe we need more strict validation
@@ -539,18 +529,18 @@ func (h *VersionHistories) FindLCAVersionHistoryIndexAndItem(
 	return versionHistoryIndex, versionHistoryItem, nil
 }
 
-// FindFirstVersionHistoryIndexByItem find the first version history index which
+// FindFirstVersionHistoryByItem find the first version history index and history which
 // contains the given version history item
-func (h *VersionHistories) FindFirstVersionHistoryIndexByItem(
+func (h *VersionHistories) FindFirstVersionHistoryByItem(
 	item *VersionHistoryItem,
-) (int, error) {
+) (index int, history *VersionHistory, err error) {
 
 	for index, localHistory := range h.Histories {
 		if localHistory.ContainsItem(item) {
-			return index, nil
+			return index, localHistory, nil
 		}
 	}
-	return 0, &shared.BadRequestError{Message: "version histories does not contains given item."}
+	return 0, nil, &types.BadRequestError{Message: "version histories does not contains given item."}
 }
 
 // IsRebuilt returns true if the current branch index's last write version is not the largest
@@ -572,7 +562,7 @@ func (h *VersionHistories) IsRebuilt() (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		if lastItem.GetVersion() > currentLastItem.GetVersion() {
+		if lastItem.Version > currentLastItem.Version {
 			return true, nil
 		}
 	}
@@ -586,7 +576,7 @@ func (h *VersionHistories) SetCurrentVersionHistoryIndex(
 ) error {
 
 	if index < 0 || index >= len(h.Histories) {
-		return &shared.BadRequestError{Message: "invalid current branch index."}
+		return &types.BadRequestError{Message: "invalid current branch index."}
 	}
 
 	h.CurrentVersionHistoryIndex = index
@@ -600,6 +590,5 @@ func (h *VersionHistories) GetCurrentVersionHistoryIndex() int {
 
 // GetCurrentVersionHistory get the current version history
 func (h *VersionHistories) GetCurrentVersionHistory() (*VersionHistory, error) {
-
 	return h.GetVersionHistory(h.GetCurrentVersionHistoryIndex())
 }

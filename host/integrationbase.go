@@ -22,26 +22,39 @@ package host
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
+	"strings"
+	"testing"
 	"time"
 
 	"github.com/pborman/uuid"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/yarpc"
 	"go.uber.org/yarpc/transport/tchannel"
-	"go.uber.org/zap"
 	"gopkg.in/yaml.v2"
 
-	workflow "github.com/uber/cadence/.gen/go/shared"
-	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/cache"
+	"github.com/uber/cadence/common/config"
+	"github.com/uber/cadence/common/constants"
+	"github.com/uber/cadence/common/dynamicconfig/dynamicproperties"
 	"github.com/uber/cadence/common/log"
-	"github.com/uber/cadence/common/log/loggerimpl"
 	"github.com/uber/cadence/common/log/tag"
+	"github.com/uber/cadence/common/log/testlogger"
 	"github.com/uber/cadence/common/persistence"
+	pt "github.com/uber/cadence/common/persistence/persistence-tests"
+	"github.com/uber/cadence/common/persistence/sql/sqlplugin/sqlite"
+	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/environment"
+)
+
+const (
+	defaultTestLimit   = 5 * time.Second
+	slowTestLimit      = 40 * time.Second
+	suiteOverheadLimit = 60 * time.Second
+	slowTestSuffix     = "_SLOW"
 )
 
 type (
@@ -49,26 +62,39 @@ type (
 	IntegrationBase struct {
 		suite.Suite
 
-		testCluster              *TestCluster
-		testClusterConfig        *TestClusterConfig
-		engine                   FrontendClient
-		adminClient              AdminClient
+		TestCluster              *TestCluster
+		TestClusterConfig        *TestClusterConfig
+		Engine                   FrontendClient
+		HistoryClient            HistoryClient
+		AdminClient              AdminClient
 		Logger                   log.Logger
-		domainName               string
-		testRawHistoryDomainName string
-		foreignDomainName        string
-		archivalDomainName       string
+		DomainName               string
+		SecondaryDomainName      string
+		TestRawHistoryDomainName string
+		ForeignDomainName        string
+		ArchivalDomainName       string
+		ActiveActiveDomainName   string
+		PersistenceConfig        config.Persistence
+	}
+
+	IntegrationBaseParams struct {
+		T                 *testing.T
+		PersistenceConfig config.Persistence
+		TestClusterConfig *TestClusterConfig
 	}
 )
 
-func (s *IntegrationBase) setupSuite(defaultClusterConfigFile string) {
-	s.setupLogger()
+func NewIntegrationBase(params IntegrationBaseParams) *IntegrationBase {
+	return &IntegrationBase{
+		PersistenceConfig: params.PersistenceConfig,
+		TestClusterConfig: params.TestClusterConfig,
+	}
+}
 
-	clusterConfig, err := GetTestClusterConfig(defaultClusterConfigFile)
-	s.Require().NoError(err)
-	s.testClusterConfig = clusterConfig
+func (s *IntegrationBase) setupSuite() {
+	s.SetupLogger()
 
-	if clusterConfig.FrontendAddress != "" {
+	if s.TestClusterConfig.FrontendAddress != "" {
 		s.Logger.Info("Running integration test against specified frontend", tag.Address(TestFlags.FrontendAddr))
 		channel, err := tchannel.NewChannelTransport(tchannel.ServiceName("cadence-frontend"))
 		s.Require().NoError(err)
@@ -85,42 +111,69 @@ func (s *IntegrationBase) setupSuite(defaultClusterConfigFile string) {
 			s.Logger.Fatal("Failed to create outbound transport channel", tag.Error(err))
 		}
 
-		s.engine = NewFrontendClient(dispatcher)
-		s.adminClient = NewAdminClient(dispatcher)
+		s.Engine = NewFrontendClient(dispatcher)
+		s.HistoryClient = NewHistoryClient(dispatcher)
+		s.AdminClient = NewAdminClient(dispatcher)
 	} else {
 		s.Logger.Info("Running integration test against test cluster")
-		cluster, err := NewCluster(clusterConfig, s.Logger)
+		clusterMetadata := NewClusterMetadata(s.T(), s.TestClusterConfig)
+		dc := *persistence.NewDefaultDynamicConfiguration()
+		dc.EnableCassandraAllConsistencyLevelDelete = dynamicproperties.GetBoolPropertyFn(true)
+		dc.EnableHistoryTaskDualWriteMode = dynamicproperties.GetBoolPropertyFn(true)
+		dc.EnableWorkflowTimerTaskCleanup = dynamicproperties.GetBoolPropertyFn(true)
+		params := pt.TestBaseParams{
+			PersistenceConfig:    s.PersistenceConfig,
+			ClusterMetadata:      &clusterMetadata,
+			DynamicConfiguration: &dc,
+		}
+		cluster, err := NewCluster(s.T(), s.TestClusterConfig, s.Logger, params)
 		s.Require().NoError(err)
-		s.testCluster = cluster
-		s.engine = s.testCluster.GetFrontendClient()
-		s.adminClient = s.testCluster.GetAdminClient()
+		s.TestCluster = cluster
+		s.Engine = s.TestCluster.GetFrontendClient()
+		s.HistoryClient = s.TestCluster.GetHistoryClient()
+		s.AdminClient = s.TestCluster.GetAdminClient()
 	}
-	s.testRawHistoryDomainName = "TestRawHistoryDomain"
-	s.domainName = s.randomizeStr("integration-test-domain")
+	s.TestRawHistoryDomainName = "TestRawHistoryDomain"
+	s.DomainName = s.RandomizeStr("integration-test-domain")
 	s.Require().NoError(
-		s.registerDomain(s.domainName, 1, workflow.ArchivalStatusDisabled, "", workflow.ArchivalStatusDisabled, ""))
+		s.RegisterDomain(s.DomainName, 1, types.ArchivalStatusDisabled, "", types.ArchivalStatusDisabled, "", nil))
 	s.Require().NoError(
-		s.registerDomain(s.testRawHistoryDomainName, 1, workflow.ArchivalStatusDisabled, "", workflow.ArchivalStatusDisabled, ""))
-	s.foreignDomainName = s.randomizeStr("integration-foreign-test-domain")
+		s.RegisterDomain(s.TestRawHistoryDomainName, 1, types.ArchivalStatusDisabled, "", types.ArchivalStatusDisabled, "", nil))
+	s.ForeignDomainName = s.RandomizeStr("integration-foreign-test-domain")
 	s.Require().NoError(
-		s.registerDomain(s.foreignDomainName, 1, workflow.ArchivalStatusDisabled, "", workflow.ArchivalStatusDisabled, ""))
+		s.RegisterDomain(s.ForeignDomainName, 1, types.ArchivalStatusDisabled, "", types.ArchivalStatusDisabled, "", nil))
 
 	s.Require().NoError(s.registerArchivalDomain())
+	s.ActiveActiveDomainName = s.RandomizeStr("integration-active-active-test-domain")
+	s.Require().NoError(s.RegisterDomain(s.ActiveActiveDomainName, 1, types.ArchivalStatusDisabled, "", types.ArchivalStatusDisabled, "", &types.ActiveClusters{
+		AttributeScopes: map[string]types.ClusterAttributeScope{
+			"region": {
+				ClusterAttributes: map[string]types.ActiveClusterInfo{
+					"us-east": {ActiveClusterName: s.TestCluster.testBase.ClusterMetadata.GetCurrentClusterName()},
+				},
+			},
+			"city": {
+				ClusterAttributes: map[string]types.ActiveClusterInfo{
+					"tokyo": {ActiveClusterName: s.TestCluster.testBase.ClusterMetadata.GetCurrentClusterName()},
+				},
+			},
+		},
+	}))
 
 	// this sleep is necessary because domainv2 cache gets refreshed in the
 	// background only every domainCacheRefreshInterval period
 	time.Sleep(cache.DomainCacheRefreshInterval + time.Second)
 }
 
-func (s *IntegrationBase) setupLogger() {
-	zapLogger, err := zap.NewDevelopment()
-	s.Require().NoError(err)
-	s.Logger = loggerimpl.NewLogger(zapLogger)
+func (s *IntegrationBase) SetupLogger() {
+	s.Logger = testlogger.New(s.T())
 }
 
 // GetTestClusterConfig return test cluster config
 func GetTestClusterConfig(configFile string) (*TestClusterConfig, error) {
-	environment.SetupEnv()
+	if err := environment.SetupEnv(); err != nil {
+		return nil, err
+	}
 
 	configLocation := configFile
 	if TestFlags.TestClusterConfigFile != "" {
@@ -128,7 +181,7 @@ func GetTestClusterConfig(configFile string) (*TestClusterConfig, error) {
 	}
 	// This is just reading a config so it's less of a security concern
 	// #nosec
-	confContent, err := ioutil.ReadFile(configLocation)
+	confContent, err := os.ReadFile(configLocation)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read test cluster config file %v: %v", configLocation, err)
 	}
@@ -140,67 +193,110 @@ func GetTestClusterConfig(configFile string) (*TestClusterConfig, error) {
 
 	options.FrontendAddress = TestFlags.FrontendAddr
 	if options.ESConfig != nil {
-		options.ESConfig.Indices[common.VisibilityAppName] += uuid.New()
+		options.ESConfig.Indices[constants.VisibilityAppName] += uuid.New()
 	}
 	return &options, nil
 }
 
-func (s *IntegrationBase) tearDownSuite() {
-	if s.testCluster != nil {
-		s.testCluster.TearDownCluster()
-		s.testCluster = nil
-		s.engine = nil
-		s.adminClient = nil
+// GetTestClusterConfigs return test cluster configs
+func GetTestClusterConfigs(configFile string) ([]*TestClusterConfig, error) {
+	if err := environment.SetupEnv(); err != nil {
+		return nil, err
+	}
+
+	fileName := configFile
+	if TestFlags.TestClusterConfigFile != "" {
+		fileName = TestFlags.TestClusterConfigFile
+	}
+
+	confContent, err := os.ReadFile(fileName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read test cluster config file %v: %v", fileName, err)
+	}
+	confContent = []byte(os.ExpandEnv(string(confContent)))
+
+	var clusterConfigs []*TestClusterConfig
+	if err := yaml.Unmarshal(confContent, &clusterConfigs); err != nil {
+		return nil, fmt.Errorf("failed to decode test cluster config %v", tag.Error(err))
+	}
+	return clusterConfigs, nil
+}
+
+func (s *IntegrationBase) TearDownBaseSuite() {
+	if s.TestCluster != nil {
+		s.TestCluster.TearDownCluster()
+		s.TestCluster = nil
+		s.Engine = nil
+		s.AdminClient = nil
 	}
 }
 
-func (s *IntegrationBase) registerDomain(
+func (s *IntegrationBase) RegisterDomain(
 	domain string,
 	retentionDays int,
-	historyArchivalStatus workflow.ArchivalStatus,
+	historyArchivalStatus types.ArchivalStatus,
 	historyArchivalURI string,
-	visibilityArchivalStatus workflow.ArchivalStatus,
+	visibilityArchivalStatus types.ArchivalStatus,
 	visibilityArchivalURI string,
+	activeClusters *types.ActiveClusters,
 ) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return s.engine.RegisterDomain(ctx, &workflow.RegisterDomainRequest{
-		Name:                                   &domain,
-		Description:                            &domain,
-		WorkflowExecutionRetentionPeriodInDays: common.Int32Ptr(int32(retentionDays)),
+	isGlobalDomain := true
+	if TestFlags.SQLPluginName == sqlite.PluginName {
+		// There seems to be a bug in the SQLite plugin that causes integration tests to fail.
+		// EnqueueMessage operation failed.  Error: sqlite3: database is locked
+		isGlobalDomain = false
+	}
+	return s.Engine.RegisterDomain(ctx, &types.RegisterDomainRequest{
+		Name:                                   domain,
+		Description:                            domain,
+		WorkflowExecutionRetentionPeriodInDays: int32(retentionDays),
 		HistoryArchivalStatus:                  &historyArchivalStatus,
-		HistoryArchivalURI:                     &historyArchivalURI,
+		HistoryArchivalURI:                     historyArchivalURI,
 		VisibilityArchivalStatus:               &visibilityArchivalStatus,
-		VisibilityArchivalURI:                  &visibilityArchivalURI,
+		VisibilityArchivalURI:                  visibilityArchivalURI,
+		ActiveClusters:                         activeClusters,
+		IsGlobalDomain:                         isGlobalDomain,
 	})
 }
 
-func (s *IntegrationBase) randomizeStr(id string) string {
+func (s *IntegrationBase) domainCacheRefresh() {
+	s.TestClusterConfig.TimeSource.Advance(cache.DomainCacheRefreshInterval + time.Second)
+	// this sleep is necessary to yield execution to other goroutines. not 100% guaranteed to work
+	time.Sleep(2 * time.Second)
+}
+
+func (s *IntegrationBase) RandomizeStr(id string) string {
 	return fmt.Sprintf("%v-%v", id, uuid.New())
 }
 
-func (s *IntegrationBase) printWorkflowHistory(domain string, execution *workflow.WorkflowExecution) {
+func (s *IntegrationBase) printWorkflowHistory(domain string, execution *types.WorkflowExecution) {
 	events := s.getHistory(domain, execution)
-	history := &workflow.History{}
+	history := &types.History{}
 	history.Events = events
-	common.PrettyPrintHistory(history, s.Logger)
+	PrettyPrintHistory(history, s.Logger)
 }
 
-func (s *IntegrationBase) getHistory(domain string, execution *workflow.WorkflowExecution) []*workflow.HistoryEvent {
-	historyResponse, err := s.engine.GetWorkflowExecutionHistory(createContext(), &workflow.GetWorkflowExecutionHistoryRequest{
-		Domain:          common.StringPtr(domain),
+func (s *IntegrationBase) getHistory(domain string, execution *types.WorkflowExecution) []*types.HistoryEvent {
+	ctx, cancel := createContext()
+	defer cancel()
+	historyResponse, err := s.Engine.GetWorkflowExecutionHistory(ctx, &types.GetWorkflowExecutionHistoryRequest{
+		Domain:          domain,
 		Execution:       execution,
-		MaximumPageSize: common.Int32Ptr(5), // Use small page size to force pagination code path
+		MaximumPageSize: 5, // Use small page size to force pagination code path
 	})
 	s.Require().NoError(err)
 
 	events := historyResponse.History.Events
 	for historyResponse.NextPageToken != nil {
-		historyResponse, err = s.engine.GetWorkflowExecutionHistory(createContext(), &workflow.GetWorkflowExecutionHistoryRequest{
-			Domain:        common.StringPtr(domain),
+		ctx, cancel := createContext()
+		historyResponse, err = s.Engine.GetWorkflowExecutionHistory(ctx, &types.GetWorkflowExecutionHistoryRequest{
+			Domain:        domain,
 			Execution:     execution,
 			NextPageToken: historyResponse.NextPageToken,
 		})
+		cancel()
 		s.Require().NoError(err)
 		events = append(events, historyResponse.History.Events...)
 	}
@@ -215,21 +311,21 @@ func (s *IntegrationBase) registerArchivalDomain() error {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestPersistenceTimeout)
 	defer cancel()
 
-	s.archivalDomainName = s.randomizeStr("integration-archival-enabled-domain")
-	currentClusterName := s.testCluster.testBase.ClusterMetadata.GetCurrentClusterName()
+	s.ArchivalDomainName = s.RandomizeStr("integration-archival-enabled-domain")
+	currentClusterName := s.TestCluster.testBase.ClusterMetadata.GetCurrentClusterName()
 	domainRequest := &persistence.CreateDomainRequest{
 		Info: &persistence.DomainInfo{
 			ID:     uuid.New(),
-			Name:   s.archivalDomainName,
+			Name:   s.ArchivalDomainName,
 			Status: persistence.DomainStatusRegistered,
 		},
 		Config: &persistence.DomainConfig{
 			Retention:                0,
-			HistoryArchivalStatus:    workflow.ArchivalStatusEnabled,
-			HistoryArchivalURI:       s.testCluster.archiverBase.historyURI,
-			VisibilityArchivalStatus: workflow.ArchivalStatusEnabled,
-			VisibilityArchivalURI:    s.testCluster.archiverBase.visibilityURI,
-			BadBinaries:              workflow.BadBinaries{Binaries: map[string]*workflow.BadBinaryInfo{}},
+			HistoryArchivalStatus:    types.ArchivalStatusEnabled,
+			HistoryArchivalURI:       s.TestCluster.archiverBase.historyURI,
+			VisibilityArchivalStatus: types.ArchivalStatusEnabled,
+			VisibilityArchivalURI:    s.TestCluster.archiverBase.visibilityURI,
+			BadBinaries:              types.BadBinaries{Binaries: map[string]*types.BadBinaryInfo{}},
 		},
 		ReplicationConfig: &persistence.DomainReplicationConfig{
 			ActiveClusterName: currentClusterName,
@@ -238,14 +334,189 @@ func (s *IntegrationBase) registerArchivalDomain() error {
 			},
 		},
 		IsGlobalDomain:  false,
-		FailoverVersion: common.EmptyVersion,
+		FailoverVersion: constants.EmptyVersion,
 	}
-	response, err := s.testCluster.testBase.MetadataManager.CreateDomain(ctx, domainRequest)
+	response, err := s.TestCluster.testBase.DomainManager.CreateDomain(ctx, domainRequest)
 	if err == nil {
 		s.Logger.Info("Register domain succeeded",
-			tag.WorkflowDomainName(s.archivalDomainName),
+			tag.WorkflowDomainName(s.ArchivalDomainName),
 			tag.WorkflowDomainID(response.ID),
 		)
 	}
 	return err
+}
+
+func (s *IntegrationBase) HandleStats(suiteName string, stats *suite.SuiteInformation) {
+	suiteDuration := stats.End.Sub(stats.Start)
+
+	var timeInTests time.Duration
+	for testName, info := range stats.TestStats {
+		testDuration := info.End.Sub(info.Start)
+
+		allowedTime := defaultTestLimit
+		if strings.HasSuffix(testName, slowTestSuffix) {
+			allowedTime = slowTestLimit
+		}
+
+		if testDuration > allowedTime {
+			s.Fail("Test took too long", "%s took %v (limit %v)", testName, testDuration, allowedTime)
+		}
+		timeInTests += testDuration
+	}
+
+	suiteOverhead := suiteDuration - timeInTests
+	if suiteOverhead > suiteOverheadLimit {
+		s.Fail("Test suite took too long to setup and teardown", "%s had overhead of %v (limit %v)", suiteName, suiteOverhead, suiteOverheadLimit)
+	}
+}
+
+func (s *IntegrationBase) newPoller(decisions decisionTaskHandler, activities ActivityExecutor) *TaskPoller {
+	return &TaskPoller{
+		Engine: s.Engine,
+		Domain: s.DomainName,
+		TaskList: &types.TaskList{
+			Name: s.T().Name(),
+		},
+		Identity:        s.T().Name(),
+		DecisionHandler: decisions,
+		ActivityHandler: activities,
+		Logger:          s.Logger,
+		T:               s.T(),
+	}
+}
+
+func (s *IntegrationBase) GetWorkflowResult(runID string) (string, error) {
+	ctx, cancel := createContext()
+	defer cancel()
+	historyResponse, err := s.Engine.GetWorkflowExecutionHistory(ctx, &types.GetWorkflowExecutionHistoryRequest{
+		Domain: s.DomainName,
+		Execution: &types.WorkflowExecution{
+			WorkflowID: s.T().Name(),
+			RunID:      runID,
+		},
+		HistoryEventFilterType: types.HistoryEventFilterTypeCloseEvent.Ptr(),
+		WaitForNewEvent:        true,
+	})
+	if err != nil {
+		return "", err
+	}
+	history := historyResponse.History
+
+	lastEvent := history.Events[len(history.Events)-1]
+	if *lastEvent.EventType != types.EventTypeWorkflowExecutionCompleted {
+		return "", errors.New("workflow didn't complete")
+	}
+
+	return string(lastEvent.WorkflowExecutionCompletedEventAttributes.Result), nil
+}
+
+func (s *IntegrationBase) GetStartedEvent(runID string) *types.WorkflowExecutionStartedEventAttributes {
+	return s.GetOnlyEventWithType(runID, types.EventTypeWorkflowExecutionStarted).WorkflowExecutionStartedEventAttributes
+}
+
+func (s *IntegrationBase) GetOnlyEventWithType(runID string, eventType types.EventType) *types.HistoryEvent {
+	return s.GetOnlyEvent(runID, func(event *types.HistoryEvent) bool {
+		return event.GetEventType() == eventType
+	})
+}
+
+func (s *IntegrationBase) GetOnlyEvent(runID string, filter func(event *types.HistoryEvent) bool) *types.HistoryEvent {
+	history := s.getHistory(s.DomainName, &types.WorkflowExecution{WorkflowID: s.T().Name(), RunID: runID})
+	events := s.filterEvents(history, filter)
+	if len(events) == 0 {
+		s.FailNowf("expected event", "no event found matching filter for: %s, got : %v ", runID, history)
+		return nil
+	}
+	if len(events) > 1 {
+		s.FailNowf("unexpected events", "expected one event for %s, got : %v", runID, events)
+		return nil
+	}
+	return events[0]
+}
+
+func (s *IntegrationBase) GetEvents(runID string, filter func(event *types.HistoryEvent) bool) []*types.HistoryEvent {
+	history := s.getHistory(s.DomainName, &types.WorkflowExecution{WorkflowID: s.T().Name(), RunID: runID})
+	return s.filterEvents(history, filter)
+}
+
+func (s *IntegrationBase) filterEvents(history []*types.HistoryEvent, filter func(event *types.HistoryEvent) bool) []*types.HistoryEvent {
+	result := make([]*types.HistoryEvent, 0, len(history))
+	for _, event := range history {
+		if filter(event) {
+			result = append(result, event)
+		}
+	}
+	return result
+}
+
+func (s *IntegrationBase) DescribeWorkflow(runID string) *types.DescribeWorkflowExecutionResponse {
+	ctx, cancel := createContext()
+	defer cancel()
+	resp, err := s.Engine.DescribeWorkflowExecution(ctx, &types.DescribeWorkflowExecutionRequest{
+		Domain: s.DomainName,
+		Execution: &types.WorkflowExecution{
+			WorkflowID: s.T().Name(),
+			RunID:      runID,
+		},
+	})
+	s.NoError(err, "failed to describe workflow")
+	return resp
+}
+
+// PrettyPrintHistory prints history in human readable format
+func PrettyPrintHistory(history *types.History, logger log.Logger) {
+	data, err := json.MarshalIndent(history, "", "    ")
+
+	if err != nil {
+		logger.Error("Error serializing history: %v\n", tag.Error(err))
+	}
+
+	fmt.Println("******************************************")
+	fmt.Println("History", tag.DetailInfo(string(data)))
+	fmt.Println("******************************************")
+}
+
+// singleDecisionWorkflow is a decisionTaskHandler that can run a single Activity or Child Workflow and will wait until
+// it completes. It always completes with a value of "done".
+func (s *IntegrationBase) singleDecisionWorkflow(testWorkflowType string, decision *types.Decision) decisionTaskHandler {
+	return func(execution *types.WorkflowExecution, wt *types.WorkflowType, previousStartedEventID, startedEventID int64, history *types.History) ([]byte, []*types.Decision, error) {
+		// Treat any other workflow type as a no-op, and allow passing nil as a no-op
+		if wt.GetName() != testWorkflowType || decision == nil {
+			return nil, []*types.Decision{{
+				DecisionType: types.DecisionTypeCompleteWorkflowExecution.Ptr(),
+				CompleteWorkflowExecutionDecisionAttributes: &types.CompleteWorkflowExecutionDecisionAttributes{
+					Result: []byte("done"),
+				},
+			}}, nil
+		}
+		// Ignore the DecisionTaskScheduled and DecisionTaskStarted that'll be at the end
+		latestEvent := history.Events[len(history.Events)-3]
+		// Started Event only. We support one of three things:
+		// - Activity Scheduled. We wait until it finishes
+		// - Child Workflow. We wait until it finishes, ignoring the start.
+		// - nil. We complete immediately
+		if *latestEvent.EventType == types.EventTypeWorkflowExecutionStarted {
+			if decision != nil {
+				return nil, []*types.Decision{decision}, nil
+			}
+		}
+		// Do nothing until the child workflow completes
+		if *latestEvent.EventType == types.EventTypeChildWorkflowExecutionStarted {
+			return nil, []*types.Decision{}, nil
+		}
+		// Once the decision is done we finish the workflow
+		if *latestEvent.EventType == types.EventTypeActivityTaskCompleted ||
+			*latestEvent.EventType == types.EventTypeChildWorkflowExecutionCompleted ||
+			*latestEvent.EventType == types.EventTypeActivityTaskFailed {
+			return nil, []*types.Decision{{
+				DecisionType: types.DecisionTypeCompleteWorkflowExecution.Ptr(),
+				CompleteWorkflowExecutionDecisionAttributes: &types.CompleteWorkflowExecutionDecisionAttributes{
+					Result: []byte("done"),
+				},
+			}}, nil
+		}
+		// Fail and pretty print the history for debugging
+		PrettyPrintHistory(&types.History{Events: history.Events}, s.Logger)
+		panic(fmt.Sprintf("Unexpected event type: %v", latestEvent.EventType))
+	}
 }

@@ -5,7 +5,13 @@ messagingclientconfig:
 historyconfig:
   numhistoryshards: 4
   numhistoryhosts: 1
+matchingconfig:
+  nummatchinghosts: 1
 workerconfig:
   enablearchiver: true
   enablereplicator: true
   enableindexer: false
+  enablescheduler: true
+dynamicclientconfig:
+  filepath: "testdata/dynamicconfig/integration_test.yaml"
+  pollInterval: "10s"

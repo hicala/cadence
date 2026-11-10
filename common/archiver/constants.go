@@ -20,15 +20,15 @@
 
 package archiver
 
-import (
-	"errors"
-)
+import "errors"
 
 const (
 	// ArchiveNonRetriableErrorMsg is the log message when the Archive() method encounters a non-retriable error
 	ArchiveNonRetriableErrorMsg = "Archive method encountered an non-retriable error."
 	// ArchiveTransientErrorMsg is the log message when the Archive() method encounters a transient error
 	ArchiveTransientErrorMsg = "Archive method encountered a transient error."
+	// ArchiveSkippedInfoMsg is the log messsage when the Archive() method encounter an entity not exists error
+	ArchiveSkippedInfoMsg = "Archive method encountered entity not exists error and skipped the archival"
 
 	// ErrReasonInvalidURI is the error reason for invalid URI
 	ErrReasonInvalidURI = "URI is invalid"

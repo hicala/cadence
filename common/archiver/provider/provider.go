@@ -22,15 +22,15 @@ package provider
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 
-	"github.com/uber/cadence/common/archiver/gcloud"
-
 	"github.com/uber/cadence/common/archiver"
-	"github.com/uber/cadence/common/archiver/filestore"
-	"github.com/uber/cadence/common/archiver/s3store"
-	"github.com/uber/cadence/common/service/config"
+	"github.com/uber/cadence/common/config/yaml"
+	"github.com/uber/cadence/common/syncmap"
 )
+
+//go:generate mockgen -package=$GOPACKAGE -destination=provider_mock.go -self_package=github.com/uber/cadence/common/archiver/provider github.com/uber/cadence/common/archiver/provider ArchiverProvider
 
 var (
 	// ErrUnknownScheme is the error for unknown archiver scheme
@@ -61,8 +61,8 @@ type (
 	archiverProvider struct {
 		sync.RWMutex
 
-		historyArchiverConfigs    *config.HistoryArchiverProvider
-		visibilityArchiverConfigs *config.VisibilityArchiverProvider
+		historyArchiverConfigs    archiver.HistoryArchiverProvider
+		visibilityArchiverConfigs archiver.VisibilityArchiverProvider
 
 		// Key for the container is just serviceName
 		historyContainers    map[string]*archiver.HistoryBootstrapContainer
@@ -72,12 +72,52 @@ type (
 		historyArchivers    map[string]archiver.HistoryArchiver
 		visibilityArchivers map[string]archiver.VisibilityArchiver
 	}
+
+	historyConstructor struct {
+		fn func(cfg *yaml.Node, container *archiver.HistoryBootstrapContainer) (archiver.HistoryArchiver, error)
+		// yaml key where this config exists, under archival.history.provider.
+		// This almost certainly should be the same as the scheme, but that'll need more work.
+		configKey string
+	}
+	visibilityConstructor struct {
+		fn func(cfg *yaml.Node, container *archiver.VisibilityBootstrapContainer) (archiver.VisibilityArchiver, error)
+		// yaml key where this config exists, under archival.visibility.provider.
+		// This almost certainly should be the same as the scheme, but that'll need more work.
+		configKey string
+	}
 )
+
+var (
+	historyConstructors    = syncmap.New[string, historyConstructor]()
+	visibilityConstructors = syncmap.New[string, visibilityConstructor]()
+)
+
+func RegisterHistoryArchiver(scheme, configKey string, constructor func(cfg *yaml.Node, container *archiver.HistoryBootstrapContainer) (archiver.HistoryArchiver, error)) error {
+	inserted := historyConstructors.Put(scheme, historyConstructor{
+		fn:        constructor,
+		configKey: configKey,
+	})
+	if !inserted {
+		return fmt.Errorf("history archiver already registered for scheme %q", scheme)
+	}
+	return nil
+}
+
+func RegisterVisibilityArchiver(scheme, configKey string, constructor func(cfg *yaml.Node, container *archiver.VisibilityBootstrapContainer) (archiver.VisibilityArchiver, error)) error {
+	inserted := visibilityConstructors.Put(scheme, visibilityConstructor{
+		fn:        constructor,
+		configKey: configKey,
+	})
+	if !inserted {
+		return fmt.Errorf("visibility archiver already registered for scheme %q", scheme)
+	}
+	return nil
+}
 
 // NewArchiverProvider returns a new Archiver provider
 func NewArchiverProvider(
-	historyArchiverConfigs *config.HistoryArchiverProvider,
-	visibilityArchiverConfigs *config.VisibilityArchiverProvider,
+	historyArchiverConfigs archiver.HistoryArchiverProvider,
+	visibilityArchiverConfigs archiver.VisibilityArchiverProvider,
 ) ArchiverProvider {
 	return &archiverProvider{
 		historyArchiverConfigs:    historyArchiverConfigs,
@@ -132,31 +172,19 @@ func (p *archiverProvider) GetHistoryArchiver(scheme, serviceName string) (histo
 		return nil, ErrBootstrapContainerNotFound
 	}
 
-	switch scheme {
-	case filestore.URIScheme:
-		if p.historyArchiverConfigs.Filestore == nil {
-			return nil, ErrArchiverConfigNotFound
-		}
-		historyArchiver, err = filestore.NewHistoryArchiver(container, p.historyArchiverConfigs.Filestore)
-
-	case gcloud.URIScheme:
-		if p.historyArchiverConfigs.Gstorage == nil {
-			return nil, ErrArchiverConfigNotFound
-		}
-
-		historyArchiver, err = gcloud.NewHistoryArchiver(container, p.historyArchiverConfigs.Gstorage)
-
-	case s3store.URIScheme:
-		if p.historyArchiverConfigs.S3store == nil {
-			return nil, ErrArchiverConfigNotFound
-		}
-		historyArchiver, err = s3store.NewHistoryArchiver(container, p.historyArchiverConfigs.S3store)
-	default:
-		return nil, ErrUnknownScheme
+	constructor, ok := historyConstructors.Get(scheme)
+	if !ok {
+		return nil, fmt.Errorf("no history archiver constructor for scheme %q", scheme)
 	}
 
+	cfg, ok := p.historyArchiverConfigs[constructor.configKey]
+	if !ok {
+		return nil, fmt.Errorf("no history archiver config for scheme %q, config key %q", scheme, constructor.configKey)
+	}
+
+	historyArchiver, err = constructor.fn(cfg, container)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("history archiver constructor failed for scheme %q, config key %q: err: %w", scheme, constructor.configKey, err)
 	}
 
 	p.Lock()
@@ -182,31 +210,19 @@ func (p *archiverProvider) GetVisibilityArchiver(scheme, serviceName string) (ar
 		return nil, ErrBootstrapContainerNotFound
 	}
 
-	var visibilityArchiver archiver.VisibilityArchiver
-	var err error
-
-	switch scheme {
-	case filestore.URIScheme:
-		if p.visibilityArchiverConfigs.Filestore == nil {
-			return nil, ErrArchiverConfigNotFound
-		}
-		visibilityArchiver, err = filestore.NewVisibilityArchiver(container, p.visibilityArchiverConfigs.Filestore)
-	case s3store.URIScheme:
-		if p.visibilityArchiverConfigs.S3store == nil {
-			return nil, ErrArchiverConfigNotFound
-		}
-		visibilityArchiver, err = s3store.NewVisibilityArchiver(container, p.visibilityArchiverConfigs.S3store)
-	case gcloud.URIScheme:
-		if p.visibilityArchiverConfigs.Gstorage == nil {
-			return nil, ErrArchiverConfigNotFound
-		}
-		visibilityArchiver, err = gcloud.NewVisibilityArchiver(container, p.visibilityArchiverConfigs.Gstorage)
-
-	default:
-		return nil, ErrUnknownScheme
+	constructor, ok := visibilityConstructors.Get(scheme)
+	if !ok {
+		return nil, fmt.Errorf("no visibility archiver constructor for scheme %q", scheme)
 	}
+
+	cfg, ok := p.visibilityArchiverConfigs[constructor.configKey]
+	if !ok {
+		return nil, fmt.Errorf("no visibility archiver config for scheme %q, config key %q", scheme, constructor.configKey)
+	}
+
+	visibilityArchiver, err := constructor.fn(cfg, container)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("visibility archiver constructor failed for scheme %q, config key %q: err: %w", scheme, constructor.configKey, err)
 	}
 
 	p.Lock()

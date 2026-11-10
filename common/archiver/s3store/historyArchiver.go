@@ -37,19 +37,23 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 
-	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/archiver"
 	"github.com/uber/cadence/common/backoff"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/persistence"
-	"github.com/uber/cadence/common/service/config"
+	"github.com/uber/cadence/common/types"
 )
 
 const (
-	// URIScheme is the scheme for the s3 implementation
-	URIScheme               = "s3"
+	// URIScheme is the scheme for the s3 implementation using a plain bucket name.
+	URIScheme = "s3"
+	// URISchemeAccessPoint is the scheme for S3 access point URIs.
+	// Format: s3-ap://<account-id>/<access-point-name>[/<path>]
+	// The region is injected from the archiver's configured AWS region,
+	// so the same URI works across all regions (useful for global domains).
+	URISchemeAccessPoint    = "s3-ap"
 	errEncodeHistory        = "failed to encode history batches"
 	errWriteKey             = "failed to write history to s3"
 	defaultBlobstoreTimeout = 60 * time.Second
@@ -57,18 +61,20 @@ const (
 )
 
 var (
-	errNoBucketSpecified = errors.New("no bucket specified")
-	errBucketNotExists   = errors.New("requested bucket does not exist")
-	errEmptyAwsRegion    = errors.New("empty aws region")
+	errNoBucketSpecified      = errors.New("no bucket specified")
+	errBucketNotExists        = errors.New("requested bucket does not exist")
+	errEmptyAwsRegion         = errors.New("empty aws region")
+	errInvalidAccessPointURI  = errors.New("invalid s3-ap URI: expected s3-ap://<account-id>/<access-point-name>[/<path>]")
+	errInvalidAccessPointAcct = errors.New("invalid s3-ap URI: account id must be 12 digits")
 )
 
 type (
 	historyArchiver struct {
 		container *archiver.HistoryBootstrapContainer
 		s3cli     s3iface.S3API
+		region    string
 		// only set in test code
 		historyIterator archiver.HistoryIterator
-		config          *config.S3Archiver
 	}
 
 	getHistoryToken struct {
@@ -87,14 +93,14 @@ type (
 // NewHistoryArchiver creates a new archiver.HistoryArchiver based on s3
 func NewHistoryArchiver(
 	container *archiver.HistoryBootstrapContainer,
-	config *config.S3Archiver,
+	config *Config,
 ) (archiver.HistoryArchiver, error) {
 	return newHistoryArchiver(container, config, nil)
 }
 
 func newHistoryArchiver(
 	container *archiver.HistoryBootstrapContainer,
-	config *config.S3Archiver,
+	config *Config,
 	historyIterator archiver.HistoryIterator,
 ) (*historyArchiver, error) {
 	if len(config.Region) == 0 {
@@ -113,6 +119,7 @@ func newHistoryArchiver(
 	return &historyArchiver{
 		container:       container,
 		s3cli:           s3.New(sess),
+		region:          config.Region,
 		historyIterator: historyIterator,
 	}, nil
 }
@@ -124,11 +131,11 @@ func (h *historyArchiver) Archive(
 ) (err error) {
 	scope := h.container.MetricsClient.Scope(metrics.HistoryArchiverScope, metrics.DomainTag(request.DomainName))
 	featureCatalog := archiver.GetFeatureCatalog(opts...)
-	sw := scope.StartTimer(metrics.CadenceLatency)
+	sw := scope.StartTimerWithExponentialHistogram(metrics.CadenceLatency, metrics.CadenceLatencyHistogram)
 	defer func() {
 		sw.Stop()
 		if err != nil {
-			if common.IsPersistenceTransientError(err) || isRetryableError(err) {
+			if persistence.IsTransientError(err) || isRetryableError(err) {
 				scope.IncCounter(metrics.HistoryArchiverArchiveTransientErrorCount)
 			} else {
 				scope.IncCounter(metrics.HistoryArchiverArchiveNonRetryableErrorCount)
@@ -159,8 +166,17 @@ func (h *historyArchiver) Archive(
 	for historyIterator.HasNext() {
 		historyBlob, err := getNextHistoryBlob(ctx, historyIterator)
 		if err != nil {
+			if common.IsEntityNotExistsError(err) {
+				// workflow history no longer exists, may due to duplicated archival signal
+				// this may happen even in the middle of iterating history as two archival signals
+				// can be processed concurrently.
+				logger.Info(archiver.ArchiveSkippedInfoMsg)
+				scope.IncCounter(metrics.HistoryArchiverDuplicateArchivalsCount)
+				return nil
+			}
+
 			logger := logger.WithTags(tag.ArchivalArchiveFailReason(archiver.ErrReasonReadHistory), tag.Error(err))
-			if common.IsPersistenceTransientError(err) {
+			if persistence.IsTransientError(err) {
 				logger.Error(archiver.ArchiveTransientErrorMsg)
 			} else {
 				logger.Error(archiver.ArchiveNonRetriableErrorMsg)
@@ -168,9 +184,10 @@ func (h *historyArchiver) Archive(
 			return err
 		}
 
-		if historyMutated(request, historyBlob.Body, *historyBlob.Header.IsLast) {
-			logger.Error(archiver.ArchiveNonRetriableErrorMsg, tag.ArchivalArchiveFailReason(archiver.ErrReasonHistoryMutated))
-			return archiver.ErrHistoryMutated
+		if archiver.IsHistoryMutated(request, historyBlob.Body, *historyBlob.Header.IsLast, logger) {
+			if !featureCatalog.ArchiveIncompleteHistory() {
+				return archiver.ErrHistoryMutated
+			}
 		}
 
 		encodedHistoryBlob, err := encode(historyBlob)
@@ -179,9 +196,9 @@ func (h *historyArchiver) Archive(
 			return err
 		}
 
-		key := constructHistoryKey(URI.Path(), request.DomainID, request.WorkflowID, request.RunID, request.CloseFailoverVersion, progress.BatchIdx)
+		key := constructHistoryKey(s3KeyPath(URI), request.DomainID, request.WorkflowID, request.RunID, request.CloseFailoverVersion, progress.BatchIdx)
 
-		exists, err := keyExists(ctx, h.s3cli, URI, key)
+		exists, err := keyExists(ctx, h.s3cli, URI, key, h.region)
 		if err != nil {
 			logger := logger.WithTags(tag.ArchivalArchiveFailReason(errWriteKey), tag.Error(err))
 			if isRetryableError(err) {
@@ -195,7 +212,7 @@ func (h *historyArchiver) Archive(
 		if exists {
 			scope.IncCounter(metrics.HistoryArchiverBlobExistsCount)
 		} else {
-			if err := upload(ctx, h.s3cli, URI, key, encodedHistoryBlob); err != nil {
+			if err := upload(ctx, h.s3cli, URI, h.region, key, encodedHistoryBlob); err != nil {
 				logger := logger.WithTags(tag.ArchivalArchiveFailReason(errWriteKey), tag.Error(err))
 				if isRetryableError(err) {
 					logger.Error(archiver.ArchiveTransientErrorMsg)
@@ -206,6 +223,7 @@ func (h *historyArchiver) Archive(
 			}
 			progress.uploadedSize += blobSize
 			scope.RecordTimer(metrics.HistoryArchiverBlobSize, time.Duration(blobSize))
+			scope.IntExponentialHistogram(metrics.HistoryArchiverBlobSizeHistogram, int(blobSize))
 		}
 
 		progress.historySize += blobSize
@@ -214,7 +232,11 @@ func (h *historyArchiver) Archive(
 	}
 
 	scope.RecordTimer(metrics.HistoryArchiverTotalUploadSize, time.Duration(progress.uploadedSize))
+	scope.IntExponentialHistogram(metrics.HistoryArchiverTotalUploadSizeHistogram, int(progress.uploadedSize))
+
 	scope.RecordTimer(metrics.HistoryArchiverHistorySize, time.Duration(progress.historySize))
+	scope.IntExponentialHistogram(metrics.HistoryArchiverHistorySizeHistogram, int(progress.historySize))
+
 	scope.IncCounter(metrics.HistoryArchiverArchiveSuccessCount)
 	return nil
 }
@@ -259,11 +281,11 @@ func (h *historyArchiver) Get(
 	request *archiver.GetHistoryRequest,
 ) (*archiver.GetHistoryResponse, error) {
 	if err := softValidateURI(URI); err != nil {
-		return nil, &shared.BadRequestError{Message: archiver.ErrInvalidURI.Error()}
+		return nil, &types.BadRequestError{Message: archiver.ErrInvalidURI.Error()}
 	}
 
 	if err := archiver.ValidateGetRequest(request); err != nil {
-		return nil, &shared.BadRequestError{Message: archiver.ErrInvalidGetHistoryRequest.Error()}
+		return nil, &types.BadRequestError{Message: archiver.ErrInvalidGetHistoryRequest.Error()}
 	}
 
 	var err error
@@ -271,7 +293,7 @@ func (h *historyArchiver) Get(
 	if request.NextPageToken != nil {
 		token, err = deserializeGetHistoryToken(request.NextPageToken)
 		if err != nil {
-			return nil, &shared.BadRequestError{Message: archiver.ErrNextPageTokenCorrupted.Error()}
+			return nil, &types.BadRequestError{Message: archiver.ErrNextPageTokenCorrupted.Error()}
 		}
 	} else if request.CloseFailoverVersion != nil {
 		token = &getHistoryToken{
@@ -280,7 +302,7 @@ func (h *historyArchiver) Get(
 	} else {
 		highestVersion, err := h.getHighestVersion(ctx, URI, request)
 		if err != nil {
-			return nil, &shared.BadRequestError{Message: err.Error()}
+			return nil, &types.BadRequestError{Message: err.Error()}
 		}
 		token = &getHistoryToken{
 			CloseFailoverVersion: *highestVersion,
@@ -295,24 +317,24 @@ func (h *historyArchiver) Get(
 			isTruncated = true
 			break
 		}
-		key := constructHistoryKey(URI.Path(), request.DomainID, request.WorkflowID, request.RunID, token.CloseFailoverVersion, token.BatchIdx)
+		key := constructHistoryKey(s3KeyPath(URI), request.DomainID, request.WorkflowID, request.RunID, token.CloseFailoverVersion, token.BatchIdx)
 
-		encodedRecord, err := download(ctx, h.s3cli, URI, key)
+		encodedRecord, err := download(ctx, h.s3cli, URI, h.region, key)
 		if err != nil {
 			if isRetryableError(err) {
-				return nil, &shared.InternalServiceError{Message: err.Error()}
+				return nil, &types.InternalServiceError{Message: err.Error()}
 			}
 			switch err.(type) {
-			case *shared.BadRequestError, *shared.InternalServiceError, *shared.EntityNotExistsError:
+			case *types.BadRequestError, *types.InternalServiceError, *types.EntityNotExistsError:
 				return nil, err
 			default:
-				return nil, &shared.InternalServiceError{Message: err.Error()}
+				return nil, &types.InternalServiceError{Message: err.Error()}
 			}
 		}
 
 		historyBlob, err := decodeHistoryBlob(encodedRecord)
 		if err != nil {
-			return nil, &shared.InternalServiceError{Message: err.Error()}
+			return nil, &types.InternalServiceError{Message: err.Error()}
 		}
 
 		for _, batch := range historyBlob.Body {
@@ -329,7 +351,7 @@ func (h *historyArchiver) Get(
 	if isTruncated {
 		nextToken, err := serializeToken(token)
 		if err != nil {
-			return nil, &shared.InternalServiceError{Message: err.Error()}
+			return nil, &types.InternalServiceError{Message: err.Error()}
 		}
 		response.NextPageToken = nextToken
 	}
@@ -342,39 +364,50 @@ func (h *historyArchiver) ValidateURI(URI archiver.URI) error {
 	if err != nil {
 		return err
 	}
-	return bucketExists(context.TODO(), h.s3cli, URI)
+	return bucketExists(context.TODO(), h.s3cli, URI, h.region)
 }
 
 func getNextHistoryBlob(ctx context.Context, historyIterator archiver.HistoryIterator) (*archiver.HistoryBlob, error) {
 	historyBlob, err := historyIterator.Next()
-	op := func() error {
+	op := func(ctx context.Context) error {
 		historyBlob, err = historyIterator.Next()
 		return err
 	}
+	throttleRetry := backoff.NewThrottleRetry(
+		backoff.WithRetryPolicy(common.CreatePersistenceRetryPolicy()),
+		backoff.WithRetryableError(persistence.IsTransientError),
+	)
 	for err != nil {
 		if contextExpired(ctx) {
 			return nil, archiver.ErrContextTimeout
 		}
-		if !common.IsPersistenceTransientError(err) {
+		if !persistence.IsTransientError(err) {
 			return nil, err
 		}
-		err = backoff.Retry(op, common.CreatePersistenceRetryPolicy(), common.IsPersistenceTransientError)
+		err = throttleRetry.Do(ctx, op)
 	}
 	return historyBlob, nil
 }
 
+// with XDC(global domain) concept, archival may write different history with the same RunID, with different failoverVersion.
+// In that case, the history/runID with the highest failoverVersion wins.
+// getHighestVersion look up all archived files to find the highest failoverVersion.
 func (h *historyArchiver) getHighestVersion(ctx context.Context, URI archiver.URI, request *archiver.GetHistoryRequest) (*int64, error) {
 	ctx, cancel := ensureContextTimeout(ctx)
 	defer cancel()
-	var prefix = constructHistoryKeyPrefix(URI.Path(), request.DomainID, request.WorkflowID, request.RunID) + "/"
+	bucket, err := s3Bucket(URI, h.region)
+	if err != nil {
+		return nil, err
+	}
+	var prefix = constructHistoryKeyPrefix(s3KeyPath(URI), request.DomainID, request.WorkflowID, request.RunID) + "/"
 	results, err := h.s3cli.ListObjectsV2WithContext(ctx, &s3.ListObjectsV2Input{
-		Bucket:    aws.String(URI.Hostname()),
+		Bucket:    aws.String(bucket),
 		Prefix:    aws.String(prefix),
 		Delimiter: aws.String("/"),
 	})
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok && aerr.Code() == s3.ErrCodeNoSuchBucket {
-			return nil, &shared.BadRequestError{Message: errBucketNotExists.Error()}
+			return nil, &types.BadRequestError{Message: errBucketNotExists.Error()}
 		}
 		return nil, err
 	}

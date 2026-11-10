@@ -29,10 +29,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
-	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
+	"github.com/uber/cadence/common/constants"
 	"github.com/uber/cadence/common/mocks"
 	"github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/types"
 )
 
 const (
@@ -69,7 +70,7 @@ type (
 )
 
 func (e *testSizeEstimator) EstimateSize(v interface{}) (int, error) {
-	historyBatch, ok := v.(*shared.History)
+	historyBatch, ok := v.(*types.History)
 	if !ok {
 		return -1, errors.New("test size estimator only estimate the size of history batches")
 	}
@@ -92,7 +93,7 @@ func (s *HistoryIteratorSuite) TestReadHistory_Failed_EventsV2() {
 	mockHistoryV2Manager := &mocks.HistoryV2Manager{}
 	mockHistoryV2Manager.On("ReadHistoryBranchByBatch", mock.Anything, mock.Anything).Return(nil, errors.New("got error reading history branch"))
 	itr := s.constructTestHistoryIterator(mockHistoryV2Manager, testDefaultTargetHistoryBlobSize, nil)
-	history, err := itr.readHistory(context.Background(), common.FirstEventID)
+	history, err := itr.readHistory(context.Background(), constants.FirstEventID)
 	s.Error(err)
 	s.Nil(history)
 	mockHistoryV2Manager.AssertExpectations(s.T())
@@ -101,12 +102,12 @@ func (s *HistoryIteratorSuite) TestReadHistory_Failed_EventsV2() {
 func (s *HistoryIteratorSuite) TestReadHistory_Success_EventsV2() {
 	mockHistoryV2Manager := &mocks.HistoryV2Manager{}
 	resp := persistence.ReadHistoryBranchByBatchResponse{
-		History:       []*shared.History{},
+		History:       []*types.History{},
 		NextPageToken: []byte{},
 	}
 	mockHistoryV2Manager.On("ReadHistoryBranchByBatch", mock.Anything, mock.Anything).Return(&resp, nil)
 	itr := s.constructTestHistoryIterator(mockHistoryV2Manager, testDefaultTargetHistoryBlobSize, nil)
-	history, err := itr.readHistory(context.Background(), common.FirstEventID)
+	history, err := itr.readHistory(context.Background(), constants.FirstEventID)
 	s.NoError(err)
 	s.NotNil(history)
 	mockHistoryV2Manager.AssertExpectations(s.T())
@@ -132,7 +133,7 @@ func (s *HistoryIteratorSuite) TestReadHistoryBatches_Fail_FirstCallToReadHistor
 	historyV2Manager := s.constructMockHistoryV2Manager(batchInfo, 0, false, pages...)
 	itr := s.constructTestHistoryIterator(historyV2Manager, testDefaultTargetHistoryBlobSize, nil)
 	startingIteratorState := s.copyIteratorState(itr)
-	events, nextIterState, err := itr.readHistoryBatches(context.Background(), common.FirstEventID)
+	events, nextIterState, err := itr.readHistoryBatches(context.Background(), constants.FirstEventID)
 	s.Nil(events)
 	s.False(nextIterState.FinishedIteration)
 	s.Zero(nextIterState.NextEventID)
@@ -160,7 +161,7 @@ func (s *HistoryIteratorSuite) TestReadHistoryBatches_Fail_NonFirstCallToReadHis
 	historyV2Manager := s.constructMockHistoryV2Manager(batchInfo, 1, false, pages...)
 	itr := s.constructTestHistoryIterator(historyV2Manager, testDefaultTargetHistoryBlobSize, nil)
 	startingIteratorState := s.copyIteratorState(itr)
-	events, nextIterState, err := itr.readHistoryBatches(context.Background(), common.FirstEventID)
+	events, nextIterState, err := itr.readHistoryBatches(context.Background(), constants.FirstEventID)
 	s.Nil(events)
 	s.False(nextIterState.FinishedIteration)
 	s.Zero(nextIterState.NextEventID)
@@ -195,7 +196,7 @@ func (s *HistoryIteratorSuite) TestReadHistoryBatches_Success_ReadToHistoryEnd()
 	// ensure target history batches size is greater than total history length to ensure all of history is read
 	itr := s.constructTestHistoryIterator(historyV2Manager, 20*testDefaultHistoryEventSize, nil)
 	startingIteratorState := s.copyIteratorState(itr)
-	history, nextIterState, err := itr.readHistoryBatches(context.Background(), common.FirstEventID)
+	history, nextIterState, err := itr.readHistoryBatches(context.Background(), constants.FirstEventID)
 	s.NotNil(history)
 	s.Len(history, 9)
 	s.True(nextIterState.FinishedIteration)
@@ -231,7 +232,7 @@ func (s *HistoryIteratorSuite) TestReadHistoryBatches_Success_TargetSizeSatisfie
 	// ensure target history batches is smaller than full length of history so that not all of history is read
 	itr := s.constructTestHistoryIterator(historyV2Manager, 11*testDefaultHistoryEventSize, nil)
 	startingIteratorState := s.copyIteratorState(itr)
-	history, nextIterState, err := itr.readHistoryBatches(context.Background(), common.FirstEventID)
+	history, nextIterState, err := itr.readHistoryBatches(context.Background(), constants.FirstEventID)
 	s.NotNil(history)
 	s.Len(history, 7)
 	s.False(nextIterState.FinishedIteration)
@@ -267,7 +268,7 @@ func (s *HistoryIteratorSuite) TestReadHistoryBatches_Success_ReadExactlyToHisto
 	// ensure target history batches size is equal to the full length of history so that all of history is read
 	itr := s.constructTestHistoryIterator(historyV2Manager, 16*testDefaultHistoryEventSize, nil)
 	startingIteratorState := s.copyIteratorState(itr)
-	history, nextIterState, err := itr.readHistoryBatches(context.Background(), common.FirstEventID)
+	history, nextIterState, err := itr.readHistoryBatches(context.Background(), constants.FirstEventID)
 	s.NotNil(history)
 	s.Len(history, 9)
 	s.True(nextIterState.FinishedIteration)
@@ -297,7 +298,7 @@ func (s *HistoryIteratorSuite) TestReadHistoryBatches_Success_ReadPageMultipleTi
 	// ensure target history batches is very small so that one page needs multiple read
 	itr := s.constructTestHistoryIterator(historyV2Manager, 2*testDefaultHistoryEventSize, nil)
 	startingIteratorState := s.copyIteratorState(itr)
-	history, nextIterState, err := itr.readHistoryBatches(context.Background(), common.FirstEventID)
+	history, nextIterState, err := itr.readHistoryBatches(context.Background(), constants.FirstEventID)
 	s.NotNil(history)
 	s.Len(history, 2)
 	s.False(nextIterState.FinishedIteration)
@@ -358,7 +359,7 @@ func (s *HistoryIteratorSuite) TestNext_Fail_IteratorDepleted() {
 		IsLast:               common.BoolPtr(true),
 		FirstFailoverVersion: common.Int64Ptr(1),
 		LastFailoverVersion:  common.Int64Ptr(5),
-		FirstEventID:         common.Int64Ptr(common.FirstEventID),
+		FirstEventID:         common.Int64Ptr(constants.FirstEventID),
 		LastEventID:          common.Int64Ptr(16),
 		EventCount:           common.Int64Ptr(16),
 	}
@@ -420,7 +421,7 @@ func (s *HistoryIteratorSuite) TestNext_Fail_ReturnErrOnSecondCallToNext() {
 		IsLast:               common.BoolPtr(false),
 		FirstFailoverVersion: common.Int64Ptr(1),
 		LastFailoverVersion:  common.Int64Ptr(1),
-		FirstEventID:         common.Int64Ptr(common.FirstEventID),
+		FirstEventID:         common.Int64Ptr(constants.FirstEventID),
 		LastEventID:          common.Int64Ptr(6),
 		EventCount:           common.Int64Ptr(6),
 	}
@@ -455,7 +456,7 @@ func (s *HistoryIteratorSuite) TestNext_Success_TenCallsToNext() {
 	itr := s.constructTestHistoryIterator(historyV2Manager, 20*10*testDefaultHistoryEventSize, nil)
 	expectedIteratorState := historyIteratorState{
 		FinishedIteration: false,
-		NextEventID:       common.FirstEventID,
+		NextEventID:       constants.FirstEventID,
 	}
 	for i := 0; i < 10; i++ {
 		s.assertStateMatches(expectedIteratorState, itr)
@@ -471,7 +472,7 @@ func (s *HistoryIteratorSuite) TestNext_Success_TenCallsToNext() {
 			IsLast:               common.BoolPtr(false),
 			FirstFailoverVersion: common.Int64Ptr(1),
 			LastFailoverVersion:  common.Int64Ptr(1),
-			FirstEventID:         common.Int64Ptr(common.FirstEventID + int64(i*200)),
+			FirstEventID:         common.Int64Ptr(constants.FirstEventID + int64(i*200)),
 			LastEventID:          common.Int64Ptr(int64(200 + (i * 200))),
 			EventCount:           common.Int64Ptr(200),
 		}
@@ -580,8 +581,8 @@ func (s *HistoryIteratorSuite) TestNext_Success_SameHistoryDifferentPage() {
 
 		s.Equal(history1.Header, history2.Header)
 		s.Equal(len(history1.Body), len(history2.Body))
-		s.Equal(expectedFirstEventID[i], history1.Body[0].Events[0].GetEventId())
-		s.Equal(expectedFirstEventID[i], history2.Body[0].Events[0].GetEventId())
+		s.Equal(expectedFirstEventID[i], history1.Body[0].Events[0].ID)
+		s.Equal(expectedFirstEventID[i], history2.Body[0].Events[0].ID)
 	}
 	expectedIteratorState := historyIteratorState{
 		NextEventID:       0,
@@ -611,7 +612,7 @@ func (s *HistoryIteratorSuite) TestNewIteratorWithState() {
 func (s *HistoryIteratorSuite) constructMockHistoryV2Manager(batchInfo []int, returnErrorOnPage int, addNotExistCall bool, pages ...page) *mocks.HistoryV2Manager {
 	mockHistoryV2Manager := &mocks.HistoryV2Manager{}
 
-	firstEventIDs := []int64{common.FirstEventID}
+	firstEventIDs := []int64{constants.FirstEventID}
 	for i, batchSize := range batchInfo {
 		firstEventIDs = append(firstEventIDs, firstEventIDs[i]+int64(batchSize))
 	}
@@ -620,9 +621,10 @@ func (s *HistoryIteratorSuite) constructMockHistoryV2Manager(batchInfo []int, re
 		req := &persistence.ReadHistoryBranchRequest{
 			BranchToken: testBranchToken,
 			MinEventID:  firstEventIDs[p.firstbatchIdx],
-			MaxEventID:  common.EndEventID,
+			MaxEventID:  constants.EndEventID,
 			PageSize:    testDefaultPersistencePageSize,
 			ShardID:     common.IntPtr(testShardID),
+			DomainName:  testDomainName,
 		}
 		if returnErrorOnPage == i {
 			mockHistoryV2Manager.On("ReadHistoryBranchByBatch", mock.Anything, req).Return(nil, errors.New("got error getting workflow execution history"))
@@ -639,11 +641,12 @@ func (s *HistoryIteratorSuite) constructMockHistoryV2Manager(batchInfo []int, re
 		req := &persistence.ReadHistoryBranchRequest{
 			BranchToken: testBranchToken,
 			MinEventID:  firstEventIDs[len(firstEventIDs)-1],
-			MaxEventID:  common.EndEventID,
+			MaxEventID:  constants.EndEventID,
 			PageSize:    testDefaultPersistencePageSize,
 			ShardID:     common.IntPtr(testShardID),
+			DomainName:  testDomainName,
 		}
-		mockHistoryV2Manager.On("ReadHistoryBranchByBatch", mock.Anything, req).Return(nil, &shared.EntityNotExistsError{Message: "Reach the end"})
+		mockHistoryV2Manager.On("ReadHistoryBranchByBatch", mock.Anything, req).Return(nil, &types.EntityNotExistsError{Message: "Reach the end"})
 	}
 
 	return mockHistoryV2Manager
@@ -658,23 +661,23 @@ func (s *HistoryIteratorSuite) assertStateMatches(expected historyIteratorState,
 	s.Equal(expected.FinishedIteration, itr.FinishedIteration)
 }
 
-func (s *HistoryIteratorSuite) constructHistoryBatches(batchInfo []int, page page, firstEventID int64) []*shared.History {
-	batches := []*shared.History{}
+func (s *HistoryIteratorSuite) constructHistoryBatches(batchInfo []int, page page, firstEventID int64) []*types.History {
+	batches := []*types.History{}
 	eventsID := firstEventID
 	for batchIdx, numEvents := range batchInfo[page.firstbatchIdx : page.firstbatchIdx+page.numBatches] {
-		events := []*shared.HistoryEvent{}
+		events := []*types.HistoryEvent{}
 		for i := 0; i < numEvents; i++ {
-			event := &shared.HistoryEvent{
-				EventId: common.Int64Ptr(eventsID),
-				Version: common.Int64Ptr(page.firstEventFailoverVersion),
+			event := &types.HistoryEvent{
+				ID:      eventsID,
+				Version: page.firstEventFailoverVersion,
 			}
 			eventsID++
 			if batchIdx == page.numBatches-1 {
-				event.Version = common.Int64Ptr(page.lastEventFailoverVersion)
+				event.Version = page.lastEventFailoverVersion
 			}
 			events = append(events, event)
 		}
-		batches = append(batches, &shared.History{
+		batches = append(batches, &types.History{
 			Events: events,
 		})
 	}

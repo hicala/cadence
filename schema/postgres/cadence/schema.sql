@@ -33,10 +33,20 @@ CREATE TABLE transfer_tasks(
   PRIMARY KEY (shard_id, task_id)
 );
 
+CREATE TABLE cross_cluster_tasks(
+  target_cluster VARCHAR(255) NOT NULL,
+  shard_id INTEGER NOT NULL,
+  task_id BIGINT NOT NULL,
+  --
+  data BYTEA NOT NULL,
+  data_encoding VARCHAR(16) NOT NULL,
+  PRIMARY KEY (target_cluster, shard_id, task_id)
+);
+
 CREATE TABLE executions(
   shard_id INTEGER NOT NULL,
   domain_id BYTEA NOT NULL,
-  workflow_id VARCHAR(255) NOT NULL,
+  workflow_id TEXT NOT NULL,
   run_id BYTEA NOT NULL,
   --
   next_event_id BIGINT NOT NULL,
@@ -49,7 +59,7 @@ CREATE TABLE executions(
 CREATE TABLE current_executions(
   shard_id INTEGER NOT NULL,
   domain_id BYTEA NOT NULL,
-  workflow_id VARCHAR(255) NOT NULL,
+  workflow_id TEXT NOT NULL,
   --
   run_id BYTEA NOT NULL,
   create_request_id VARCHAR(64) NOT NULL,
@@ -64,7 +74,7 @@ CREATE TABLE buffered_events (
   id BIGSERIAL NOT NULL,
   shard_id INTEGER NOT NULL,
   domain_id BYTEA NOT NULL,
-  workflow_id VARCHAR(255) NOT NULL,
+  workflow_id TEXT NOT NULL,
   run_id BYTEA NOT NULL,
   --
   data BYTEA NOT NULL,
@@ -130,7 +140,7 @@ CREATE TABLE activity_info_maps (
 -- each row corresponds to one key of one map<string, ActivityInfo>
   shard_id INTEGER NOT NULL,
   domain_id BYTEA NOT NULL,
-  workflow_id VARCHAR(255) NOT NULL,
+  workflow_id TEXT NOT NULL,
   run_id BYTEA NOT NULL,
   schedule_id BIGINT NOT NULL,
 --
@@ -144,7 +154,7 @@ CREATE TABLE activity_info_maps (
 CREATE TABLE timer_info_maps (
   shard_id INTEGER NOT NULL,
   domain_id BYTEA NOT NULL,
-  workflow_id VARCHAR(255) NOT NULL,
+  workflow_id TEXT NOT NULL,
   run_id BYTEA NOT NULL,
   timer_id VARCHAR(255) NOT NULL,
 --
@@ -156,7 +166,7 @@ CREATE TABLE timer_info_maps (
 CREATE TABLE child_execution_info_maps (
   shard_id INTEGER NOT NULL,
   domain_id BYTEA NOT NULL,
-  workflow_id VARCHAR(255) NOT NULL,
+  workflow_id TEXT NOT NULL,
   run_id BYTEA NOT NULL,
   initiated_id BIGINT NOT NULL,
 --
@@ -168,7 +178,7 @@ CREATE TABLE child_execution_info_maps (
 CREATE TABLE request_cancel_info_maps (
   shard_id INTEGER NOT NULL,
   domain_id BYTEA NOT NULL,
-  workflow_id VARCHAR(255) NOT NULL,
+  workflow_id TEXT NOT NULL,
   run_id BYTEA NOT NULL,
   initiated_id BIGINT NOT NULL,
 --
@@ -180,7 +190,7 @@ CREATE TABLE request_cancel_info_maps (
 CREATE TABLE signal_info_maps (
   shard_id INTEGER NOT NULL,
   domain_id BYTEA NOT NULL,
-  workflow_id VARCHAR(255) NOT NULL,
+  workflow_id TEXT NOT NULL,
   run_id BYTEA NOT NULL,
   initiated_id BIGINT NOT NULL,
 --
@@ -192,7 +202,7 @@ CREATE TABLE signal_info_maps (
 CREATE TABLE buffered_replication_task_maps (
   shard_id INTEGER NOT NULL,
   domain_id BYTEA NOT NULL,
-  workflow_id VARCHAR(255) NOT NULL,
+  workflow_id TEXT NOT NULL,
   run_id BYTEA NOT NULL,
   first_event_id BIGINT NOT NULL,
 --
@@ -210,7 +220,7 @@ CREATE TABLE buffered_replication_task_maps (
 CREATE TABLE signals_requested_sets (
   shard_id INTEGER NOT NULL,
   domain_id BYTEA NOT NULL,
-  workflow_id VARCHAR(255) NOT NULL,
+  workflow_id TEXT NOT NULL,
   run_id BYTEA NOT NULL,
   signal_id VARCHAR(64) NOT NULL,
   --
@@ -252,4 +262,42 @@ CREATE TABLE queue_metadata (
   queue_type INTEGER NOT NULL,
   data BYTEA NOT NULL,
   PRIMARY KEY(queue_type)
+);
+
+CREATE TABLE cluster_config (
+  row_type INTEGER NOT NULL,
+  version BIGINT NOT NULL,
+  --
+  timestamp TIMESTAMP NOT NULL,
+  data           BYTEA NOT NULL,
+  data_encoding  VARCHAR(16) NOT NULL,
+  PRIMARY KEY (row_type, version)
+);
+
+CREATE TABLE domain_audit_log (
+  domain_id               TEXT NOT NULL,
+  event_id                TEXT NOT NULL,
+  --
+  state_before            BYTEA NOT NULL,
+  state_before_encoding   TEXT NOT NULL,
+  state_after             BYTEA NOT NULL,
+  state_after_encoding    TEXT NOT NULL,
+  operation_type          INTEGER NOT NULL,
+  created_time            TIMESTAMP NOT NULL,
+  last_updated_time       TIMESTAMP NOT NULL,
+  identity                TEXT NOT NULL,
+  identity_type           TEXT NOT NULL,
+  comment                 TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (domain_id, operation_type, created_time, event_id)
+);
+
+CREATE TABLE active_cluster_selection_policy (
+  shard_id      INT          NOT NULL,
+  domain_id     BYTEA        NOT NULL,
+  workflow_id   TEXT         NOT NULL,
+  run_id        BYTEA        NOT NULL,
+  --
+  data          BYTEA        NOT NULL,
+  data_encoding VARCHAR(16)  NOT NULL,
+  PRIMARY KEY (shard_id, domain_id, workflow_id, run_id)
 );

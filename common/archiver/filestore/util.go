@@ -31,8 +31,7 @@ import (
 
 	"github.com/dgryski/go-farm"
 
-	"github.com/uber/cadence/.gen/go/shared"
-	"github.com/uber/cadence/common/archiver"
+	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/common/util"
 )
 
@@ -46,8 +45,8 @@ func encode(v interface{}) ([]byte, error) {
 	return json.Marshal(v)
 }
 
-func decodeHistoryBatches(data []byte) ([]*shared.History, error) {
-	historyBatches := []*shared.History{}
+func decodeHistoryBatches(data []byte) ([]*types.History, error) {
+	historyBatches := []*types.History{}
 	err := json.Unmarshal(data, &historyBatches)
 	if err != nil {
 		return nil, err
@@ -131,21 +130,6 @@ func extractCloseFailoverVersion(filename string) (int64, error) {
 		return -1, errors.New("unknown filename structure")
 	}
 	return strconv.ParseInt(filenameParts[1], 10, 64)
-}
-
-func historyMutated(request *archiver.ArchiveHistoryRequest, historyBatches []*shared.History, isLast bool) bool {
-	lastBatch := historyBatches[len(historyBatches)-1].Events
-	lastEvent := lastBatch[len(lastBatch)-1]
-	lastFailoverVersion := lastEvent.GetVersion()
-	if lastFailoverVersion > request.CloseFailoverVersion {
-		return true
-	}
-
-	if !isLast {
-		return false
-	}
-	lastEventID := lastEvent.GetEventId()
-	return lastFailoverVersion != request.CloseFailoverVersion || lastEventID+1 != request.NextEventID
 }
 
 func contextExpired(ctx context.Context) bool {
